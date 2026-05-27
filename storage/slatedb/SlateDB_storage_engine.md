@@ -385,10 +385,13 @@ When a unit exhausts its repair budget or fails the gate after pass 2:
 
 ## 11. Definition of done (per stage)
 
-- **Stage 1 — skeleton:** `ha_slatedb` plugin loads; `CREATE TABLE t(a INT) ENGINE=SLATEDB;
-  INSERT; SELECT;` works through the cxx bridge against SlateDB; **the §8.B differential
-  bridge harness builds and runs end-to-end on a smoke-sized fuzz corpus**. The harness
-  itself is the long-pole deliverable here; without it Stage 2 has no gate.
+- **Stage 0 — substrate proof of life:** the three checkpoints below land before any
+  agent time is spent on INDEX/INTERFACE. Done when all three are committed green.
+- **Stage 1 — first CRUD + harness:** `CREATE TABLE t(a INT) ENGINE=SLATEDB; INSERT;
+  SELECT;` works end-to-end through the cxx bridge against SlateDB; **the §8.B
+  differential bridge harness builds and runs on a smoke-sized fuzz corpus**. The harness
+  is the long-pole deliverable here; without it Stage 2 has no gate. (Plugin-load itself
+  is Stage 0.)
 - **Stage 2 — translation:** all in-scope manifest units gate-green at their tier; full
   MTR coverage for translated modules passes Tier C; sysbench within agreed
   batched-baseline thresholds.
@@ -397,13 +400,48 @@ When a unit exhausts its repair budget or fails the gate after pass 2:
   RocksDB remains the production default until the human declares parity *for their
   workload* (§1).
 
+### Stage 0 — substrate proof of life (do this before INDEX)
+
+Three checkpoints, each a separate commit, executed in order. Each one isolates a single
+failure mode so that when something breaks you know which substrate hurt you.
+
+1. **Empty plugin loads.** A C++-only `ha_slatedb` skeleton (copy from `storage/example/`)
+   that `MYSQL_ADD_PLUGIN(... STORAGE_ENGINE MODULE_ONLY ...)` builds, that
+   `INSTALL PLUGIN slatedb SONAME 'ha_slatedb.so';` accepts, and that `SHOW ENGINES`
+   lists. No Rust, no SlateDB, no cxx. Proves the MariaDB build works and the plugin
+   loader accepts our skeleton.
+2. **cxx wired end-to-end.** Add the Rust crate and corrosion-rs CMake glue (§4). One
+   trivial `#[cxx::bridge]` function (`slatedb_version() -> String`); the shim calls it
+   from `handlerton::init` and logs the result. Proves Cargo ↔ CMake ↔ cxx works in
+   isolation, before any engine logic moves through it.
+3. **SlateDB runs.** Add SlateDB as a Cargo dep at a pinned rev (§4). Write one Rust unit
+   test that does `put`/`get` against a local-fs or Minio backend. No MariaDB integration
+   yet. Isolates "does SlateDB build and run in our toolchain at all" from "does it work
+   through the bridge".
+
+Stage 0 has no dependency on INDEX or INTERFACE; it intentionally validates the bottom
+turtle before any agent time is spent on the 33k-line C++ analysis. **Days-to-weeks, not
+quarters.** If any checkpoint fights you for more than a few sessions, that's signal about
+the substrate, not the work — stop and reconsider before continuing.
+
+**Stage 0 preconditions** (decide before starting):
+- **Object-store backend for dev/CI.** Minio locally, an fs adapter, or real S3? Affects
+  test ergonomics significantly; default to Minio unless the human specifies otherwise.
+- **`corrosion-rs` availability.** Is it on the CMake module path, or do we vendor it as a
+  git subtree under `storage/slatedb/cmake/`?
+- **In-tree MariaDB build cadence.** If you are not already building MariaDB from source
+  regularly, set that up first — the rest of the stages assume `make` works and the test
+  binary launches.
+
 ### Realistic time framing
 
-After deduplicating the megafiles in §5, expect ~70-100 translation units. Even at
-optimistic Claude throughput (one unit through both passes + gate in ~30 minutes of agent
-time, including repair loops), Stage 2 is hundreds of agent-hours plus design work for the
-RocksDB-divergent units plus MTR debugging. Calendar-wise, **plan in quarters, not weeks**.
-If the human expects a faster delivery, the scope (§1 non-goals) needs to be cut, not the
+Stage 0 is days-to-weeks of bounded substrate work; Stage 1 is the next bounded chunk
+(first CRUD + harness skeleton). The bulk of agent time is Stage 2: after deduplicating
+the megafiles in §5, expect ~70-100 translation units. Even at optimistic Claude
+throughput (one unit through both passes + gate in ~30 minutes of agent time, including
+repair loops), Stage 2 is hundreds of agent-hours plus design work for the RocksDB-
+divergent units plus MTR debugging. Calendar-wise, **plan in quarters, not weeks**. If
+the human expects a faster delivery, the scope (§1 non-goals) needs to be cut, not the
 gate (§0.3).
 
 `ha_rocksdb` is **never** removed by you. Decommissioning is a human decision made after a
@@ -413,16 +451,17 @@ long clean shadow period.
 
 ## 12. First actions for this session
 
-1. Confirm the repo paths in §2; report any mismatch.
-2. Ensure `storage/rocksdb/rocksdb/` submodule is initialized; ensure
+1. Confirm the repo paths in §2; resolve Stage 0 preconditions (§11). Report any mismatch.
+2. Execute **Stage 0** (§11): three checkpoints, three commits — empty plugin loads, cxx
+   wired end-to-end, SlateDB runs in a Rust unit test. Do not advance until all three are
+   committed green.
+3. Ensure `storage/rocksdb/rocksdb/` submodule is initialized; ensure
    `compile_commands.json` exists (generate via CMake if needed).
-3. Run the INDEX phase (§5) → `migration/manifest.json`.
-4. Run the INTERFACE phase (§6): propose all safe-Rust interface stubs in one batch.
-5. Stand up the **Stage-1 skeleton** (§11): a minimal `ha_slatedb` plugin that loads, with
-   the cxx bridge (§3) wired through `build.rs`/CMake via corrosion-rs (§4), backed by
-   SlateDB, such that `CREATE TABLE t(a INT) ENGINE=SLATEDB; INSERT; SELECT;` works
-   end-to-end **and** the §8.B differential bridge harness builds and runs on a smoke
-   corpus. Figure out the scaffold structure yourself within the conventions in §3 and §4.
-6. **Stop and present** the manifest ordering, the batch of proposed interfaces, and the
+4. Run the INDEX phase (§5) → `migration/manifest.json`.
+5. Run the INTERFACE phase (§6): propose all safe-Rust interface stubs in one batch.
+6. Stand up the **Stage-1 skeleton** (§11): minimal CRUD (`CREATE`/`INSERT`/`SELECT`)
+   through the cxx bridge against SlateDB, plus the §8.B differential bridge harness
+   building and running on a smoke corpus.
+7. **Stop and present** the manifest ordering, the batch of proposed interfaces, and the
    working Stage-1 skeleton for human review. Do not begin the TRANSLATE loop (§7) until
    interfaces are approved.
