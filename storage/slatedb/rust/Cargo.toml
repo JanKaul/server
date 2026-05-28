@@ -10,3 +10,12 @@ crate-type = ["staticlib"]
 
 [dependencies]
 cxx = "1.0"
+slatedb = "=0.13.1"
+object_store = { version = "0.12", features = ["aws"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+
+[dev-dependencies]
+testcontainers = "0.27"
+testcontainers-modules = { version = "0.15", features = ["minio"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
+aws-config = { version = "1", default-features = false, features = ["rt-tokio", "rustls"] }
