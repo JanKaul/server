@@ -1,0 +1,1643 @@
+{
+  "schema_version": 1,
+  "generator": "storage/slatedb/migration/index.py",
+  "source_root": "storage/rocksdb",
+  "loc_target": 500,
+  "notes": [
+    "v1: file-level units; megafiles flagged needs_split for INTERFACE phase.",
+    "Deps are from #include graph only; no call-graph yet (TRANSLATE-phase concern).",
+    "touches_rocksdb_api / touches_handler_vtable are heuristic; verify in INTERFACE.",
+    "Clusters are SCCs of the include graph; size > 1 means the cluster's interfaces",
+    "are mutually recursive and must be proposed together in one INTERFACE batch.",
+    "Clusters are listed in reverse-topological order (deps before dependents)."
+  ],
+  "clusters": [
+    {
+      "cluster_id": "c00",
+      "size": 1,
+      "loc": 94,
+      "members": [
+        "atomic_stat"
+      ],
+      "needs_split_in_interface_phase": false
+    },
+    {
+      "cluster_id": "c01",
+      "size": 1,
+      "loc": 103,
+      "members": [
+        "ha_rocksdb_proto"
+      ],
+      "needs_split_in_interface_phase": false
+    },
+    {
+      "cluster_id": "c02",
+      "size": 1,
+      "loc": 85,
+      "members": [
+        "logger"
+      ],
+      "needs_split_in_interface_phase": false
+    },
+    {
+      "cluster_id": "c03",
+      "size": 1,
+      "loc": 203,
+      "members": [
+        "ut0counter"
+      ],
+      "needs_split_in_interface_phase": false
+    },
+    {
+      "cluster_id": "c04",
+      "size": 1,
+      "loc": 396,
+      "members": [
+        "rdb_global"
+      ],
+      "needs_split_in_interface_phase": false
+    },
+    {
+      "cluster_id": "c05",
+      "size": 1,
+      "loc": 55,
+      "members": [
+        "rdb_mariadb_port"
+      ],
+      "needs_split_in_interface_phase": false
+    },
+    {
+      "cluster_id": "c06",
+      "size": 1,
+      "loc": 453,
+      "members": [
+        "rdb_perf_context"
+      ],
+      "needs_split_in_interface_phase": false
+    },
+    {
+      "cluster_id": "c07",
+      "size": 20,
+      "loc": 32445,
+      "members": [
+        "event_listener",
+        "ha_rocksdb",
+        "nosql_access",
+        "properties_collector",
+        "rdb_buff",
+        "rdb_cf_manager",
+        "rdb_cf_options",
+        "rdb_compact_filter",
+        "rdb_comparator",
+        "rdb_converter",
+        "rdb_datadic",
+        "rdb_i_s",
+        "rdb_index_merge",
+        "rdb_io_watchdog",
+        "rdb_mariadb_server_port",
+        "rdb_mutex_wrapper",
+        "rdb_psi",
+        "rdb_sst_info",
+        "rdb_threads",
+        "rdb_utils"
+      ],
+      "needs_split_in_interface_phase": true
+    }
+  ],
+  "units": {
+    "atomic_stat": {
+      "id": "atomic_stat",
+      "source_files": [
+        "storage/rocksdb/atomic_stat.h"
+      ],
+      "loc": 94,
+      "classes": [
+        {
+          "name": "atomic_stat",
+          "base": null
+        }
+      ],
+      "includes": [
+        "atomic"
+      ],
+      "touches_rocksdb_api": false,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": []
+    },
+    "event_listener": {
+      "id": "event_listener",
+      "source_files": [
+        "storage/rocksdb/event_listener.cc",
+        "storage/rocksdb/event_listener.h"
+      ],
+      "loc": 145,
+      "classes": [
+        {
+          "name": "Rdb_event_listener",
+          "base": "rocksdb::EventListener"
+        }
+      ],
+      "includes": [
+        "./event_listener.h",
+        "./ha_rocksdb.h",
+        "./properties_collector.h",
+        "./rdb_datadic.h",
+        "my_global.h",
+        "mysql/plugin.h",
+        "rocksdb/listener.h",
+        "string",
+        "vector"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "ha_rocksdb",
+        "properties_collector",
+        "rdb_datadic"
+      ]
+    },
+    "ha_rocksdb": {
+      "id": "ha_rocksdb",
+      "source_files": [
+        "storage/rocksdb/ha_rocksdb.cc",
+        "storage/rocksdb/ha_rocksdb.h"
+      ],
+      "loc": 15862,
+      "classes": [
+        {
+          "name": "Rdb_explicit_snapshot",
+          "base": "explicit_snapshot"
+        },
+        {
+          "name": "Rdb_open_tables_map",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_value",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_value",
+          "base": null
+        },
+        {
+          "name": "st_mysql_value",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_value",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_value",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "Rdb_read_free_rpl_updater",
+          "base": "Rdb_tables_scanner"
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_value",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "Rdb_snapshot_notifier",
+          "base": "rocksdb::TransactionNotifier"
+        },
+        {
+          "name": "Rdb_transaction",
+          "base": null
+        },
+        {
+          "name": "Rdb_transaction_impl",
+          "base": "Rdb_transaction"
+        },
+        {
+          "name": "Rdb_writebatch_impl",
+          "base": "Rdb_transaction"
+        },
+        {
+          "name": "Rdb_perf_context_guard",
+          "base": null
+        },
+        {
+          "name": "Rdb_snapshot_status",
+          "base": "Rdb_tx_list_walker"
+        },
+        {
+          "name": "Rdb_trx_info_aggregator",
+          "base": "Rdb_tx_list_walker"
+        },
+        {
+          "name": "unique_sk_buf_info",
+          "base": null
+        },
+        {
+          "name": "Item",
+          "base": null
+        },
+        {
+          "name": "system_status_var",
+          "base": null
+        },
+        {
+          "name": "rocksdb_status_counters_t",
+          "base": null
+        },
+        {
+          "name": "system_status_var",
+          "base": null
+        },
+        {
+          "name": "system_status_var",
+          "base": null
+        },
+        {
+          "name": "Rdb_index_collector",
+          "base": "Rdb_tables_scanner"
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_sys_var",
+          "base": null
+        },
+        {
+          "name": "st_mysql_value",
+          "base": null
+        },
+        {
+          "name": "st_mysql_storage_engine",
+          "base": null
+        },
+        {
+          "name": "Rdb_table_handler",
+          "base": null
+        },
+        {
+          "name": "hash",
+          "base": null
+        },
+        {
+          "name": "ha_rocksdb",
+          "base": "my_core::handler"
+        },
+        {
+          "name": "key_def_cf_info",
+          "base": null
+        },
+        {
+          "name": "update_row_info",
+          "base": null
+        },
+        {
+          "name": "unique_sk_buf_info",
+          "base": null
+        },
+        {
+          "name": "unique_sk_buf_info",
+          "base": null
+        },
+        {
+          "name": "Rdb_inplace_alter_ctx",
+          "base": "my_core::inplace_alter_handler_ctx"
+        }
+      ],
+      "includes": [
+        "./debug_sync.h",
+        "./event_listener.h",
+        "./ha_rocksdb.h",
+        "./ha_rocksdb_proto.h",
+        "./handler.h",
+        "./logger.h",
+        "./my_bit.h",
+        "./my_global.h",
+        "./my_stacktrace.h",
+        "./my_sys.h",
+        "./nosql_access.h",
+        "./rdb_buff.h",
+        "./rdb_cf_manager.h",
+        "./rdb_cf_options.h",
+        "./rdb_comparator.h",
+        "./rdb_converter.h",
+        "./rdb_datadic.h",
+        "./rdb_global.h",
+        "./rdb_i_s.h",
+        "./rdb_index_merge.h",
+        "./rdb_io_watchdog.h",
+        "./rdb_mariadb_server_port.h",
+        "./rdb_mutex_wrapper.h",
+        "./rdb_perf_context.h",
+        "./rdb_psi.h",
+        "./rdb_source_revision.h",
+        "./rdb_sst_info.h",
+        "./rdb_threads.h",
+        "./rdb_utils.h",
+        "./sql_audit.h",
+        "./sql_hset.h",
+        "./sql_string.h",
+        "./sql_table.h",
+        "./ut0counter.h",
+        "algorithm",
+        "direct.h",
+        "inttypes.h",
+        "limits",
+        "map",
+        "monitoring/histogram.h",
+        "my_global.h",
+        "mysql/psi/mysql_table.h",
+        "mysys_err.h",
+        "queue",
+        "rdb_mariadb_server_port.h",
+        "rocksdb/cache.h",
+        "rocksdb/compaction_filter.h",
+        "rocksdb/env.h",
+        "rocksdb/memory_allocator.h",
+        "rocksdb/merge_operator.h",
+        "rocksdb/perf_context.h",
+        "rocksdb/persistent_cache.h",
+        "rocksdb/rate_limiter.h",
+        "rocksdb/slice_transform.h",
+        "rocksdb/sst_file_manager.h",
+        "rocksdb/statistics.h",
+        "rocksdb/thread_status.h",
+        "rocksdb/utilities/checkpoint.h",
+        "rocksdb/utilities/convenience.h",
+        "rocksdb/utilities/memory_util.h",
+        "rocksdb/utilities/options_util.h",
+        "rocksdb/utilities/sim_cache.h",
+        "rocksdb/utilities/transaction_db.h",
+        "rocksdb/utilities/write_batch_with_index.h",
+        "set",
+        "string",
+        "test_util/sync_point.h",
+        "unordered_map",
+        "unordered_set",
+        "util/stop_watch.h",
+        "vector"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": true,
+      "needs_split": true,
+      "depends_on": [
+        "event_listener",
+        "ha_rocksdb_proto",
+        "logger",
+        "nosql_access",
+        "rdb_buff",
+        "rdb_cf_manager",
+        "rdb_cf_options",
+        "rdb_comparator",
+        "rdb_converter",
+        "rdb_datadic",
+        "rdb_global",
+        "rdb_i_s",
+        "rdb_index_merge",
+        "rdb_io_watchdog",
+        "rdb_mariadb_server_port",
+        "rdb_mutex_wrapper",
+        "rdb_perf_context",
+        "rdb_psi",
+        "rdb_sst_info",
+        "rdb_threads",
+        "rdb_utils",
+        "ut0counter"
+      ]
+    },
+    "ha_rocksdb_proto": {
+      "id": "ha_rocksdb_proto",
+      "source_files": [
+        "storage/rocksdb/ha_rocksdb_proto.h"
+      ],
+      "loc": 103,
+      "classes": [],
+      "includes": [
+        "./sql_string.h",
+        "rocksdb/table.h",
+        "rocksdb/utilities/transaction_db.h",
+        "string",
+        "vector"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": []
+    },
+    "logger": {
+      "id": "logger",
+      "source_files": [
+        "storage/rocksdb/logger.h"
+      ],
+      "loc": 85,
+      "classes": [
+        {
+          "name": "Rdb_logger",
+          "base": "rocksdb::Logger"
+        }
+      ],
+      "includes": [
+        "log.h",
+        "sstream",
+        "string"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": []
+    },
+    "nosql_access": {
+      "id": "nosql_access",
+      "source_files": [
+        "storage/rocksdb/nosql_access.cc",
+        "storage/rocksdb/nosql_access.h"
+      ],
+      "loc": 89,
+      "classes": [],
+      "includes": [
+        "../../sql/item.h",
+        "../../sql/protocol.h",
+        "../../sql/sql_base.h",
+        "../../sql/sql_class.h",
+        "../../sql/strfunc.h",
+        "./ha_rocksdb.h",
+        "./ha_rocksdb_proto.h",
+        "./nosql_access.h",
+        "./rdb_buff.h",
+        "./rdb_datadic.h",
+        "./sql_string.h",
+        "algorithm",
+        "array",
+        "ctype.h",
+        "limits",
+        "my_global.h",
+        "string",
+        "utility",
+        "vector"
+      ],
+      "touches_rocksdb_api": false,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "ha_rocksdb",
+        "ha_rocksdb_proto",
+        "rdb_buff",
+        "rdb_datadic"
+      ]
+    },
+    "properties_collector": {
+      "id": "properties_collector",
+      "source_files": [
+        "storage/rocksdb/properties_collector.cc",
+        "storage/rocksdb/properties_collector.h"
+      ],
+      "loc": 761,
+      "classes": [
+        {
+          "name": "Rdb_compact_params",
+          "base": null
+        },
+        {
+          "name": "Rdb_index_stats",
+          "base": null
+        },
+        {
+          "name": "Rdb_tbl_card_coll",
+          "base": null
+        },
+        {
+          "name": "Rdb_tbl_prop_coll",
+          "base": "rocksdb::TablePropertiesCollector"
+        },
+        {
+          "name": "Rdb_tbl_prop_coll_factory",
+          "base": null
+        }
+      ],
+      "includes": [
+        "./ha_rocksdb.h",
+        "./log.h",
+        "./my_stacktrace.h",
+        "./properties_collector.h",
+        "./rdb_datadic.h",
+        "./rdb_utils.h",
+        "./sql_array.h",
+        "algorithm",
+        "map",
+        "memory",
+        "my_global.h",
+        "rocksdb/db.h",
+        "stdlib.h",
+        "string",
+        "unordered_set",
+        "vector"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "ha_rocksdb",
+        "rdb_datadic",
+        "rdb_utils"
+      ]
+    },
+    "rdb_buff": {
+      "id": "rdb_buff",
+      "source_files": [
+        "storage/rocksdb/rdb_buff.h"
+      ],
+      "loc": 549,
+      "classes": [
+        {
+          "name": "Rdb_string_reader",
+          "base": null
+        },
+        {
+          "name": "Rdb_string_writer",
+          "base": null
+        },
+        {
+          "name": "Rdb_bit_writer",
+          "base": null
+        },
+        {
+          "name": "Rdb_bit_reader",
+          "base": null
+        },
+        {
+          "name": "Rdb_buf_writer",
+          "base": null
+        }
+      ],
+      "includes": [
+        "./my_global.h",
+        "./rdb_global.h",
+        "./rdb_utils.h",
+        "algorithm",
+        "libkern/OSByteOrder.h",
+        "rocksdb/slice.h",
+        "rocksdb/status.h",
+        "stdlib.h",
+        "string",
+        "vector"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "rdb_global",
+        "rdb_utils"
+      ]
+    },
+    "rdb_cf_manager": {
+      "id": "rdb_cf_manager",
+      "source_files": [
+        "storage/rocksdb/rdb_cf_manager.cc",
+        "storage/rocksdb/rdb_cf_manager.h"
+      ],
+      "loc": 377,
+      "classes": [
+        {
+          "name": "Rdb_cf_scanner",
+          "base": "Rdb_tables_scanner"
+        },
+        {
+          "name": "Rdb_cf_manager",
+          "base": null
+        }
+      ],
+      "includes": [
+        "./ha_rocksdb.h",
+        "./ha_rocksdb_proto.h",
+        "./rdb_cf_manager.h",
+        "./rdb_cf_options.h",
+        "./rdb_datadic.h",
+        "./rdb_psi.h",
+        "./sql_class.h",
+        "inttypes.h",
+        "map",
+        "my_global.h",
+        "rocksdb/db.h",
+        "string",
+        "vector"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "ha_rocksdb",
+        "ha_rocksdb_proto",
+        "rdb_cf_options",
+        "rdb_datadic",
+        "rdb_psi"
+      ]
+    },
+    "rdb_cf_options": {
+      "id": "rdb_cf_options",
+      "source_files": [
+        "storage/rocksdb/rdb_cf_options.cc",
+        "storage/rocksdb/rdb_cf_options.h"
+      ],
+      "loc": 441,
+      "classes": [
+        {
+          "name": "Rdb_cf_options",
+          "base": null
+        }
+      ],
+      "includes": [
+        "./ha_rocksdb.h",
+        "./log.h",
+        "./rdb_cf_manager.h",
+        "./rdb_cf_options.h",
+        "./rdb_compact_filter.h",
+        "./rdb_comparator.h",
+        "my_global.h",
+        "rocksdb/table.h",
+        "rocksdb/utilities/convenience.h",
+        "rocksdb/utilities/options_util.h",
+        "string",
+        "unordered_map"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "ha_rocksdb",
+        "rdb_cf_manager",
+        "rdb_compact_filter",
+        "rdb_comparator"
+      ]
+    },
+    "rdb_compact_filter": {
+      "id": "rdb_compact_filter",
+      "source_files": [
+        "storage/rocksdb/rdb_compact_filter.h"
+      ],
+      "loc": 216,
+      "classes": [
+        {
+          "name": "Rdb_compact_filter",
+          "base": "rocksdb::CompactionFilter"
+        },
+        {
+          "name": "Rdb_compact_filter_factory",
+          "base": "rocksdb::CompactionFilterFactory"
+        }
+      ],
+      "includes": [
+        "./ha_rocksdb_proto.h",
+        "./rdb_datadic.h",
+        "ctime",
+        "rocksdb/compaction_filter.h",
+        "string",
+        "time.h"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "ha_rocksdb_proto",
+        "rdb_datadic"
+      ]
+    },
+    "rdb_comparator": {
+      "id": "rdb_comparator",
+      "source_files": [
+        "storage/rocksdb/rdb_comparator.h"
+      ],
+      "loc": 85,
+      "classes": [
+        {
+          "name": "Rdb_pk_comparator",
+          "base": "rocksdb::Comparator"
+        },
+        {
+          "name": "Rdb_rev_comparator",
+          "base": "rocksdb::Comparator"
+        }
+      ],
+      "includes": [
+        "./m_ctype.h",
+        "./rdb_utils.h",
+        "rocksdb/comparator.h",
+        "string"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "rdb_utils"
+      ]
+    },
+    "rdb_converter": {
+      "id": "rdb_converter",
+      "source_files": [
+        "storage/rocksdb/rdb_converter.cc",
+        "storage/rocksdb/rdb_converter.h"
+      ],
+      "loc": 1085,
+      "classes": [
+        {
+          "name": "READ_FIELD",
+          "base": null
+        },
+        {
+          "name": "Rdb_convert_to_record_value_decoder",
+          "base": null
+        },
+        {
+          "name": "Rdb_value_field_iterator",
+          "base": null
+        },
+        {
+          "name": "Rdb_converter",
+          "base": null
+        }
+      ],
+      "includes": [
+        "./field.h",
+        "./ha_rocksdb.h",
+        "./ha_rocksdb_proto.h",
+        "./handler.h",
+        "./key.h",
+        "./m_ctype.h",
+        "./my_bit.h",
+        "./my_bitmap.h",
+        "./my_global.h",
+        "./my_stacktrace.h",
+        "./rdb_cf_manager.h",
+        "./rdb_converter.h",
+        "./rdb_datadic.h",
+        "./rdb_psi.h",
+        "./rdb_utils.h",
+        "./sql_string.h",
+        "./sql_table.h",
+        "./ut0counter.h",
+        "algorithm",
+        "map",
+        "my_global.h",
+        "string",
+        "vector"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": true,
+      "depends_on": [
+        "ha_rocksdb",
+        "ha_rocksdb_proto",
+        "rdb_cf_manager",
+        "rdb_datadic",
+        "rdb_psi",
+        "rdb_utils",
+        "ut0counter"
+      ]
+    },
+    "rdb_datadic": {
+      "id": "rdb_datadic",
+      "source_files": [
+        "storage/rocksdb/rdb_datadic.cc",
+        "storage/rocksdb/rdb_datadic.h"
+      ],
+      "loc": 7078,
+      "classes": [
+        {
+          "name": "Rdb_charset_space_info",
+          "base": null
+        },
+        {
+          "name": "Rdb_validate_tbls",
+          "base": "Rdb_tables_scanner"
+        },
+        {
+          "name": "Rdb_index_info",
+          "base": null
+        },
+        {
+          "name": "Rdb_convert_to_record_key_decoder",
+          "base": null
+        },
+        {
+          "name": "Rdb_pack_field_context",
+          "base": null
+        },
+        {
+          "name": "Rdb_key_field_iterator",
+          "base": null
+        },
+        {
+          "name": "Rdb_key_def",
+          "base": null
+        },
+        {
+          "name": "Rdb_collation_codec",
+          "base": null
+        },
+        {
+          "name": "Rdb_field_packing",
+          "base": null
+        },
+        {
+          "name": "Rdb_field_encoder",
+          "base": null
+        },
+        {
+          "name": "Rdb_tbl_def",
+          "base": null
+        },
+        {
+          "name": "Rdb_seq_generator",
+          "base": null
+        },
+        {
+          "name": "Rdb_ddl_manager",
+          "base": null
+        },
+        {
+          "name": "Rdb_binlog_manager",
+          "base": null
+        },
+        {
+          "name": "Rdb_dict_manager",
+          "base": null
+        },
+        {
+          "name": "Rdb_index_info",
+          "base": null
+        },
+        {
+          "name": "Rdb_system_merge_op",
+          "base": "rocksdb::AssociativeMergeOperator"
+        }
+      ],
+      "includes": [
+        "./field.h",
+        "./ha_rocksdb.h",
+        "./ha_rocksdb_proto.h",
+        "./key.h",
+        "./m_ctype.h",
+        "./my_bit.h",
+        "./my_bitmap.h",
+        "./my_stacktrace.h",
+        "./properties_collector.h",
+        "./rdb_buff.h",
+        "./rdb_cf_manager.h",
+        "./rdb_datadic.h",
+        "./rdb_psi.h",
+        "./rdb_utils.h",
+        "./sql_table.h",
+        "algorithm",
+        "arpa/inet.h",
+        "array",
+        "atomic",
+        "cstdlib",
+        "inttypes.h",
+        "limits",
+        "map",
+        "mutex",
+        "my_global.h",
+        "set",
+        "string",
+        "unordered_map",
+        "unordered_set",
+        "utility",
+        "vector"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": true,
+      "depends_on": [
+        "ha_rocksdb",
+        "ha_rocksdb_proto",
+        "properties_collector",
+        "rdb_buff",
+        "rdb_cf_manager",
+        "rdb_psi",
+        "rdb_utils"
+      ]
+    },
+    "rdb_global": {
+      "id": "rdb_global",
+      "source_files": [
+        "storage/rocksdb/rdb_global.h"
+      ],
+      "loc": 396,
+      "classes": [
+        {
+          "name": "Rdb_trx_info",
+          "base": null
+        },
+        {
+          "name": "Rdb_deadlock_info",
+          "base": null
+        },
+        {
+          "name": "Rdb_dl_trx_info",
+          "base": null
+        },
+        {
+          "name": "st_global_stats",
+          "base": null
+        },
+        {
+          "name": "st_export_stats",
+          "base": null
+        },
+        {
+          "name": "st_memory_stats",
+          "base": null
+        },
+        {
+          "name": "st_io_stall_stats",
+          "base": null
+        }
+      ],
+      "includes": [
+        "./handler.h",
+        "./my_global.h",
+        "./sql_string.h",
+        "./ut0counter.h",
+        "limits",
+        "string",
+        "vector"
+      ],
+      "touches_rocksdb_api": false,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "ut0counter"
+      ]
+    },
+    "rdb_i_s": {
+      "id": "rdb_i_s",
+      "source_files": [
+        "storage/rocksdb/rdb_i_s.cc",
+        "storage/rocksdb/rdb_i_s.h"
+      ],
+      "loc": 2012,
+      "classes": [
+        {
+          "name": "Rdb_ddl_scanner",
+          "base": "Rdb_tables_scanner"
+        },
+        {
+          "name": "st_maria_plugin",
+          "base": null
+        },
+        {
+          "name": "st_maria_plugin",
+          "base": null
+        },
+        {
+          "name": "st_maria_plugin",
+          "base": null
+        },
+        {
+          "name": "st_maria_plugin",
+          "base": null
+        },
+        {
+          "name": "st_maria_plugin",
+          "base": null
+        },
+        {
+          "name": "st_maria_plugin",
+          "base": null
+        },
+        {
+          "name": "st_maria_plugin",
+          "base": null
+        },
+        {
+          "name": "st_maria_plugin",
+          "base": null
+        },
+        {
+          "name": "st_maria_plugin",
+          "base": null
+        },
+        {
+          "name": "st_maria_plugin",
+          "base": null
+        },
+        {
+          "name": "st_maria_plugin",
+          "base": null
+        },
+        {
+          "name": "st_maria_plugin",
+          "base": null
+        },
+        {
+          "name": "st_maria_plugin",
+          "base": null
+        }
+      ],
+      "includes": [
+        "./ha_rocksdb.h",
+        "./ha_rocksdb_proto.h",
+        "./rdb_cf_manager.h",
+        "./rdb_datadic.h",
+        "./rdb_mariadb_port.h",
+        "./rdb_mariadb_server_port.h",
+        "./rdb_utils.h",
+        "algorithm",
+        "cctype",
+        "map",
+        "my_global.h",
+        "rocksdb/compaction_filter.h",
+        "rocksdb/convenience.h",
+        "rocksdb/filter_policy.h",
+        "rocksdb/memtablerep.h",
+        "rocksdb/merge_operator.h",
+        "rocksdb/slice_transform.h",
+        "rocksdb/utilities/transaction_db.h",
+        "sql_show.h",
+        "string",
+        "vector"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": true,
+      "depends_on": [
+        "ha_rocksdb",
+        "ha_rocksdb_proto",
+        "rdb_cf_manager",
+        "rdb_datadic",
+        "rdb_mariadb_port",
+        "rdb_mariadb_server_port",
+        "rdb_utils"
+      ]
+    },
+    "rdb_index_merge": {
+      "id": "rdb_index_merge",
+      "source_files": [
+        "storage/rocksdb/rdb_index_merge.cc",
+        "storage/rocksdb/rdb_index_merge.h"
+      ],
+      "loc": 857,
+      "classes": [
+        {
+          "name": "Rdb_index_merge",
+          "base": null
+        },
+        {
+          "name": "merge_file_info",
+          "base": null
+        },
+        {
+          "name": "merge_buf_info",
+          "base": null
+        },
+        {
+          "name": "merge_heap_entry",
+          "base": null
+        },
+        {
+          "name": "merge_heap_comparator",
+          "base": null
+        },
+        {
+          "name": "merge_record",
+          "base": null
+        }
+      ],
+      "includes": [
+        "../sql/log.h",
+        "../sql/sql_class.h",
+        "./ha_rocksdb.h",
+        "./handler.h",
+        "./my_global.h",
+        "./rdb_comparator.h",
+        "./rdb_datadic.h",
+        "./rdb_index_merge.h",
+        "my_global.h",
+        "queue",
+        "rocksdb/db.h",
+        "set",
+        "vector"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "ha_rocksdb",
+        "rdb_comparator",
+        "rdb_datadic"
+      ]
+    },
+    "rdb_io_watchdog": {
+      "id": "rdb_io_watchdog",
+      "source_files": [
+        "storage/rocksdb/rdb_io_watchdog.cc",
+        "storage/rocksdb/rdb_io_watchdog.h"
+      ],
+      "loc": 359,
+      "classes": [
+        {
+          "name": "Rdb_io_watchdog",
+          "base": null
+        }
+      ],
+      "includes": [
+        "./my_global.h",
+        "./my_stacktrace.h",
+        "./rdb_io_watchdog.h",
+        "./rdb_utils.h",
+        "atomic",
+        "signal.h",
+        "stdlib.h",
+        "string",
+        "string.h",
+        "time.h",
+        "vector"
+      ],
+      "touches_rocksdb_api": false,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "rdb_utils"
+      ]
+    },
+    "rdb_mariadb_port": {
+      "id": "rdb_mariadb_port",
+      "source_files": [
+        "storage/rocksdb/rdb_mariadb_port.h"
+      ],
+      "loc": 55,
+      "classes": [
+        {
+          "name": "my_io_perf_atomic_struct",
+          "base": null
+        }
+      ],
+      "includes": [
+        "atomic_stat.h",
+        "my_global.h",
+        "string",
+        "vector"
+      ],
+      "touches_rocksdb_api": false,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "atomic_stat"
+      ]
+    },
+    "rdb_mariadb_server_port": {
+      "id": "rdb_mariadb_server_port",
+      "source_files": [
+        "storage/rocksdb/rdb_mariadb_server_port.cc",
+        "storage/rocksdb/rdb_mariadb_server_port.h"
+      ],
+      "loc": 198,
+      "classes": [
+        {
+          "name": "Regex_list_handler",
+          "base": null
+        }
+      ],
+      "includes": [
+        "./debug_sync.h",
+        "./log.h",
+        "./my_bit.h",
+        "./my_stacktrace.h",
+        "./rdb_threads.h",
+        "./sql_table.h",
+        "atomic_stat.h",
+        "my_global.h",
+        "my_pthread.h",
+        "mysql/psi/mysql_table.h",
+        "mysql/psi/mysql_thread.h",
+        "mysys_err.h",
+        "rdb_mariadb_server_port.h",
+        "regex",
+        "string"
+      ],
+      "touches_rocksdb_api": false,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "atomic_stat",
+        "rdb_threads"
+      ]
+    },
+    "rdb_mutex_wrapper": {
+      "id": "rdb_mutex_wrapper",
+      "source_files": [
+        "storage/rocksdb/rdb_mutex_wrapper.cc",
+        "storage/rocksdb/rdb_mutex_wrapper.h"
+      ],
+      "loc": 357,
+      "classes": [
+        {
+          "name": "Rdb_mutex",
+          "base": "rocksdb::TransactionDBMutex"
+        },
+        {
+          "name": "Rdb_cond_var",
+          "base": "rocksdb::TransactionDBCondVar"
+        },
+        {
+          "name": "Rdb_mutex_factory",
+          "base": "rocksdb::TransactionDBMutexFactory"
+        }
+      ],
+      "includes": [
+        "./ha_rocksdb.h",
+        "./my_sys.h",
+        "./rdb_mutex_wrapper.h",
+        "./rdb_utils.h",
+        "chrono",
+        "condition_variable",
+        "functional",
+        "mutex",
+        "my_decimal.h",
+        "my_global.h",
+        "mysql/plugin.h",
+        "rdb_mariadb_port.h",
+        "rocksdb/utilities/transaction_db_mutex.h",
+        "sql_class.h",
+        "sql_priv.h",
+        "unordered_map"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "ha_rocksdb",
+        "rdb_mariadb_port",
+        "rdb_utils"
+      ]
+    },
+    "rdb_perf_context": {
+      "id": "rdb_perf_context",
+      "source_files": [
+        "storage/rocksdb/rdb_perf_context.cc",
+        "storage/rocksdb/rdb_perf_context.h"
+      ],
+      "loc": 453,
+      "classes": [
+        {
+          "name": "Rdb_atomic_perf_counters",
+          "base": null
+        },
+        {
+          "name": "Rdb_perf_counters",
+          "base": null
+        },
+        {
+          "name": "Rdb_io_perf",
+          "base": null
+        }
+      ],
+      "includes": [
+        "./ha_rocksdb_proto.h",
+        "./handler.h",
+        "./rdb_perf_context.h",
+        "atomic",
+        "cstdint",
+        "my_global.h",
+        "rdb_mariadb_port.h",
+        "rocksdb/iostats_context.h",
+        "rocksdb/perf_context.h",
+        "string"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "ha_rocksdb_proto",
+        "rdb_mariadb_port"
+      ]
+    },
+    "rdb_psi": {
+      "id": "rdb_psi",
+      "source_files": [
+        "storage/rocksdb/rdb_psi.cc",
+        "storage/rocksdb/rdb_psi.h"
+      ],
+      "loc": 169,
+      "classes": [],
+      "includes": [
+        "./rdb_psi.h",
+        "./rdb_utils.h",
+        "my_global.h",
+        "my_pthread.h",
+        "mysql/psi/mysql_stage.h"
+      ],
+      "touches_rocksdb_api": false,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "rdb_utils"
+      ]
+    },
+    "rdb_sst_info": {
+      "id": "rdb_sst_info",
+      "source_files": [
+        "storage/rocksdb/rdb_sst_info.cc",
+        "storage/rocksdb/rdb_sst_info.h"
+      ],
+      "loc": 827,
+      "classes": [
+        {
+          "name": "Rdb_sst_file_ordered",
+          "base": null
+        },
+        {
+          "name": "Rdb_sst_file",
+          "base": null
+        },
+        {
+          "name": "Rdb_sst_stack",
+          "base": null
+        },
+        {
+          "name": "Rdb_sst_info",
+          "base": null
+        },
+        {
+          "name": "Rdb_sst_commit_info",
+          "base": null
+        }
+      ],
+      "includes": [
+        "../sql/log.h",
+        "./ha_rocksdb.h",
+        "./ha_rocksdb_proto.h",
+        "./my_dir.h",
+        "./rdb_cf_options.h",
+        "./rdb_psi.h",
+        "./rdb_sst_info.h",
+        "./rdb_utils.h",
+        "atomic",
+        "condition_variable",
+        "cstdio",
+        "inttypes.h",
+        "mutex",
+        "my_global.h",
+        "mysqld_error.h",
+        "queue",
+        "rocksdb/db.h",
+        "rocksdb/options.h",
+        "rocksdb/sst_file_writer.h",
+        "stack",
+        "string",
+        "thread",
+        "utility",
+        "vector"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "ha_rocksdb",
+        "ha_rocksdb_proto",
+        "rdb_cf_options",
+        "rdb_psi",
+        "rdb_utils"
+      ]
+    },
+    "rdb_threads": {
+      "id": "rdb_threads",
+      "source_files": [
+        "storage/rocksdb/rdb_threads.cc",
+        "storage/rocksdb/rdb_threads.h"
+      ],
+      "loc": 274,
+      "classes": [
+        {
+          "name": "Rdb_thread",
+          "base": null
+        },
+        {
+          "name": "Rdb_background_thread",
+          "base": "Rdb_thread"
+        },
+        {
+          "name": "Rdb_manual_compaction_thread",
+          "base": "Rdb_thread"
+        },
+        {
+          "name": "Manual_compaction_request",
+          "base": null
+        },
+        {
+          "name": "Rdb_drop_index_thread",
+          "base": "Rdb_thread"
+        }
+      ],
+      "includes": [
+        "./my_global.h",
+        "./rdb_threads.h",
+        "./rdb_utils.h",
+        "map",
+        "my_global.h",
+        "my_pthread.h",
+        "mysql/psi/mysql_table.h",
+        "rocksdb/db.h",
+        "string"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "rdb_utils"
+      ]
+    },
+    "rdb_utils": {
+      "id": "rdb_utils",
+      "source_files": [
+        "storage/rocksdb/rdb_utils.cc",
+        "storage/rocksdb/rdb_utils.h"
+      ],
+      "loc": 704,
+      "classes": [
+        {
+          "name": "st_my_dir",
+          "base": null
+        },
+        {
+          "name": "Ensure_cleanup",
+          "base": null
+        }
+      ],
+      "includes": [
+        "../sql/log.h",
+        "./ha_rocksdb.h",
+        "./my_stacktrace.h",
+        "./rdb_utils.h",
+        "./sql_string.h",
+        "array",
+        "chrono",
+        "ctype.h",
+        "functional",
+        "jemalloc/jemalloc.h",
+        "my_global.h",
+        "rdb_mariadb_port.h",
+        "rocksdb/slice.h",
+        "rocksdb/status.h",
+        "sstream",
+        "string",
+        "util/compression.h",
+        "vector"
+      ],
+      "touches_rocksdb_api": true,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": [
+        "ha_rocksdb",
+        "rdb_mariadb_port"
+      ]
+    },
+    "ut0counter": {
+      "id": "ut0counter",
+      "source_files": [
+        "storage/rocksdb/ut0counter.h"
+      ],
+      "loc": 203,
+      "classes": [
+        {
+          "name": "generic_indexer_t",
+          "base": null
+        },
+        {
+          "name": "get_sched_indexer_t",
+          "base": "generic_indexer_t<Type"
+        },
+        {
+          "name": "thread_id_indexer_t",
+          "base": "generic_indexer_t<Type"
+        },
+        {
+          "name": "single_indexer_t",
+          "base": null
+        },
+        {
+          "name": "ib_counter_t",
+          "base": null
+        }
+      ],
+      "includes": [
+        "sched.h",
+        "string.h"
+      ],
+      "touches_rocksdb_api": false,
+      "touches_handler_vtable": false,
+      "needs_split": false,
+      "depends_on": []
+    }
+  }
+}
