@@ -101,46 +101,41 @@ def touches_handler_vtable(p: Path, klasses: list[dict]) -> bool:
 
 
 def unit_id_for(p: Path) -> str:
-    """One translation unit per stem; the .cc and .h pair together."""
-    return p.stem
+    """One translation unit per file. .h and .cc are separate units — the .h is
+    the interface (depended on by other units), the .cc is the implementation
+    (depends on its own .h plus impl-side headers from other units). Splitting
+    them breaks the .cc → other.h back-edges that otherwise turn nearly all of
+    MyRocks into one mutually-recursive cluster (see reports/index-v1.md)."""
+    return f"{p.stem}_{'h' if p.suffix == '.h' else 'cc'}"
 
 
 def build_units(files: list[Path]) -> dict[str, dict]:
     units: dict[str, dict] = {}
     for p in files:
         uid = unit_id_for(p)
-        u = units.setdefault(uid, {
-            "id": uid,
-            "source_files": [],
-            "loc": 0,
-            "classes": [],
-            "includes": [],
-            "touches_rocksdb_api": False,
-            "touches_handler_vtable": False,
-            "needs_split": False,
-            "depends_on": [],
-        })
-        rel = p.relative_to(REPO_ROOT).as_posix()
-        u["source_files"].append(rel)
-        u["loc"] += loc(p)
         ks = classes_in(p)
-        u["classes"].extend(ks)
-        u["includes"].extend(includes_in(p))
-        u["touches_rocksdb_api"] |= touches_rocksdb_api(p)
-        u["touches_handler_vtable"] |= touches_handler_vtable(p, ks)
-    for u in units.values():
-        u["needs_split"] = u["loc"] > 2 * LOC_TARGET
+        units[uid] = {
+            "id": uid,
+            "kind": "header" if p.suffix == ".h" else "impl",
+            "source_files": [p.relative_to(REPO_ROOT).as_posix()],
+            "loc": loc(p),
+            "classes": ks,
+            "includes": sorted(set(includes_in(p))),
+            "touches_rocksdb_api": touches_rocksdb_api(p),
+            "touches_handler_vtable": touches_handler_vtable(p, ks),
+            "needs_split": loc(p) > 2 * LOC_TARGET,
+            "depends_on": [],
+        }
     return units
 
 
 def resolve_deps(units: dict[str, dict]) -> None:
-    """Each unit's `depends_on` lists other in-scope units it #includes from."""
-    # Map each in-scope header basename → unit id
+    """Each unit's `depends_on` lists in-scope _h units it #includes from.
+    Implementation units (_cc) always depend on their paired _h."""
     header_to_unit: dict[str, str] = {}
     for u in units.values():
-        for src in u["source_files"]:
-            if src.endswith(".h"):
-                header_to_unit[Path(src).name] = u["id"]
+        if u["kind"] == "header":
+            header_to_unit[Path(u["source_files"][0]).name] = u["id"]
     for u in units.values():
         deps: set[str] = set()
         for inc in u["includes"]:
@@ -148,8 +143,13 @@ def resolve_deps(units: dict[str, dict]) -> None:
             other = header_to_unit.get(base)
             if other and other != u["id"]:
                 deps.add(other)
+        # Each .cc implicitly depends on its own .h even if not listed (it always is, in practice)
+        if u["kind"] == "impl":
+            stem = u["id"][:-3]  # strip "_cc"
+            own_h = f"{stem}_h"
+            if own_h in units:
+                deps.add(own_h)
         u["depends_on"] = sorted(deps)
-        u["includes"] = sorted(set(u["includes"]))  # dedup, keep all (for context)
 
 
 def tarjan_sccs(units: dict[str, dict]) -> list[list[str]]:
