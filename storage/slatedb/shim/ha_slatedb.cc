@@ -23,6 +23,8 @@
 #include <mysql/plugin.h>
 #include "ha_slatedb.h"
 #include "sql_class.h"
+#include "log.h"
+#include "slatedb_bridge/bridge.h"
 
 static handlerton *slatedb_hton;
 
@@ -39,6 +41,10 @@ static int slatedb_init_func(void *p)
   slatedb_hton->create= slatedb_create_handler;
   slatedb_hton->flags=  HTON_CAN_RECREATE;
   slatedb_hton->drop_table= [](handlerton *, const char *) { return -1; };
+
+  rust::String version= slatedb::slatedb_version();
+  sql_print_information("SLATEDB: cxx bridge live (%.*s)",
+                        static_cast<int>(version.size()), version.data());
   DBUG_RETURN(0);
 }
 
