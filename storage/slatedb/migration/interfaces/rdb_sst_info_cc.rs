@@ -16,7 +16,7 @@
 //! None — bulk-load behaves as a batched write path. Direct SST file
 //! emission is dropped (per _DESIGN.md §1).
 
-use slatedb::bytes::Bytes;
+use bytes::Bytes;
 use slatedb::Error;
 use std::sync::Arc;
 

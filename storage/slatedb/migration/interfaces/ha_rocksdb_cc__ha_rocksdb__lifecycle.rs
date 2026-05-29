@@ -98,9 +98,7 @@ pub enum RowLockMode {
 // `lock_rows: RowLockMode`, a `keyread_only: bool`, a `dup_pk_found: bool`, a
 // `retrieved_record: bytes::BytesMut`, and an `active_txn:
 // Option<slatedb::DbTransaction>`. Field shapes finalized in TRANSLATE.
-pub struct HaSlateDb {
-    _private: (),
-}
+use crate::ha_rocksdb_h__ha_rocksdb::HaSlateDb;
 
 impl HaSlateDb {
     /// `bool ha_rocksdb::init_with_fields()` — original C++ source line 6373.

@@ -25,7 +25,7 @@
 //! ## Out-of-scope methods
 //! None.
 
-use slatedb::bytes::Bytes;
+use bytes::Bytes;
 use slatedb::Error;
 
 use crate::ha_rocksdb_h__ha_rocksdb::{HaSlateDb, KeyShareView};

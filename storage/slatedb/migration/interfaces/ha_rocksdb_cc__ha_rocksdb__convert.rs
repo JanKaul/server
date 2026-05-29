@@ -28,7 +28,7 @@
 use bytes::Bytes;
 use slatedb::Error;
 
-use crate::ha_rocksdb_cc__ha_rocksdb__lifecycle::HaSlateDb;
+use crate::ha_rocksdb_h__ha_rocksdb::HaSlateDb;
 
 /// A MariaDB-format row buffer (`table->record[0]` style). Same POD type used
 /// by the `dml` bucket. Re-declared here for compile isolation; the canonical

@@ -46,8 +46,9 @@
 use bytes::Bytes;
 use slatedb::Error;
 
-use crate::ha_rocksdb_cc__ha_rocksdb__dml::UpdateRowInfo;
-use crate::ha_rocksdb_cc__ha_rocksdb__lifecycle::{HaSlateDb, ThdRef};
+use crate::ha_rocksdb_h__update_row_info::UpdateRowInfo;
+use crate::ha_rocksdb_h__ha_rocksdb::HaSlateDb;
+use crate::ha_rocksdb_cc__ha_rocksdb__lifecycle::ThdRef;
 
 /// Mirror of MyRocks `HA_CHECK_OPT` — the bitmask passed by the SQL layer to
 /// `CHECK` / `OPTIMIZE` / `ANALYZE TABLE`. Forwarded as an opaque tuple; the

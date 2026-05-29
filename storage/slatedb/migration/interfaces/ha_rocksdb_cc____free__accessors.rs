@@ -20,7 +20,7 @@
 //! sensible defaults rather than non-goal errors so that SHOW STATUS
 //! callers keep working.
 
-use slatedb::bytes::Bytes;
+use bytes::Bytes;
 use slatedb::Error;
 use std::sync::Arc;
 
@@ -119,7 +119,7 @@ pub fn can_hold_read_locks_on_select(isolation_level: u32, _select_lock_type: u3
 /// Returns the absolute path of the corruption-marker file in the data dir.
 /// Original: `rdb_corruption_marker_file_name`.
 pub fn rdb_corruption_marker_file_name() -> String {
-    todo!("join data_dir + 'ROCKSDB_CORRUPTED'")
+    todo!("join data_dir + 'SLATEDB_CORRUPTED'")
 }
 
 /// `rmdir -rf`: recursively delete a directory tree. Used when dropping a

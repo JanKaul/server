@@ -33,7 +33,7 @@ use bytes::Bytes;
 use slatedb::Error;
 
 use crate::ha_rocksdb_cc__ha_rocksdb__index::KeyRange;
-use crate::ha_rocksdb_cc__ha_rocksdb__lifecycle::HaSlateDb;
+use crate::ha_rocksdb_h__ha_rocksdb::HaSlateDb;
 use crate::rdb_global_h::{MAX_INDEX_COL_LEN_LARGE, MAX_INDEX_COL_LEN_SMALL};
 
 /// Bitmask passed to `handler::info(uint flag)`. Mirrors the

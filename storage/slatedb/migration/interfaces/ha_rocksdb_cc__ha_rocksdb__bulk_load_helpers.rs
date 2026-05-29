@@ -32,7 +32,7 @@ use bytes::Bytes;
 use crate::rdb_global_h::GlIndexId;
 
 /// Forward-declared. Owned by A2's `ha_rocksdb_h` stub.
-pub struct HaSlateDb;
+use crate::ha_rocksdb_h__ha_rocksdb::HaSlateDb;
 
 impl HaSlateDb {
     /// True iff the current statement is configured for "commit in the

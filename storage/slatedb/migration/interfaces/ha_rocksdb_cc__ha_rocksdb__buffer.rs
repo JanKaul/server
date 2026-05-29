@@ -33,7 +33,7 @@ use bytes::Bytes;
 use slatedb::Error;
 
 /// Forward-declared. Owned by A2's `ha_rocksdb_h` stub.
-pub struct HaSlateDb;
+use crate::ha_rocksdb_h__ha_rocksdb::HaSlateDb;
 
 /// Forward-decl mirror of the per-table key-def array. The real type lives
 /// in `codec::ddl`; we reference it through a handle.

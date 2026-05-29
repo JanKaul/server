@@ -50,14 +50,11 @@ pub struct IbCounter {
 
 impl IbCounter {
     pub fn new() -> Self {
-        // Construct on the heap to avoid a 4 KiB stack allocation.
-        let shards: Box<[Slot; IB_N_SLOTS]> = (0..IB_N_SLOTS)
-            .map(|_| Slot::default())
-            .collect::<Vec<_>>()
-            .into_boxed_slice()
-            .try_into()
-            .ok()
-            .expect("IB_N_SLOTS-sized box");
+        // Construct on the heap to avoid a 4 KiB stack allocation. Uses
+        // `std::array::from_fn` (no fallible conversion, hence no `expect`
+        // required by §0.4).
+        let shards: Box<[Slot; IB_N_SLOTS]> =
+            Box::new(std::array::from_fn(|_| Slot::default()));
         Self { shards }
     }
 

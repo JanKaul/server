@@ -34,7 +34,7 @@ pub struct IndexInfo {
 
 impl IndexInfo {
     /// Encode to the system-CF value bytes (preserves MyRocks format).
-    pub fn serialize(&self) -> slatedb::bytes::Bytes {
+    pub fn serialize(&self) -> bytes::Bytes {
         todo!("preserve MyRocks Rdb_index_info encoding")
     }
 

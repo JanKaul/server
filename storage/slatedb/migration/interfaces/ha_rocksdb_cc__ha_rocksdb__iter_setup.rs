@@ -34,7 +34,7 @@ use bytes::Bytes;
 use crate::rdb_comparator_h::KeyDirection;
 
 /// Forward-declared. Owned by A2's `ha_rocksdb_h` stub.
-pub struct HaSlateDb;
+use crate::ha_rocksdb_h__ha_rocksdb::HaSlateDb;
 
 /// A computed range for `Db::scan_with_options`. Both bounds are inclusive at
 /// the lower end and exclusive at the upper end (matching SlateDB's

@@ -112,7 +112,13 @@ pub fn xid_from_bytes(src: &[u8]) -> Result<Xid, Error> {
     if src.len() < RDB_XIDHDR_LEN {
         return Err(Error::invalid("xid: header truncated".into()));
     }
-    let raw_fid8 = u64::from_be_bytes(src[..RDB_FORMATID_SZ].try_into().unwrap());
+    // Length checked above (`src.len() < RDB_XIDHDR_LEN`); the `try_into`
+    // failure case is unreachable but we still propagate rather than expect.
+    let raw_fid8 = u64::from_be_bytes(
+        src[..RDB_FORMATID_SZ]
+            .try_into()
+            .map_err(|_| Error::invalid("xid: format_id slice not 8 bytes".into()))?,
+    );
     let format_id = raw_fid8 as i64;
     let gtrid_len = src[RDB_FORMATID_SZ] as usize;
     let bqual_len = src[RDB_FORMATID_SZ + 1] as usize;

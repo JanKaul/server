@@ -10,14 +10,15 @@
 //! and the unpack-info writer for the new PK.
 //!
 //! Per _DESIGN.md §5, the C++ `Rdb_transaction*` is replaced by a borrow of
-//! the engine's `Txn` wrapper around `slatedb::DbTransaction`. `rocksdb::Slice`
-//! becomes `&[u8]` for borrowed and `Bytes` for owned views.
+//! `dyn RdbTransaction` (the trait that wraps `slatedb::DbTransaction`).
+//! `rocksdb::Slice` becomes `&[u8]` for borrowed and `Bytes` for owned views.
 //!
 //! ## Out-of-scope methods
 //! None — pure data carrier.
 
-use slatedb::bytes::Bytes;
+use bytes::Bytes;
 
+use crate::ha_rocksdb_cc__Rdb_transaction::RdbTransaction;
 use crate::rdb_buff_h::StringWriter;
 
 /// Scratch state threaded through the UPDATE pipeline. Constructed in
@@ -27,9 +28,9 @@ use crate::rdb_buff_h::StringWriter;
 ///
 /// Original: ha_rocksdb.h:674 — `struct update_row_info`.
 pub struct UpdateRowInfo<'a> {
-    /// Borrowed engine txn (a wrapper around `slatedb::DbTransaction`).
+    /// Borrowed engine txn (a `dyn RdbTransaction` wrapping `slatedb::DbTransaction`).
     /// Lifetime tied to the statement; never null while UPDATE is in flight.
-    pub tx: &'a crate::ha_rocksdb_cc__Rdb_transaction::Txn,
+    pub tx: &'a (dyn RdbTransaction + Send + Sync),
 
     /// New row in MySQL-wire format. Borrowed from the MariaDB caller's
     /// `uchar*` row buffer for the duration of the UPDATE.

@@ -8,8 +8,8 @@
 //! directly to safe Rust. Encoders preserve bit-for-bit format because the
 //! on-disk key format (per _DESIGN.md §2) is preserved from MyRocks.
 //!
-//! We use `bytes::Bytes` / `BytesMut` from SlateDB's re-exported `bytes` crate
-//! (`slatedb::bytes`) for zero-copy buffer handling where appropriate.
+//! We use `bytes::Bytes` / `BytesMut` (the `bytes` crate, version-aligned
+//! with SlateDB's transitive dep) for zero-copy buffer handling where appropriate.
 //!
 //! ## Out-of-scope
 //! None — pure data manipulation, fully in scope.
@@ -50,15 +50,20 @@ pub fn store_index(dst: &mut [u8], index_id: u32) {
 }
 
 // --- network-byte-order reads ---
+//
+// Each returns `None` on under-read (matches the MyRocks `nullptr`-on-error
+// pattern and respects §0.4 "no expect/unwrap on request paths"). Callers
+// inside `StringReader` already do their own length checks; the `Option`
+// makes the precondition explicit at the API surface.
 
-pub fn read_u64_be(src: &[u8]) -> u64 {
-    u64::from_be_bytes(src[..8].try_into().expect("buffer too small"))
+pub fn read_u64_be(src: &[u8]) -> Option<u64> {
+    Some(u64::from_be_bytes(src.get(..8)?.try_into().ok()?))
 }
-pub fn read_u32_be(src: &[u8]) -> u32 {
-    u32::from_be_bytes(src[..4].try_into().expect("buffer too small"))
+pub fn read_u32_be(src: &[u8]) -> Option<u32> {
+    Some(u32::from_be_bytes(src.get(..4)?.try_into().ok()?))
 }
-pub fn read_u16_be(src: &[u8]) -> u16 {
-    u16::from_be_bytes(src[..2].try_into().expect("buffer too small"))
+pub fn read_u16_be(src: &[u8]) -> Option<u16> {
+    Some(u16::from_be_bytes(src.get(..2)?.try_into().ok()?))
 }
 
 // --- string reader (sliding window over an immutable byte slice) ---
@@ -84,9 +89,9 @@ impl<'a> StringReader<'a> {
     }
 
     pub fn read_u8(&mut self) -> Option<u8> { self.read(1).map(|s| s[0]) }
-    pub fn read_u16_be(&mut self) -> Option<u16> { self.read(2).map(read_u16_be) }
-    pub fn read_u32_be(&mut self) -> Option<u32> { self.read(4).map(read_u32_be) }
-    pub fn read_u64_be(&mut self) -> Option<u64> { self.read(8).map(read_u64_be) }
+    pub fn read_u16_be(&mut self) -> Option<u16> { self.read(2).and_then(read_u16_be) }
+    pub fn read_u32_be(&mut self) -> Option<u32> { self.read(4).and_then(read_u32_be) }
+    pub fn read_u64_be(&mut self) -> Option<u64> { self.read(8).and_then(read_u64_be) }
 
     pub fn remaining(&self) -> usize { self.buf.len() - self.pos }
     pub fn current_pos(&self) -> usize { self.pos }
@@ -126,8 +131,8 @@ impl StringWriter {
 
     /// Convert to a `bytes::Bytes` (zero-copy via `Vec → Bytes`).
     /// Used when handing the buffer to SlateDB which takes `Bytes` for keys/values.
-    pub fn into_bytes(self) -> slatedb::bytes::Bytes {
-        slatedb::bytes::Bytes::from(self.data)
+    pub fn into_bytes(self) -> bytes::Bytes {
+        bytes::Bytes::from(self.data)
     }
 }
 
@@ -207,8 +212,8 @@ impl<const N: usize> BufWriter<N> {
     pub fn size(&self) -> usize { self.pos }
 
     /// Copy the written prefix into a `Bytes` (cheap — small fixed buffers).
-    pub fn to_bytes(&self) -> slatedb::bytes::Bytes {
-        slatedb::bytes::Bytes::copy_from_slice(self.data())
+    pub fn to_bytes(&self) -> bytes::Bytes {
+        bytes::Bytes::copy_from_slice(self.data())
     }
 }
 

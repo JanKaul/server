@@ -38,13 +38,14 @@ use crate::rdb_global_h::{ExportStats, MemoryStats};
 
 /// Global row-op counter snapshot — populated by `update_status` from the
 /// engine-side `GlobalStats`. The numeric SHOW STATUS getters read from
-/// this struct (via a `OnceLock<RwLock<_>>`).
-pub static EXPORT_STATS: once_cell::sync::Lazy<std::sync::RwLock<ExportStats>> =
-    once_cell::sync::Lazy::new(|| std::sync::RwLock::new(ExportStats::default()));
+/// this struct via a `parking_lot::RwLock` (no poisoning, so `.write()`
+/// is infallible — see §0.4).
+pub static EXPORT_STATS: once_cell::sync::Lazy<parking_lot::RwLock<ExportStats>> =
+    once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(ExportStats::default()));
 
 /// Memtable-usage snapshot. Populated from `DbStatus` once per status fetch.
-pub static MEMORY_STATS: once_cell::sync::Lazy<std::sync::RwLock<MemoryStats>> =
-    once_cell::sync::Lazy::new(|| std::sync::RwLock::new(MemoryStats::default()));
+pub static MEMORY_STATS: once_cell::sync::Lazy<parking_lot::RwLock<MemoryStats>> =
+    once_cell::sync::Lazy::new(|| parking_lot::RwLock::new(MemoryStats::default()));
 
 /// A single (type, name, status_body) row produced by `show_status`.
 /// The cxx shim feeds these back to MariaDB's `stat_print_fn` one at a time.
@@ -59,7 +60,10 @@ pub struct StatusRow {
 /// every `SHOW STATUS` to guarantee freshness.
 /// Original: ha_rocksdb.cc:13318 — `myrocks_update_status`.
 pub fn update_status(global_rows: &[AtomicU64], global_system_rows: &[AtomicU64], queries: &[AtomicU64], covered: &AtomicU64) {
-    let mut s = EXPORT_STATS.write().expect("EXPORT_STATS poisoned");
+    // `parking_lot::RwLock` (not `std::sync::RwLock`) — no poisoning, so
+    // `.write()` is infallible. Switched to parking_lot per §0.4 to drop
+    // the `expect("...poisoned")` panic site.
+    let mut s = EXPORT_STATS.write();
     s.rows_deleted = global_rows[0].load(Ordering::Relaxed);
     s.rows_inserted = global_rows[1].load(Ordering::Relaxed);
     s.rows_read = global_rows[2].load(Ordering::Relaxed);

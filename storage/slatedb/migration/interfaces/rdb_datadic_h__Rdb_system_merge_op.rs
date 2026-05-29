@@ -17,7 +17,7 @@
 //! ## Out-of-scope methods
 //! None.
 
-use slatedb::bytes::Bytes;
+use bytes::Bytes;
 use slatedb::{MergeOperator, MergeOperatorError};
 
 /// System-CF merge operator. Registered once at engine init.

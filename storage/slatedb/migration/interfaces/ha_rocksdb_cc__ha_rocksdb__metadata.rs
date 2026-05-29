@@ -26,7 +26,7 @@
 use slatedb::Error;
 
 /// Forward-declared. Owned by A2's `ha_rocksdb_h` stub.
-pub struct HaSlateDb;
+use crate::ha_rocksdb_h__ha_rocksdb::HaSlateDb;
 
 /// Mirror of `Rdb_tbl_def` — A1 owns the canonical type in
 /// `codec::ddl`. Referenced here by reference only.

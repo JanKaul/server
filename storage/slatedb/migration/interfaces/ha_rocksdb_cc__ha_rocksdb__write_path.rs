@@ -37,21 +37,8 @@ use bytes::Bytes;
 
 use crate::rdb_global_h::GlIndexId;
 
-/// Forward-declared. Owned by A2's `ha_rocksdb_h` stub.
-pub struct HaSlateDb;
-
-/// Mirror of `struct update_row_info` — A2 / A3-auto_incr also reference it.
-/// Canonical definition lives in A2's ha_rocksdb_h. Sketched here for
-/// signature completeness only.
-pub struct UpdateRowInfo {
-    pub hidden_pk_id: i64,
-    pub new_pk_buf: Bytes,
-    pub old_pk_buf: Bytes,
-    pub new_row_buf: Bytes,
-    pub old_row_buf: Option<Bytes>,
-    pub skip_unique_check: bool,
-    pub gl_index_id: GlIndexId,
-}
+use crate::ha_rocksdb_h__ha_rocksdb::HaSlateDb;
+use crate::ha_rocksdb_h__update_row_info::UpdateRowInfo;
 
 impl HaSlateDb {
     /// True iff the session has enabled `blind_delete_primary_key` AND the

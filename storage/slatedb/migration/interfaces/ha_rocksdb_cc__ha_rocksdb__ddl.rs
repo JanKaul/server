@@ -28,7 +28,8 @@
 use bytes::Bytes;
 use slatedb::Error;
 
-use crate::ha_rocksdb_cc__ha_rocksdb__lifecycle::{HaSlateDb, TableRef, ThdRef};
+use crate::ha_rocksdb_h__ha_rocksdb::HaSlateDb;
+use crate::ha_rocksdb_cc__ha_rocksdb__lifecycle::{TableRef, ThdRef};
 
 /// Forwarded to a future TABLE-shape unit. Mirrors `HA_CREATE_INFO`:
 /// `AUTO_INCREMENT` start value, `COMMENT`, charset hints, and the

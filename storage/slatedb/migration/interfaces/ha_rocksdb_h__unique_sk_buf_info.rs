@@ -17,7 +17,7 @@
 //! ## Out-of-scope methods
 //! None — pure data carrier with one method.
 
-use slatedb::bytes::Bytes;
+use bytes::Bytes;
 
 /// Ping-pong buffer for inplace unique-index dup detection. Each iteration
 /// of the inplace-populate-sk loop calls `swap_and_get_sk_buf()` to switch

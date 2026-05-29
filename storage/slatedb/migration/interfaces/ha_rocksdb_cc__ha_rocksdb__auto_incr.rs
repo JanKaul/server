@@ -27,8 +27,8 @@ use slatedb::Error;
 
 use crate::rdb_global_h::GlIndexId;
 
-/// Forward-declared. The real type is produced by A2's `ha_rocksdb_h` stub.
-pub struct HaSlateDb;
+use crate::ha_rocksdb_h__ha_rocksdb::HaSlateDb;
+use crate::ha_rocksdb_h__update_row_info::UpdateRowInfo;
 
 impl HaSlateDb {
     /// Load the persisted auto-increment value for this handler's table into
@@ -186,16 +186,5 @@ impl HaSlateDb {
     }
 }
 
-/// Mirror of `struct update_row_info` (declared in `ha_rocksdb.h`). Provided
-/// by A2 — referenced here for signature completeness only.
-pub struct UpdateRowInfo {
-    pub hidden_pk_id: i64,
-    /// new-row PK bytes after packing
-    pub new_pk_buf: bytes::Bytes,
-    /// old-row PK bytes (empty for INSERT)
-    pub old_pk_buf: bytes::Bytes,
-    // TODO(human): the C++ struct has `new_pk_unpack_info`, `tx`, `skip_unique_check`,
-    // `old_data`, `new_data` pointers that we need to model carefully — A2 owns the
-    // canonical definition; this is just a placeholder so this file type-checks in
-    // isolation during stub review.
-}
+// `UpdateRowInfo` is canonically defined in `ha_rocksdb_h__update_row_info.rs`.
+// Imported at the top of this file.

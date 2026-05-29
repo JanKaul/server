@@ -222,6 +222,141 @@ call `txn.mark_read(...)` on every key returned by a non-`SELECT FOR UPDATE`
 read in `SerializableSnapshot` mode. This is what lets the engine detect
 read-write conflicts at commit time.
 
+## 5.2 Concurrency model migration (pessimistic → optimistic)
+
+**This is the single largest behavioural shift in the engine and warrants
+its own section.** Added in response to the interface-phase critique that
+caught the gap in §5 above.
+
+### The shift
+
+MyRocks runs on RocksDB's `TransactionDB` with **pessimistic row locking**:
+`SELECT ... FOR UPDATE` acquires a real X lock; competing writers block
+(or deadlock-abort early); `innodb_lock_wait_timeout` is a meaningful knob.
+See `storage/rocksdb/ha_rocksdb.cc:3395` (`GetForUpdate`), `:5647`
+(`TransactionDB::Open`), `:3425-3427` (per-THD `lock_timeout` /
+`deadlock_detect`).
+
+SlateDB has **optimistic SSI** only (`IsolationLevel::Snapshot` or
+`SerializableSnapshot`, per `transaction_manager.rs:16`). There is no
+lock-manager extension point. `mark_read`/`unmark_write` track the
+read/write sets used at commit-time conflict detection — they do not
+block.
+
+### What changes for users
+
+| Surface | MyRocks today | SlateDB engine |
+|---|---|---|
+| `SELECT ... FOR UPDATE` | Acquires X lock; blocks competing writers | Returns immediately; conflict surfaces at commit on **whichever** txn commits second |
+| `HA_ERR_LOCK_DEADLOCK` | "Server picked you as victim before you finished work" | "You ran the whole txn, then we threw it away at commit" — retry cost rotates from ms to "whatever the txn's work was" |
+| `innodb_lock_wait_timeout` analog (`slatedb_lock_wait_timeout`) | Tunes lock-wait behaviour | **No-op** (no lock-wait path exists) |
+| `deadlock_detect` / `deadlock_detect_depth` | Toggle the deadlock-detection graph traversal | **No-ops** |
+| `information_schema.rocksdb_locks` | Held row locks per txn | Buffered writes per txn — schema preserved, semantics shifted (see `rdb_i_s_cc__lock_info.rs` for the explicit note) |
+| `information_schema.rocksdb_deadlock` | History of deadlock cycles | History of commit-time SSI conflict victims (`path.len() == 1` typical) |
+| Long-running contended writes | First writer to ask wins (early-victim semantics) | Last writer to commit may livelock under contention; needs application-level backoff |
+
+### Why this matters NOW
+
+Applications use `FOR UPDATE` in two distinct patterns:
+
+1. **"Cheap-read, expensive-update" with serialization intent** — read
+   a row, compute new value, write back, expecting that competing
+   readers wait. Under SSI this gives correctness regressions: two
+   competing increments can both commit (whichever races first wins),
+   and the loser silently retries — but only if the application is
+   coded for retry. Most aren't.
+2. **"Pessimistic acquire" for queue dispatch** — `SELECT ... FOR
+   UPDATE SKIP LOCKED` patterns to fan out work across consumers.
+   Without locks, two consumers grab the same row and both succeed at
+   commit. Application-level idempotency or SKIP-LOCKED-equivalent
+   semantics aren't free.
+
+Both patterns are common in MyRocks workloads. Migration without
+disclosure leads to silent data corruption (pattern 1) or duplicate
+work (pattern 2).
+
+### Three options
+
+#### (A) Embrace SSI; document and deprecate
+
+- `slatedb_lock_wait_timeout` and `slatedb_deadlock_detect*` become
+  read-only sysvars (visible but ignored), with `SHOW WARNINGS`
+  emitting an informational note on session start.
+- `FOR UPDATE` doc-explicitly maps to "mark in read-set; conflict at
+  commit". Documented as a non-trivial semantic difference.
+- `information_schema.rocksdb_locks` renamed (or kept with a clearly
+  rewritten column doc string) — see option below for whether to
+  rename or preserve.
+- Retry guidance documented for `HA_ERR_LOCK_DEADLOCK` (now actually
+  meaning "SSI conflict at commit").
+
+Cost: documentation work + small sysvar deprecation. Application
+authors carry the burden.
+
+#### (B) Layer engine-side pessimistic locks on top of SSI
+
+- Add a Rust-side lock manager (`Mutex<HashMap<KeyBytes, LockHolder>>`)
+  consulted on every `FOR UPDATE` and every write. Honours
+  `lock_wait_timeout` and per-THD `deadlock_detect`.
+- On conflict: block, time out, or deadlock-abort early as MyRocks does.
+- SSI conflict detection remains as a second safety net.
+
+Cost: significant engineering — a real lock manager is ~1000+ LoC of
+careful code with its own correctness story. Reintroduces the
+complexity SlateDB deliberately omits. Memory overhead per active key.
+Maintenance burden.
+
+#### (C) Hybrid: session-selectable
+
+- New session var `slatedb_concurrency_mode = optimistic | pessimistic`
+  (default: optimistic).
+- Pessimistic mode opts into option (B)'s machinery for the duration
+  of the session.
+- Default workloads pay no overhead; legacy workloads can opt back in.
+
+Cost: implements both (A) and (B), plus the mode-selection plumbing.
+The "best of both" framing but actually "all the costs of both".
+
+### Recommendation
+
+**Option (A).** Aligned with §1 of `SlateDB_storage_engine.md`:
+
+> This migration is **not** a drop-in MyRocks replacement; it is a new
+> engine that happens to share MyRocks' SQL semantics where feasible.
+> [...] Behavioural parity with MyRocks on the MTR subset that does
+> **not depend on RocksDB internals** (column families, merge operators,
+> TTL compaction filters, ...).
+
+The concurrency model **is** a RocksDB internal that users built on top
+of. Per §1, we don't promise parity here. Adding pessimistic locks (B)
+re-introduces machinery SlateDB deliberately avoids, and at scale
+likely performs worse than SSI on the object-store substrate (lock
+table contention plus the writes still cost the same).
+
+### Action items if option (A) is approved
+
+1. Add a `## 5.2 Concurrency` section to user-facing engine docs
+   covering the table above.
+2. Deprecate (but keep accepting) `slatedb_lock_wait_timeout` and
+   `slatedb_deadlock_detect*`. Emit a one-time `SHOW WARNINGS`
+   informational note per session if any of these are non-default.
+3. `rdb_i_s_cc__lock_info.rs` already documents the semantic shift —
+   verify the per-row note reaches the column documentation (DOCSTRING
+   parameter on the `Column` declaration).
+4. `rdb_i_s_cc__deadlock_info.rs` rename `MODE` semantics in doc
+   comment.
+5. `rdb_psi_h.rs` rename `STAGE_WAITING_ON_ROW_LOCK` to
+   `STAGE_WAITING_ON_TXN_COMMIT` — **done in this patch round**.
+6. The 5 cited sites in `ha_rocksdb_cc____free__error_helpers.rs`
+   (mapping `ErrorKind::Transaction` → `HA_ERR_LOCK_DEADLOCK`) get a
+   doc-comment note flagging the rotated retry semantics.
+
+### Decision required before TRANSLATE
+
+**Open Question 9 (new):** Which option (A/B/C)? Lean (A). Block
+TRANSLATE on any handler unit that touches `FOR UPDATE`, savepoints,
+locks I_S tables, or the deadlock I_S table until ruled.
+
 ## 6. Write-batching layer (per §9 of doc, simpler than v1)
 
 SlateDB has `WriteBatch` natively. Our role is narrower than v1 envisioned:
@@ -332,7 +467,9 @@ pub trait ExampleTrait {
 
 ## 11. Open questions (reviewer should rule on)
 
-Down from 12 to 8 because SlateDB removed several decisions:
+Down from 12 to 8 in v2 because SlateDB removed several decisions;
+expanded to 10 after the interface-phase critique surfaced
+concurrency-model and 2PC-protocol gaps.
 
 1. **CF-id → key-prefix layout.** `varint(cf_id) || u32_be(index_id) || ...`
    matches MyRocks and feeds cleanly into `PrefixExtractor`. Confirm.
@@ -351,9 +488,37 @@ Down from 12 to 8 because SlateDB removed several decisions:
    Confirm we limit to `aws` initially.
 7. **Compression codec.** `Settings.compression_codec` default. Lean: `zstd`
    (feature `zstd`). Confirm.
-8. **2PC implementation strategy.** XA prepare → SlateDB `flush_with_options(Wal)`
-   plus a metadata marker in our system CF. Commit → marker flip. Confirm
-   this layered approach (no native SlateDB XA primitive exists).
+8. **2PC implementation strategy.** *(rewritten after critique.)* SlateDB's
+   `flush_with_options(Wal)` does NOT make a `DbTransaction`'s buffered writes
+   durable — they live in-memory until commit. Two viable shapes:
+   - **(8a) Serialize-and-replay** *(recommended)*: `prepare` serializes the
+     txn's buffered writes into a `xa_prepare:<xid>` system-CF key (going
+     through the underlying `Db` and thus through the WAL with
+     `await_durable=true`), then rolls back the in-memory txn. `commit`
+     reads the marker, replays into a fresh txn, commits, deletes the
+     marker. Recovery scans `xa_prepare:*` on startup and awaits the
+     binlog coordinator's verdict per prepared xid.
+   - **(8b) Commit-and-undo**: `prepare` commits under a "prepared" flag;
+     `rollback` writes tombstones; `commit` flips the flag. Wrong recovery
+     semantic (prepared writes are visible to other readers between
+     `prepare` and `commit`), so DO NOT do this.
+   Concrete sub-questions for (8a): marker size limits (a 100 MB INSERT-batch
+   becomes a 100 MB single key — does SlateDB tolerate? cap txn size or
+   split marker across multiple keys?); recovery idempotency (crash
+   mid-replay must be safe to redo); replay durability ordering (the marker
+   write must be `await_durable=true` before binlog reports prepare
+   success).
+9. **Concurrency model migration (NEW, post-critique).** See §5.2. Pick
+   option (A), (B), or (C). Lean (A). Blocks any handler unit touching
+   `FOR UPDATE`, savepoints, lock I_S tables, or deadlock I_S table.
+10. **Savepoint truncation primitive.** §5 says "Rollback to savepoint
+    discards write-batch entries above the position". SlateDB's
+    `DbTransactionOps` does NOT expose a write-batch truncate primitive
+    (only `put`, `delete`, `merge`, `mark_read`, `unmark_write`, `commit`,
+    `rollback`). Two fallbacks: replay-on-rollback (Rust-side log of
+    every op below the savepoint; rebuild txn on rollback — O(N)) or
+    abandon-and-restart (`rollback` + replay from start — also O(N) but
+    no extra bookkeeping). Pick one.
 
 ## 12. SlateDB version pinning
 

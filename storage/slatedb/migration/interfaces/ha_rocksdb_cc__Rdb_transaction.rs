@@ -28,18 +28,13 @@ use slatedb::Error;
 
 use crate::rdb_global_h::GlIndexId;
 
-/// I/O perf-counter handle stub. Real type lives in `rdb_perf_context_h.rs`.
-pub struct RdbIoPerf;
-
-/// Forward decl for the data-dictionary table-def. Lives in
-/// `rdb_datadic_h__Rdb_tbl_def.rs`.
-pub struct RdbTblDef;
-
-/// Forward decl for key-def metadata. Lives in `rdb_datadic_h__Rdb_key_def.rs`.
-pub struct RdbKeyDef;
-
-/// Forward decl for the per-table handler shared state.
-pub struct RdbTableHandler;
+// Re-export the canonical types under the `Rdb*` aliases that downstream
+// stubs (ddl, Rdb_index_collector, Rdb_writebatch_impl) already import from
+// this module. This replaces the earlier empty placeholder structs that
+// silently shadowed the real definitions and caused field accesses to fail.
+pub use crate::ha_rocksdb_h__Rdb_table_handler::{IoPerfCounters as RdbIoPerf, TableHandler as RdbTableHandler};
+pub use crate::rdb_datadic_h__Rdb_key_def::KeyDef as RdbKeyDef;
+pub use crate::rdb_datadic_h__Rdb_tbl_def::TblDef as RdbTblDef;
 
 /// Reasons we mark a transaction as failed (mirrors MyRocks bookkeeping).
 #[derive(Debug, Clone, Copy)]
@@ -59,9 +54,17 @@ pub trait TxListWalker {
 /// Abstract transaction. Implementations are `Rdb_transaction_impl` (full
 /// SlateDB `DbTransaction`) and `Rdb_writebatch_impl` (bare `WriteBatch`).
 ///
-/// The trait is `Send + Sync` only at the registry boundary; the per-THD
-/// transaction itself is single-threaded.
-pub trait RdbTransaction: Send {
+/// The trait is `Send + Sync` so the per-Txn registry
+/// (`Mutex<Vec<Weak<dyn RdbTransaction + Send + Sync>>>`, see `walk_tx_list`)
+/// can hold trait objects across threads. The per-THD transaction itself is
+/// still single-threaded — `Sync` is only needed to make `Weak` references
+/// to it hold across the registry boundary.
+///
+/// Async methods (`get`, `get_for_update`, `commit`, `prepare`, `start_tx`)
+/// wrap the corresponding `slatedb::DbTransaction` futures. We use
+/// `#[async_trait]` so the trait remains object-safe under `dyn RdbTransaction`.
+#[async_trait::async_trait]
+pub trait RdbTransaction: Send + Sync {
     // --- accessors / counters ---
     fn write_count(&self) -> u64;
     fn insert_count(&self) -> u64;
@@ -106,7 +109,7 @@ pub trait RdbTransaction: Send {
     /// Point lookup using the transaction's read view (its `DbSnapshot`).
     /// Returns `Ok(None)` on not-found; `Err` only on
     /// `slatedb::ErrorKind::{Unavailable, Closed, Data}`.
-    fn get(&self, cf_id: u32, key: &[u8]) -> Result<Option<Bytes>, Error>;
+    async fn get(&self, cf_id: u32, key: &[u8]) -> Result<Option<Bytes>, Error>;
 
     /// `SELECT … FOR UPDATE`. Maps to SlateDB SSI: in `Snapshot` mode we
     /// just call `get` (no lock taken — MyRocks' pessimistic lock has no
@@ -114,7 +117,7 @@ pub trait RdbTransaction: Send {
     /// `mark_read([key])` to enforce write-write conflict detection at commit.
     ///
     /// Original: ha_rocksdb.cc:2969 — `Rdb_transaction::get_for_update`.
-    fn get_for_update(
+    async fn get_for_update(
         &mut self,
         cf_id: u32,
         key: &[u8],
@@ -155,8 +158,9 @@ pub trait RdbTransaction: Send {
 
     /// Start a fresh `DbTransaction` on the SlateDB side. Picks
     /// `IsolationLevel::SerializableSnapshot` if SQL session is SERIALIZABLE,
-    /// else `IsolationLevel::Snapshot` (per _DESIGN.md §5 table).
-    fn start_tx(&mut self);
+    /// else `IsolationLevel::Snapshot` (per _DESIGN.md §5 table). Async
+    /// because `Db::begin()` returns a future.
+    async fn start_tx(&mut self);
 
     /// Hook called at each statement start; in REPEATABLE READ this is where
     /// the delayed snapshot is acquired.
@@ -169,7 +173,7 @@ pub trait RdbTransaction: Send {
     /// `Err(ErrorKind::Transaction)` on conflict.
     ///
     /// Original: ha_rocksdb.cc:2582 — `Rdb_transaction::commit`.
-    fn commit(&mut self) -> Result<bool, Error>;
+    async fn commit(&mut self) -> Result<bool, Error>;
 
     /// Rollback the entire transaction. Calls `DbTransaction::rollback()` and
     /// clears all engine-side counters.
@@ -186,7 +190,7 @@ pub trait RdbTransaction: Send {
     ///
     /// `name` is `rdb_xid_to_string(XID)` — see `name_helpers` stub.
     /// Original: ha_rocksdb.cc:2569 — `prepare` (pure virtual).
-    fn prepare(&mut self, xid_name: &[u8]) -> Result<(), Error>;
+    async fn prepare(&mut self, xid_name: &[u8]) -> Result<(), Error>;
 
     /// `can_prepare` — false if `m_rollback_only` is set.
     /// Original: ha_rocksdb.cc:3087.

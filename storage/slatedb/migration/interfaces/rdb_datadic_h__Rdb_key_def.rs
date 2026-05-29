@@ -170,7 +170,7 @@ pub struct IndexStats; // forwarded — defined in properties_collector_cc.rs
 pub struct PrefixExtractor; // TODO(human): wire to codec::prefix module
 
 /// Forward — see `Rdb_tbl_def` stub.
-pub struct TblDef; // see rdb_datadic_h__Rdb_tbl_def
+pub use crate::rdb_datadic_h__Rdb_tbl_def::TblDef;
 
 // ---------- the main struct ----------
 

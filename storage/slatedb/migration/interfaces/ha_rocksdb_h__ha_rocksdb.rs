@@ -33,7 +33,7 @@
 //! - `MARIAROCKS_NOT_YET` block (ha_rocksdb.h:977-988) — Read-Free
 //!   Replication RPL hooks. §1 non-goal. Not exposed.
 
-use slatedb::bytes::Bytes;
+use bytes::Bytes;
 use slatedb::{DbIterator, DbSnapshot, DbTransaction, Error};
 use std::sync::Arc;
 

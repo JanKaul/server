@@ -26,7 +26,7 @@
 //! - All `Field*` / `TABLE*` parameters — translated at the bridge boundary.
 
 use crate::rdb_buff_h::{StringReader, StringWriter};
-use slatedb::bytes::Bytes;
+use bytes::Bytes;
 use slatedb::Error;
 use std::collections::BTreeMap;
 

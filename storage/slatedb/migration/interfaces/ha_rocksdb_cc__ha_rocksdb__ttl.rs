@@ -37,7 +37,7 @@
 use slatedb::Error;
 
 /// Forward-declared. Owned by A2's `ha_rocksdb_h` stub.
-pub struct HaSlateDb;
+use crate::ha_rocksdb_h__ha_rocksdb::HaSlateDb;
 
 impl HaSlateDb {
     /// Migration shim. In MyRocks this decoded the 8-byte TTL prefix from

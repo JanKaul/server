@@ -27,7 +27,7 @@
 //!   async file under TRANSLATE.
 
 use crate::rdb_cf_manager_cc::CfDescriptor;
-use slatedb::bytes::Bytes;
+use bytes::Bytes;
 use slatedb::Error;
 use std::collections::BTreeSet;
 use std::path::PathBuf;

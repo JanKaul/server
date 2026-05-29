@@ -30,7 +30,7 @@ use bytes::Bytes;
 use crate::rdb_comparator_h::KeyDirection;
 
 /// Forward-declared. Owned by A2's `ha_rocksdb_h` stub.
-pub struct HaSlateDb;
+use crate::ha_rocksdb_h__ha_rocksdb::HaSlateDb;
 
 /// Marker for the SQL-layer "find-flag" enum. We translate from MariaDB's
 /// `enum ha_rkey_function` at the cxx bridge; the Rust core sees this.

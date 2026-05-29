@@ -85,7 +85,7 @@ pub struct SstCommitInfo {
     /// CF id of the index being loaded (key-prefix component).
     pub cf_id: u32,
     /// The accumulated WriteBatch. `None` after `commit()` returns.
-    pub batch: Option<slatedb::batch::WriteBatch>,
+    pub batch: Option<slatedb::WriteBatch>,
 }
 
 impl SstCommitInfo {
@@ -122,7 +122,7 @@ pub struct SstInfo {
     max_size: u64,
     /// Pending writes. Single in-flight batch (MyRocks supported multiple
     /// committed files — irrelevant in our model).
-    batch: slatedb::batch::WriteBatch,
+    batch: slatedb::WriteBatch,
     /// First non-success status observed during background work, if any.
     background_error: std::sync::atomic::AtomicI32,
     done: bool,
@@ -143,7 +143,7 @@ impl SstInfo {
             index_name,
             curr_size: 0,
             max_size,
-            batch: slatedb::batch::WriteBatch::new(),
+            batch: slatedb::WriteBatch::new(),
             background_error: std::sync::atomic::AtomicI32::new(0),
             done: false,
             tracing,
@@ -175,7 +175,7 @@ impl SstInfo {
         }
         self.done = true;
         // Move batch out via swap with a fresh empty one.
-        let batch = std::mem::replace(&mut self.batch, slatedb::batch::WriteBatch::new());
+        let batch = std::mem::replace(&mut self.batch, slatedb::WriteBatch::new());
         commit_info.cf_id = self.cf_id;
         commit_info.batch = Some(batch);
         Ok(())

@@ -45,4 +45,4 @@ pub fn init_psi_keys() -> Result<(), Error> {
 /// Currently unused. Preserved as a string so any code that wanted to
 /// reference the C++ `stage_waiting_on_row_lock` symbol has something to
 /// resolve.
-pub const STAGE_WAITING_ON_ROW_LOCK: &str = "Waiting on row lock";
+pub const STAGE_WAITING_ON_TXN_COMMIT: &str = "Waiting on transaction commit";

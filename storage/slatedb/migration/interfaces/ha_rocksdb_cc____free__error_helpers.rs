@@ -117,8 +117,9 @@ pub fn log_status_error(_e: &Error, _msg: &str) {
 
 /// Persist a corruption marker so the next startup refuses to load the
 /// engine unless `--slatedb-allow-to-start-after-corruption=1`. MyRocks
-/// writes a sentinel file `./ROCKSDB_CORRUPTED`; we keep that exact name
-/// for operator muscle memory.
+/// writes a sentinel file `./ROCKSDB_CORRUPTED`. For the SlateDB engine
+/// we use `./SLATEDB_CORRUPTED` to distinguish the two markers (the
+/// engines co-exist in tree per §1 "ha_rocksdb removal: never").
 /// Original: rdb_utils — `rdb_persist_corruption_marker`.
 pub fn persist_corruption_marker(_datadir: &std::path::Path) -> Result<(), Error> {
     todo!("std::fs::write(datadir.join('SLATEDB_CORRUPTED'), b'') and tracing::error!")

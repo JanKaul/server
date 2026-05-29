@@ -12,7 +12,7 @@
 //! ## Out-of-scope methods
 //! None — pure metadata.
 
-use slatedb::bytes::Bytes;
+use bytes::Bytes;
 use slatedb::Error;
 use std::sync::Arc;
 

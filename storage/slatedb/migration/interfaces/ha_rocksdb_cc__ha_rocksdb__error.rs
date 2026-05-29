@@ -24,7 +24,7 @@ use slatedb::Error;
 use slatedb::ErrorKind;
 
 /// Forward-declared. Owned by A2's `ha_rocksdb_h` stub.
-pub struct HaSlateDb;
+use crate::ha_rocksdb_h__ha_rocksdb::HaSlateDb;
 
 /// MariaDB `HA_ERR_*` codes we need. The actual numbers come from
 /// `include/my_base.h`; we re-declare a minimal set here. The real engine

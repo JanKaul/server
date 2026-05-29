@@ -39,7 +39,7 @@
 use bytes::Bytes;
 use slatedb::Error;
 
-use crate::ha_rocksdb_cc__ha_rocksdb__lifecycle::HaSlateDb;
+use crate::ha_rocksdb_h__ha_rocksdb::HaSlateDb;
 use crate::ha_rocksdb_cc__ha_rocksdb__dml::RowBuf;
 
 /// Forwarded to a future TABLE-shape unit. Mirrors `enum ha_rkey_function`
