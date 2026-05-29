@@ -1,0 +1,255 @@
+[
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__auto_incr",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 390,
+    "methods": [
+      "load_auto_incr_value",
+      "load_auto_incr_value_from_index",
+      "update_auto_incr_val",
+      "update_auto_incr_val_from_field",
+      "load_hidden_pk_value",
+      "update_hidden_pk_val",
+      "read_hidden_pk_id_from_rowkey",
+      "has_hidden_pk",
+      "is_hidden_pk",
+      "pk_index",
+      "is_pk",
+      "get_pk_for_update",
+      "get_auto_increment"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      6099,
+      12418
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__metadata",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 125,
+    "methods": [
+      "get_table_basename",
+      "contains_foreign_key",
+      "get_key_name",
+      "get_key_comment",
+      "generate_cf_name",
+      "get_table_comment",
+      "get_table_if_exists"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      6364,
+      11725
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__ttl",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 90,
+    "methods": [
+      "should_hide_ttl_rec",
+      "rocksdb_skip_expired_records",
+      "should_skip_invalidated_record"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      6399,
+      13838
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__buffer",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 154,
+    "methods": [
+      "alloc_key_buffers",
+      "free_key_buffers",
+      "set_skip_unique_check_tables",
+      "set_last_rowkey"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      6557,
+      9659
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__error",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 109,
+    "methods": [
+      "get_error_message",
+      "rdb_error_to_mysql",
+      "print_error"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      6940,
+      14655
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__key_compare",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 124,
+    "methods": [
+      "get_old_key_positions",
+      "compare_keys",
+      "compare_key_parts",
+      "is_using_full_key"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      7383,
+      8373
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__read",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 422,
+    "methods": [
+      "read_key_exact",
+      "read_before_key",
+      "read_after_key",
+      "read_row_from_primary_key",
+      "read_row_from_secondary_key",
+      "secondary_index_read",
+      "prepare_index_scan",
+      "prepare_range_scan",
+      "find_icp_matching_index_rec",
+      "get_for_update",
+      "get_row_by_rowid"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      7955,
+      9108
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__write_path",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 351,
+    "methods": [
+      "is_blind_delete_enabled",
+      "unlock_row",
+      "can_use_single_delete",
+      "skip_unique_check",
+      "update_write_pk",
+      "update_write_sk",
+      "update_write_indexes",
+      "update_write_row",
+      "delete_or_singledelete",
+      "can_assume_tracked"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      8995,
+      13865
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__bulk_load_helpers",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 94,
+    "methods": [
+      "commit_in_the_middle",
+      "do_bulk_commit",
+      "bulk_load_key",
+      "finalize_bulk_load"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      9465,
+      10108
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__iter_setup",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 121,
+    "methods": [
+      "setup_iterator_bounds",
+      "setup_scan_iterator",
+      "release_scan_iterator",
+      "setup_iterator_for_rnd_scan"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      10459,
+      10586
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__table_mgmt",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 442,
+    "methods": [
+      "truncate",
+      "update_stats",
+      "calc_updated_indexes",
+      "read_thd_vars",
+      "get_range",
+      "remove_rows",
+      "update_create_info",
+      "calculate_stats_for_table",
+      "idx_cond_push",
+      "inplace_populate_sk",
+      "should_recreate_snapshot",
+      "can_use_bloom_filter",
+      "index_blocks",
+      "table_version"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      10833,
+      14725
+    ]
+  }
+]

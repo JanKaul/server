@@ -1,0 +1,121 @@
+[
+  {
+    "unit_id": "ha_rocksdb_h__Rdb_table_handler",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_h",
+    "source_file": "storage/rocksdb/ha_rocksdb.h",
+    "body_loc": 20,
+    "methods": [
+      "Rdb_table_handler"
+    ],
+    "classes": [
+      "Rdb_table_handler"
+    ],
+    "span_range": [
+      105,
+      124
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_h__hash",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_h",
+    "source_file": "storage/rocksdb/ha_rocksdb.h",
+    "body_loc": 8,
+    "methods": [
+      "hash"
+    ],
+    "classes": [
+      "hash"
+    ],
+    "span_range": [
+      130,
+      137
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_h__ha_rocksdb",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_h",
+    "source_file": "storage/rocksdb/ha_rocksdb.h",
+    "body_loc": 850,
+    "methods": [
+      "ha_rocksdb"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      147,
+      996
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_h__key_def_cf_info",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_h",
+    "source_file": "storage/rocksdb/ha_rocksdb.h",
+    "body_loc": 5,
+    "methods": [
+      "key_def_cf_info"
+    ],
+    "classes": [
+      "key_def_cf_info"
+    ],
+    "span_range": [
+      668,
+      672
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_h__update_row_info",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_h",
+    "source_file": "storage/rocksdb/ha_rocksdb.h",
+    "body_loc": 14,
+    "methods": [
+      "update_row_info"
+    ],
+    "classes": [
+      "update_row_info"
+    ],
+    "span_range": [
+      674,
+      687
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_h__unique_sk_buf_info",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_h",
+    "source_file": "storage/rocksdb/ha_rocksdb.h",
+    "body_loc": 21,
+    "methods": [
+      "unique_sk_buf_info"
+    ],
+    "classes": [
+      "unique_sk_buf_info"
+    ],
+    "span_range": [
+      693,
+      713
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_h__Rdb_inplace_alter_ctx",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_h",
+    "source_file": "storage/rocksdb/ha_rocksdb.h",
+    "body_loc": 57,
+    "methods": [
+      "Rdb_inplace_alter_ctx"
+    ],
+    "classes": [
+      "Rdb_inplace_alter_ctx"
+    ],
+    "span_range": [
+      1002,
+      1058
+    ]
+  }
+]

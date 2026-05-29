@@ -1,0 +1,682 @@
+[
+  {
+    "unit_id": "ha_rocksdb_cc____free__txn_handlers",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 455,
+    "methods": [
+      "thd_mark_transaction_to_rollback",
+      "get_tx_from_thd",
+      "get_or_create_tx",
+      "rocksdb_close_connection",
+      "rocksdb_prepare",
+      "rocksdb_commit_by_xid",
+      "rocksdb_rollback_by_xid",
+      "rocksdb_recover",
+      "rocksdb_checkpoint_request",
+      "rocksdb_commit_ordered",
+      "rocksdb_commit",
+      "rocksdb_rollback",
+      "rocksdb_register_tx",
+      "rocksdb_start_tx_and_assign_read_view",
+      "rocksdb_savepoint",
+      "rocksdb_rollback_to_savepoint",
+      "rocksdb_rollback_to_savepoint_can_release_mdl"
+    ],
+    "classes": [
+      "(free)"
+    ],
+    "span_range": [
+      94,
+      5036
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc____free__cf_ops",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 287,
+    "methods": [
+      "getCompactRangeOptions",
+      "rocksdb_flush_all_memtables",
+      "rocksdb_delete_column_family_stub",
+      "rocksdb_delete_column_family",
+      "rocksdb_create_checkpoint",
+      "rocksdb_create_checkpoint_stub",
+      "rocksdb_force_flush_memtable_now_stub",
+      "rocksdb_force_flush_memtable_now",
+      "rocksdb_force_flush_memtable_and_lzero_now_stub",
+      "rocksdb_force_flush_memtable_and_lzero_now",
+      "rocksdb_remove_mariabackup_checkpoint",
+      "rdb_init_rocksdb_db_options",
+      "rocksdb_compact_column_family_stub",
+      "rdb_get_rocksdb_write_options",
+      "rocksdb_compact_column_family",
+      "rocksdb_drop_index_wakeup_thread",
+      "rocksdb_perf_context_level",
+      "rocksdb_smart_seek",
+      "rocksdb_smart_next"
+    ],
+    "classes": [
+      "(free)"
+    ],
+    "span_range": [
+      232,
+      5944
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__Rdb_open_tables_map",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 88,
+    "methods": [
+      "init",
+      "free",
+      "count",
+      "get_table_handler",
+      "get_table_names",
+      "release_table_handler"
+    ],
+    "classes": [
+      "Rdb_open_tables_map"
+    ],
+    "span_range": [
+      346,
+      6323
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc____free__name_helpers",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 104,
+    "methods": [
+      "rdb_normalize_dir",
+      "rdb_is_index_collation_supported",
+      "rdb_field_uses_nopad_collation",
+      "rdb_normalize_tablename",
+      "rdb_split_normalized_tablename"
+    ],
+    "classes": [
+      "(free)"
+    ],
+    "span_range": [
+      367,
+      7710
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc____free__sysvar_set",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 542,
+    "methods": [
+      "rocksdb_set_pause_background_work",
+      "rocksdb_set_rocksdb_info_log_level",
+      "rocksdb_set_rocksdb_stats_level",
+      "rocksdb_set_reset_stats",
+      "rocksdb_set_io_write_timeout",
+      "rocksdb_validate_flush_log_at_trx_commit",
+      "rocksdb_set_compaction_options",
+      "rocksdb_set_table_stats_sampling_pct",
+      "rocksdb_set_rate_limiter_bytes_per_sec",
+      "rocksdb_set_sst_mgr_rate_bytes_per_sec",
+      "rocksdb_set_delayed_write_rate",
+      "rocksdb_set_max_latest_deadlocks",
+      "rdb_set_collation_exception_list",
+      "rocksdb_set_collation_exception_list",
+      "mysql_value_to_bool",
+      "rocksdb_check_bulk_load",
+      "rocksdb_check_bulk_load_allow_unsorted",
+      "rocksdb_set_max_background_jobs",
+      "rocksdb_set_bytes_per_sync",
+      "rocksdb_set_wal_bytes_per_sync",
+      "rocksdb_validate_set_block_cache_size",
+      "rocksdb_validate_update_cf_options",
+      "rocksdb_set_update_cf_options"
+    ],
+    "classes": [
+      "(free)"
+    ],
+    "span_range": [
+      501,
+      14557
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc____free__accessors",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 278,
+    "methods": [
+      "rmdir_force",
+      "is_valid",
+      "rdb_get_int_col_max_value",
+      "can_hold_read_locks_on_select",
+      "get_range",
+      "get_range",
+      "get_range",
+      "is_myrocks_index_empty",
+      "calculate_stats",
+      "rdb_get_rocksdb_db",
+      "rdb_get_cf_manager",
+      "rdb_get_table_options",
+      "rdb_is_ttl_enabled",
+      "rdb_is_ttl_read_filtering_enabled",
+      "rdb_get_dict_manager",
+      "rdb_get_ddl_manager",
+      "rdb_get_binlog_manager",
+      "rdb_corruption_marker_file_name"
+    ],
+    "classes": [
+      "(free)"
+    ],
+    "span_range": [
+      695,
+      14730
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__Rdb_snapshot_notifier",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 7,
+    "methods": [
+      "detach",
+      "SnapshotCreated"
+    ],
+    "classes": [
+      "Rdb_snapshot_notifier"
+    ],
+    "span_range": [
+      2274,
+      3726
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc____free__error_helpers",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 215,
+    "methods": [
+      "timeout_message",
+      "rdb_xid_to_string",
+      "rdb_xid_from_string",
+      "print_stats",
+      "format_string",
+      "rdb_get_all_trx_info",
+      "rdb_get_deadlock_info",
+      "rdb_get_error_messages",
+      "get_rdb_io_error_string",
+      "rdb_handle_io_error",
+      "sql_print_verbose_info",
+      "print_keydup_error"
+    ],
+    "classes": [
+      "(free)"
+    ],
+    "span_range": [
+      2281,
+      14757
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__Rdb_transaction",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 582,
+    "methods": [
+      "merge_auto_incr_map",
+      "init_mutex",
+      "term_mutex",
+      "walk_tx_list",
+      "set_status_error",
+      "get_thd",
+      "io_perf_start",
+      "io_perf_end_and_record",
+      "io_perf_end_and_record",
+      "update_bytes_written",
+      "set_params",
+      "get_write_count",
+      "get_insert_count",
+      "get_update_count",
+      "get_delete_count",
+      "incr_insert_count",
+      "incr_update_count",
+      "incr_delete_count",
+      "get_timeout_sec",
+      "get_lock_count",
+      "commit_or_rollback",
+      "commit",
+      "snapshot_created",
+      "has_snapshot",
+      "get_key_merge",
+      "finish_bulk_load",
+      "start_bulk_load",
+      "num_ongoing_bulk_load",
+      "get_rocksdb_tmpdir",
+      "flush_batch",
+      "set_auto_incr",
+      "get_auto_incr",
+      "get_blind_write_batch",
+      "get_iterator",
+      "on_commit",
+      "on_rollback",
+      "log_table_write_op",
+      "set_initial_savepoint",
+      "make_stmt_savepoint_permanent",
+      "rollback_to_stmt_savepoint",
+      "set_tx_failed",
+      "can_prepare",
+      "rollback_to_savepoint",
+      "is_tx_read_only",
+      "is_two_phase",
+      "set_tx_read_only",
+      "is_prepared",
+      "detach_prepared_tx"
+    ],
+    "classes": [
+      "Rdb_transaction"
+    ],
+    "span_range": [
+      2367,
+      3129
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__Rdb_transaction_impl",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 307,
+    "methods": [
+      "set_lock_timeout",
+      "set_sync",
+      "release_lock",
+      "is_writebatch_trx",
+      "is_prepared",
+      "detach_prepared_tx",
+      "release_tx",
+      "prepare",
+      "commit_no_binlog",
+      "rollback",
+      "acquire_snapshot",
+      "release_snapshot",
+      "has_snapshot",
+      "put",
+      "delete_key",
+      "single_delete",
+      "has_modifications",
+      "get_write_batch",
+      "get_indexed_write_batch",
+      "get",
+      "get_for_update",
+      "get_iterator",
+      "get_rdb_trx",
+      "is_tx_started",
+      "start_tx",
+      "do_set_savepoint",
+      "do_rollback_to_savepoint",
+      "start_stmt",
+      "rollback_stmt"
+    ],
+    "classes": [
+      "Rdb_transaction_impl"
+    ],
+    "span_range": [
+      3146,
+      3501
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__Rdb_writebatch_impl",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 145,
+    "methods": [
+      "reset",
+      "prepare",
+      "commit_no_binlog",
+      "do_set_savepoint",
+      "do_rollback_to_savepoint",
+      "is_writebatch_trx",
+      "set_lock_timeout",
+      "set_sync",
+      "release_lock",
+      "rollback",
+      "acquire_snapshot",
+      "release_snapshot",
+      "put",
+      "delete_key",
+      "single_delete",
+      "has_modifications",
+      "get_write_batch",
+      "get_indexed_write_batch",
+      "get",
+      "get_for_update",
+      "get_iterator",
+      "is_tx_started",
+      "start_tx",
+      "start_stmt",
+      "rollback_stmt"
+    ],
+    "classes": [
+      "Rdb_writebatch_impl"
+    ],
+    "span_range": [
+      3535,
+      3707
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__Rdb_snapshot_status",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 149,
+    "methods": [
+      "current_timestamp",
+      "get_header",
+      "get_footer",
+      "get_dl_txn_info",
+      "get_dl_path_trx_info",
+      "getResult",
+      "process_tran",
+      "populate_deadlock_buffer",
+      "get_deadlock_info"
+    ],
+    "classes": [
+      "Rdb_snapshot_status"
+    ],
+    "span_range": [
+      4332,
+      4493
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__Rdb_trx_info_aggregator",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 60,
+    "methods": [
+      "process_tran"
+    ],
+    "classes": [
+      "Rdb_trx_info_aggregator"
+    ],
+    "span_range": [
+      4509,
+      4568
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc____free__show_callbacks",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 351,
+    "methods": [
+      "rocksdb_show_status",
+      "rocksdb_show_block_cache_miss",
+      "rocksdb_show_block_cache_hit",
+      "rocksdb_show_block_cache_add",
+      "rocksdb_show_block_cache_add_failures",
+      "rocksdb_show_block_cache_index_miss",
+      "rocksdb_show_block_cache_index_hit",
+      "rocksdb_show_block_cache_index_add",
+      "rocksdb_show_block_cache_index_bytes_insert",
+      "rocksdb_show_block_cache_index_bytes_evict",
+      "rocksdb_show_block_cache_filter_miss",
+      "rocksdb_show_block_cache_filter_hit",
+      "rocksdb_show_block_cache_filter_add",
+      "rocksdb_show_block_cache_filter_bytes_insert",
+      "rocksdb_show_block_cache_filter_bytes_evict",
+      "rocksdb_show_block_cache_bytes_read",
+      "rocksdb_show_block_cache_bytes_write",
+      "rocksdb_show_block_cache_data_bytes_insert",
+      "rocksdb_show_block_cache_data_miss",
+      "rocksdb_show_block_cache_data_hit",
+      "rocksdb_show_block_cache_data_add",
+      "rocksdb_show_bloom_filter_useful",
+      "rocksdb_show_bloom_filter_full_positive",
+      "rocksdb_show_bloom_filter_full_true_positive",
+      "rocksdb_show_memtable_hit",
+      "rocksdb_show_memtable_miss",
+      "rocksdb_show_get_hit_l0",
+      "rocksdb_show_get_hit_l1",
+      "rocksdb_show_get_hit_l2_and_up",
+      "rocksdb_show_compaction_key_drop_new",
+      "rocksdb_show_compaction_key_drop_obsolete",
+      "rocksdb_show_compaction_key_drop_user",
+      "rocksdb_show_number_keys_written",
+      "rocksdb_show_number_keys_read",
+      "rocksdb_show_number_keys_updated",
+      "rocksdb_show_bytes_written",
+      "rocksdb_show_bytes_read",
+      "rocksdb_show_number_db_seek",
+      "rocksdb_show_number_db_seek_found",
+      "rocksdb_show_number_db_next",
+      "rocksdb_show_number_db_next_found",
+      "rocksdb_show_number_db_prev",
+      "rocksdb_show_number_db_prev_found",
+      "rocksdb_show_iter_bytes_read",
+      "rocksdb_show_no_file_closes",
+      "rocksdb_show_no_file_opens",
+      "rocksdb_show_no_file_errors",
+      "rocksdb_show_stall_micros",
+      "rocksdb_show_num_iterators",
+      "rocksdb_show_number_multiget_get",
+      "rocksdb_show_number_multiget_keys_read",
+      "rocksdb_show_number_multiget_bytes_read",
+      "rocksdb_show_number_deletes_filtered",
+      "rocksdb_show_number_merge_failures",
+      "rocksdb_show_bloom_filter_prefix_checked",
+      "rocksdb_show_bloom_filter_prefix_useful",
+      "rocksdb_show_number_reseeks_iteration",
+      "rocksdb_show_getupdatessince_calls",
+      "rocksdb_show_block_cachecompressed_miss",
+      "rocksdb_show_block_cachecompressed_hit",
+      "rocksdb_show_wal_synced",
+      "rocksdb_show_wal_bytes",
+      "rocksdb_show_write_self",
+      "rocksdb_show_write_other",
+      "rocksdb_show_write_timedout",
+      "rocksdb_show_write_wal",
+      "rocksdb_show_flush_write_bytes",
+      "rocksdb_show_compact_read_bytes",
+      "rocksdb_show_compact_write_bytes",
+      "rocksdb_show_number_superversion_acquires",
+      "rocksdb_show_number_superversion_releases",
+      "rocksdb_show_number_superversion_cleanups",
+      "rocksdb_show_number_block_not_compressed",
+      "myrocks_update_status",
+      "myrocks_update_memory_status",
+      "show_myrocks_vars",
+      "io_stall_prop_value",
+      "update_rocksdb_stall_status",
+      "show_rocksdb_stall_vars"
+    ],
+    "classes": [
+      "(free)"
+    ],
+    "span_range": [
+      4613,
+      13483
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc____free__lifecycle",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 773,
+    "methods": [
+      "check_rocksdb_options_compatibility",
+      "rocksdb_check_version",
+      "rocksdb_update_optimizer_costs",
+      "rocksdb_init_func",
+      "rocksdb_done_func",
+      "rocksdb_create_handler"
+    ],
+    "classes": [
+      "(free)"
+    ],
+    "span_range": [
+      5139,
+      6329
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc____free__dbug_helpers",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 74,
+    "methods": [
+      "dbug_change_status_to_corrupted",
+      "dbug_append_garbage_at_end",
+      "dbug_truncate_record",
+      "dbug_modify_rec_varchar12",
+      "dbug_create_err_inplace_alter",
+      "dbug_dump_str",
+      "dbug_dump_database",
+      "dbug_print_item",
+      "rdb_dbug_set_ttl_rec_ts",
+      "rdb_dbug_set_ttl_snapshot_ts",
+      "rdb_dbug_set_ttl_read_filter_ts",
+      "rdb_dbug_set_ttl_ignore_pk"
+    ],
+    "classes": [
+      "(free)"
+    ],
+    "span_range": [
+      5948,
+      13967
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc____free__status_helpers",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 32,
+    "methods": [
+      "rdb_get_open_table_names",
+      "rdb_update_global_stats",
+      "rdb_get_table_perf_counters"
+    ],
+    "classes": [
+      "(free)"
+    ],
+    "span_range": [
+      6030,
+      13999
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__Rdb_drop_index_thread",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 89,
+    "methods": [
+      "run"
+    ],
+    "classes": [
+      "Rdb_drop_index_thread"
+    ],
+    "span_range": [
+      11626,
+      11714
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__Rdb_background_thread",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 92,
+    "methods": [
+      "run"
+    ],
+    "classes": [
+      "Rdb_background_thread"
+    ],
+    "span_range": [
+      13595,
+      13686
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__Rdb_index_collector",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 14,
+    "methods": [
+      "add_table",
+      "add_table"
+    ],
+    "classes": [
+      "Rdb_index_collector"
+    ],
+    "span_range": [
+      13653,
+      13659
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__Rdb_manual_compaction_thread",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 126,
+    "methods": [
+      "run",
+      "clear_all_manual_compaction_requests",
+      "clear_manual_compaction_request",
+      "request_manual_compaction",
+      "is_manual_compaction_finished"
+    ],
+    "classes": [
+      "Rdb_manual_compaction_thread"
+    ],
+    "span_range": [
+      13693,
+      13822
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc____free__table_version",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 42,
+    "methods": [
+      "rdb_queue_save_stats_request",
+      "make_table_version_lookup_key",
+      "save_table_version",
+      "get_table_version",
+      "delete_table_version"
+    ],
+    "classes": [
+      "(free)"
+    ],
+    "span_range": [
+      14559,
+      14721
+    ]
+  }
+]

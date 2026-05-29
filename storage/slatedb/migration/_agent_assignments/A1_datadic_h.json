@@ -1,0 +1,257 @@
+[
+  {
+    "unit_id": "rdb_datadic_h__Rdb_convert_to_record_key_decoder",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_h",
+    "source_file": "storage/rocksdb/rdb_datadic.h",
+    "body_loc": 20,
+    "methods": [
+      "Rdb_convert_to_record_key_decoder"
+    ],
+    "classes": [
+      "Rdb_convert_to_record_key_decoder"
+    ],
+    "span_range": [
+      52,
+      71
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_h__Rdb_pack_field_context",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_h",
+    "source_file": "storage/rocksdb/rdb_datadic.h",
+    "body_loc": 11,
+    "methods": [
+      "Rdb_pack_field_context"
+    ],
+    "classes": [
+      "Rdb_pack_field_context"
+    ],
+    "span_range": [
+      87,
+      97
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_h__Rdb_key_field_iterator",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_h",
+    "source_file": "storage/rocksdb/rdb_datadic.h",
+    "body_loc": 38,
+    "methods": [
+      "Rdb_key_field_iterator"
+    ],
+    "classes": [
+      "Rdb_key_field_iterator"
+    ],
+    "span_range": [
+      99,
+      136
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_h__Rdb_key_def",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_h",
+    "source_file": "storage/rocksdb/rdb_datadic.h",
+    "body_loc": 625,
+    "methods": [
+      "Rdb_key_def"
+    ],
+    "classes": [
+      "Rdb_key_def"
+    ],
+    "span_range": [
+      251,
+      875
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_h__Rdb_collation_codec",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_h",
+    "source_file": "storage/rocksdb/rdb_datadic.h",
+    "body_loc": 12,
+    "methods": [
+      "Rdb_collation_codec"
+    ],
+    "classes": [
+      "Rdb_collation_codec"
+    ],
+    "span_range": [
+      894,
+      905
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_h__Rdb_field_packing",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_h",
+    "source_file": "storage/rocksdb/rdb_datadic.h",
+    "body_loc": 98,
+    "methods": [
+      "Rdb_field_packing"
+    ],
+    "classes": [
+      "Rdb_field_packing"
+    ],
+    "span_range": [
+      912,
+      1009
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_h__Rdb_field_encoder",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_h",
+    "source_file": "storage/rocksdb/rdb_datadic.h",
+    "body_loc": 35,
+    "methods": [
+      "Rdb_field_encoder"
+    ],
+    "classes": [
+      "Rdb_field_encoder"
+    ],
+    "span_range": [
+      1018,
+      1052
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_h__Rdb_tbl_def",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_h",
+    "source_file": "storage/rocksdb/rdb_datadic.h",
+    "body_loc": 73,
+    "methods": [
+      "Rdb_tbl_def"
+    ],
+    "classes": [
+      "Rdb_tbl_def"
+    ],
+    "span_range": [
+      1079,
+      1151
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_h__Rdb_seq_generator",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_h",
+    "source_file": "storage/rocksdb/rdb_datadic.h",
+    "body_loc": 19,
+    "methods": [
+      "Rdb_seq_generator"
+    ],
+    "classes": [
+      "Rdb_seq_generator"
+    ],
+    "span_range": [
+      1158,
+      1176
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_h__Rdb_tables_scanner",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_h",
+    "source_file": "storage/rocksdb/rdb_datadic.h",
+    "body_loc": 4,
+    "methods": [
+      "Rdb_tables_scanner"
+    ],
+    "classes": [
+      "Rdb_tables_scanner"
+    ],
+    "span_range": [
+      1178,
+      1181
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_h__Rdb_ddl_manager",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_h",
+    "source_file": "storage/rocksdb/rdb_datadic.h",
+    "body_loc": 78,
+    "methods": [
+      "Rdb_ddl_manager"
+    ],
+    "classes": [
+      "Rdb_ddl_manager"
+    ],
+    "span_range": [
+      1191,
+      1268
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_h__Rdb_binlog_manager",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_h",
+    "source_file": "storage/rocksdb/rdb_datadic.h",
+    "body_loc": 27,
+    "methods": [
+      "Rdb_binlog_manager"
+    ],
+    "classes": [
+      "Rdb_binlog_manager"
+    ],
+    "span_range": [
+      1285,
+      1311
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_h__Rdb_dict_manager",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_h",
+    "source_file": "storage/rocksdb/rdb_datadic.h",
+    "body_loc": 153,
+    "methods": [
+      "Rdb_dict_manager"
+    ],
+    "classes": [
+      "Rdb_dict_manager"
+    ],
+    "span_range": [
+      1371,
+      1523
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_h__Rdb_index_info",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_h",
+    "source_file": "storage/rocksdb/rdb_datadic.h",
+    "body_loc": 8,
+    "methods": [
+      "Rdb_index_info"
+    ],
+    "classes": [
+      "Rdb_index_info"
+    ],
+    "span_range": [
+      1525,
+      1532
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_h__Rdb_system_merge_op",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_h",
+    "source_file": "storage/rocksdb/rdb_datadic.h",
+    "body_loc": 90,
+    "methods": [
+      "Rdb_system_merge_op"
+    ],
+    "classes": [
+      "Rdb_system_merge_op"
+    ],
+    "span_range": [
+      1546,
+      1635
+    ]
+  }
+]

@@ -1,0 +1,361 @@
+[
+  {
+    "unit_id": "rdb_datadic_cc____free_functions",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_cc",
+    "source_file": "storage/rocksdb/rdb_datadic.cc",
+    "body_loc": 236,
+    "methods": [
+      "field_check_field_name_match",
+      "rdb_swap_double_bytes",
+      "rdb_swap_float_bytes",
+      "rdb_compare_string_with_spaces",
+      "unpack_charset",
+      "rdb_write_unpack_simple",
+      "rdb_read_unpack_simple",
+      "rdb_get_mem_comparable_space",
+      "rdb_is_collation_supported",
+      "rdb_init_collation_mapping",
+      "get_segment_size_from_collation"
+    ],
+    "classes": [
+      "(free)"
+    ],
+    "span_range": [
+      61,
+      3190
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_cc__Rdb_convert_to_record_key_decoder",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_cc",
+    "source_file": "storage/rocksdb/rdb_datadic.cc",
+    "body_loc": 92,
+    "methods": [
+      "decode_field",
+      "decode",
+      "skip"
+    ],
+    "classes": [
+      "Rdb_convert_to_record_key_decoder"
+    ],
+    "span_range": [
+      78,
+      197
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_cc__Rdb_key_field_iterator",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_cc",
+    "source_file": "storage/rocksdb/rdb_datadic.cc",
+    "body_loc": 60,
+    "methods": [
+      "get_dst",
+      "get_field_index",
+      "get_is_null",
+      "get_field",
+      "has_next",
+      "next"
+    ],
+    "classes": [
+      "Rdb_key_field_iterator"
+    ],
+    "span_range": [
+      222,
+      288
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_cc__Rdb_key_def__meta",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_cc",
+    "source_file": "storage/rocksdb/rdb_datadic.cc",
+    "body_loc": 676,
+    "methods": [
+      "setup",
+      "extract_ttl_duration",
+      "extract_ttl_col",
+      "gen_qualifier_for_table",
+      "gen_cf_name_qualifier_for_partition",
+      "gen_ttl_duration_qualifier_for_partition",
+      "gen_ttl_col_qualifier_for_partition",
+      "parse_comment_for_qualifier",
+      "get_primary_key_tuple",
+      "get_memcmp_sk_parts",
+      "successor",
+      "predecessor",
+      "compare_keys",
+      "key_length",
+      "table_has_hidden_pk",
+      "report_checksum_mismatch",
+      "index_format_min_check",
+      "has_index_flag",
+      "calculate_index_flag_offset"
+    ],
+    "classes": [
+      "Rdb_key_def"
+    ],
+    "span_range": [
+      388,
+      3675
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_cc__Rdb_key_def__decode",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_cc",
+    "source_file": "storage/rocksdb/rdb_datadic.cc",
+    "body_loc": 889,
+    "methods": [
+      "read_memcmp_key_part",
+      "unpack_info_has_checksum",
+      "get_unpack_header_size",
+      "get_lookup_bitmap",
+      "covers_lookup",
+      "can_cover_lookup",
+      "unpack_record",
+      "skip_max_length",
+      "skip_variable_length",
+      "skip_variable_space_pad",
+      "unpack_integer",
+      "unpack_floating_point",
+      "unpack_double",
+      "unpack_float",
+      "unpack_newdate",
+      "unpack_binary_str",
+      "unpack_utf8_str",
+      "calc_unpack_legacy_variable_format",
+      "calc_unpack_variable_format",
+      "unpack_binary_or_utf8_varchar",
+      "unpack_binary_or_utf8_varchar_space_pad",
+      "make_unpack_unknown",
+      "dummy_make_unpack_info",
+      "unpack_unknown",
+      "make_unpack_unknown_varchar",
+      "unpack_unknown_varchar",
+      "make_unpack_simple_varchar",
+      "unpack_simple_varchar_space_pad",
+      "make_unpack_simple",
+      "unpack_simple"
+    ],
+    "classes": [
+      "Rdb_key_def"
+    ],
+    "span_range": [
+      843,
+      3004
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_cc__Rdb_key_def__encode",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_cc",
+    "source_file": "storage/rocksdb/rdb_datadic.cc",
+    "body_loc": 450,
+    "methods": [
+      "pack_index_tuple",
+      "pack_field",
+      "pack_record",
+      "pack_hidden_pk",
+      "pack_with_make_sort_key",
+      "pack_legacy_variable_format",
+      "pack_variable_format",
+      "pack_with_varchar_encoding",
+      "pack_with_varchar_space_pad",
+      "write_index_flag_field"
+    ],
+    "classes": [
+      "Rdb_key_def"
+    ],
+    "span_range": [
+      1001,
+      3684
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_cc__Rdb_field_packing",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_cc",
+    "source_file": "storage/rocksdb/rdb_datadic.cc",
+    "body_loc": 311,
+    "methods": [
+      "setup",
+      "get_field_in_table",
+      "fill_hidden_pk_val"
+    ],
+    "classes": [
+      "Rdb_field_packing"
+    ],
+    "span_range": [
+      3212,
+      3524
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_cc__Rdb_tbl_def",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_cc",
+    "source_file": "storage/rocksdb/rdb_datadic.cc",
+    "body_loc": 128,
+    "methods": [
+      "put_dict",
+      "get_create_time",
+      "check_if_is_mysql_system_table",
+      "check_and_set_read_free_rpl_table",
+      "set_name",
+      "get_autoincr_gl_index_id"
+    ],
+    "classes": [
+      "Rdb_tbl_def"
+    ],
+    "span_range": [
+      3558,
+      3734
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_cc__Rdb_ddl_manager",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_cc",
+    "source_file": "storage/rocksdb/rdb_datadic.cc",
+    "body_loc": 551,
+    "methods": [
+      "erase_index_num",
+      "add_uncommitted_keydefs",
+      "remove_uncommitted_keydefs",
+      "validate_auto_incr",
+      "validate_schemas",
+      "init",
+      "find",
+      "safe_find",
+      "find",
+      "safe_get_table_name",
+      "set_stats",
+      "adjust_stats",
+      "persist_stats",
+      "put_and_write",
+      "put",
+      "remove",
+      "rename",
+      "cleanup",
+      "scan_for_tables"
+    ],
+    "classes": [
+      "Rdb_ddl_manager"
+    ],
+    "span_range": [
+      3736,
+      4514
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_cc__Rdb_validate_tbls",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_cc",
+    "source_file": "storage/rocksdb/rdb_datadic.cc",
+    "body_loc": 146,
+    "methods": [
+      "add_table",
+      "check_frm_file",
+      "scan_for_frms",
+      "compare_to_actual_tables"
+    ],
+    "classes": [
+      "Rdb_validate_tbls"
+    ],
+    "span_range": [
+      3782,
+      3939
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_cc__Rdb_binlog_manager",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_cc",
+    "source_file": "storage/rocksdb/rdb_datadic.cc",
+    "body_loc": 174,
+    "methods": [
+      "init",
+      "cleanup",
+      "update",
+      "read",
+      "unpack_value",
+      "update_slave_gtid_info"
+    ],
+    "classes": [
+      "Rdb_binlog_manager"
+    ],
+    "span_range": [
+      4520,
+      4734
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_cc__Rdb_dict_manager",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_cc",
+    "source_file": "storage/rocksdb/rdb_datadic.cc",
+    "body_loc": 603,
+    "methods": [
+      "init",
+      "begin",
+      "put_key",
+      "get_value",
+      "delete_key",
+      "new_iterator",
+      "commit",
+      "dump_index_id",
+      "delete_with_prefix",
+      "add_or_update_index_cf_mapping",
+      "add_cf_flags",
+      "delete_index_info",
+      "get_index_info",
+      "get_cf_flags",
+      "get_ongoing_index_operation",
+      "is_index_operation_ongoing",
+      "start_ongoing_index_operation",
+      "end_ongoing_index_operation",
+      "is_drop_index_empty",
+      "add_drop_table",
+      "add_drop_index",
+      "add_create_index",
+      "finish_indexes_operation",
+      "resume_drop_indexes",
+      "rollback_ongoing_index_creation",
+      "log_start_drop_table",
+      "log_start_drop_index",
+      "get_max_index_id",
+      "update_max_index_id",
+      "add_stats",
+      "get_stats",
+      "put_auto_incr_val",
+      "get_auto_incr_val"
+    ],
+    "classes": [
+      "Rdb_dict_manager"
+    ],
+    "span_range": [
+      4736,
+      5416
+    ]
+  },
+  {
+    "unit_id": "rdb_datadic_cc__Rdb_seq_generator",
+    "kind": "sub_unit",
+    "parent": "rdb_datadic_cc",
+    "source_file": "storage/rocksdb/rdb_datadic.cc",
+    "body_loc": 20,
+    "methods": [
+      "get_and_update_next_number"
+    ],
+    "classes": [
+      "Rdb_seq_generator"
+    ],
+    "span_range": [
+      5418,
+      5437
+    ]
+  }
+]

@@ -1,0 +1,223 @@
+[
+  {
+    "unit_id": "ut0counter_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/ut0counter.h",
+    "body_loc": 203,
+    "classes": [
+      "generic_indexer_t",
+      "get_sched_indexer_t",
+      "thread_id_indexer_t",
+      "single_indexer_t",
+      "ib_counter_t"
+    ]
+  },
+  {
+    "unit_id": "rdb_mariadb_port_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/rdb_mariadb_port.h",
+    "body_loc": 55,
+    "classes": [
+      "my_io_perf_atomic_struct"
+    ]
+  },
+  {
+    "unit_id": "rdb_utils_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/rdb_utils.h",
+    "body_loc": 335,
+    "classes": [
+      "Ensure_cleanup"
+    ]
+  },
+  {
+    "unit_id": "rdb_index_merge_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/rdb_index_merge.h",
+    "body_loc": 227,
+    "classes": [
+      "Rdb_index_merge",
+      "merge_file_info",
+      "merge_buf_info",
+      "merge_heap_entry",
+      "merge_heap_comparator",
+      "merge_record"
+    ]
+  },
+  {
+    "unit_id": "rdb_io_watchdog_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/rdb_io_watchdog.h",
+    "body_loc": 119,
+    "classes": [
+      "Rdb_io_watchdog"
+    ]
+  },
+  {
+    "unit_id": "rdb_mariadb_server_port_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/rdb_mariadb_server_port.h",
+    "body_loc": 76,
+    "classes": [
+      "Regex_list_handler"
+    ]
+  },
+  {
+    "unit_id": "rdb_perf_context_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/rdb_perf_context.h",
+    "body_loc": 168,
+    "classes": [
+      "Rdb_atomic_perf_counters",
+      "Rdb_perf_counters",
+      "Rdb_io_perf"
+    ]
+  },
+  {
+    "unit_id": "rdb_sst_info_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/rdb_sst_info.h",
+    "body_loc": 265,
+    "classes": [
+      "Rdb_sst_file_ordered",
+      "Rdb_sst_file",
+      "Rdb_sst_stack",
+      "Rdb_sst_info",
+      "Rdb_sst_commit_info"
+    ]
+  },
+  {
+    "unit_id": "properties_collector_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/properties_collector.h",
+    "body_loc": 215,
+    "classes": [
+      "Rdb_compact_params",
+      "Rdb_index_stats",
+      "Rdb_tbl_card_coll",
+      "Rdb_tbl_prop_coll",
+      "Rdb_tbl_prop_coll_factory"
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_proto_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/ha_rocksdb_proto.h",
+    "body_loc": 103,
+    "classes": []
+  },
+  {
+    "unit_id": "logger_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/logger.h",
+    "body_loc": 85,
+    "classes": [
+      "Rdb_logger"
+    ]
+  },
+  {
+    "unit_id": "nosql_access_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/nosql_access.h",
+    "body_loc": 36,
+    "classes": []
+  },
+  {
+    "unit_id": "rdb_cf_options_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/rdb_cf_options.h",
+    "body_loc": 104,
+    "classes": [
+      "Rdb_cf_options"
+    ]
+  },
+  {
+    "unit_id": "rdb_cf_manager_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/rdb_cf_manager.h",
+    "body_loc": 108,
+    "classes": [
+      "Rdb_cf_manager"
+    ]
+  },
+  {
+    "unit_id": "rdb_converter_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/rdb_converter.h",
+    "body_loc": 247,
+    "classes": [
+      "READ_FIELD",
+      "Rdb_convert_to_record_value_decoder",
+      "Rdb_value_field_iterator",
+      "Rdb_converter"
+    ]
+  },
+  {
+    "unit_id": "rdb_i_s_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/rdb_i_s.h",
+    "body_loc": 37,
+    "classes": []
+  },
+  {
+    "unit_id": "rdb_mutex_wrapper_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/rdb_mutex_wrapper.h",
+    "body_loc": 143,
+    "classes": [
+      "Rdb_mutex",
+      "Rdb_cond_var",
+      "Rdb_mutex_factory"
+    ]
+  },
+  {
+    "unit_id": "rdb_psi_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/rdb_psi.h",
+    "body_loc": 58,
+    "classes": []
+  },
+  {
+    "unit_id": "rdb_threads_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/rdb_threads.h",
+    "body_loc": 195,
+    "classes": [
+      "Rdb_thread",
+      "Rdb_background_thread",
+      "Rdb_manual_compaction_thread",
+      "Manual_compaction_request",
+      "Rdb_drop_index_thread"
+    ]
+  },
+  {
+    "unit_id": "rdb_compact_filter_h",
+    "kind": "header",
+    "parent": null,
+    "source_file": "storage/rocksdb/rdb_compact_filter.h",
+    "body_loc": 216,
+    "classes": [
+      "Rdb_compact_filter",
+      "Rdb_compact_filter_factory"
+    ]
+  }
+]

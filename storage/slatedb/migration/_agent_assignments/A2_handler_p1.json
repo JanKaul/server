@@ -1,0 +1,224 @@
+[
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__dml",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 127,
+    "methods": [
+      "update_row_stats",
+      "write_row",
+      "delete_row",
+      "update_row"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      211,
+      11267
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__lifecycle",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 433,
+    "methods": [
+      "init_with_fields",
+      "open",
+      "close",
+      "store_lock",
+      "external_lock",
+      "extra"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      6373,
+      11973
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__convert",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 16,
+    "methods": [
+      "convert_record_from_storage_format",
+      "convert_record_from_storage_format"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      6515,
+      6555
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__ddl",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 561,
+    "methods": [
+      "create_key_defs",
+      "create_cfs",
+      "create_inplace_key_defs",
+      "create_key_def",
+      "create_table",
+      "create",
+      "delete_table",
+      "delete_table",
+      "rename_table"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      7108,
+      11912
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__repair",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 519,
+    "methods": [
+      "check_keyread_allowed",
+      "check",
+      "check_and_lock_unique_pk",
+      "check_and_lock_sk",
+      "check_uniqueness_and_lock",
+      "check_duplicate_sk",
+      "check_if_incompatible_data",
+      "optimize",
+      "analyze",
+      "check_bloom_and_set_bounds"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      7922,
+      13878
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__scan",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 305,
+    "methods": [
+      "position_to_correct_key",
+      "rnd_init",
+      "rnd_next",
+      "rnd_next_with_direction",
+      "rnd_end",
+      "position",
+      "rnd_pos"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      8058,
+      11200
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__index",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 533,
+    "methods": [
+      "calc_eq_cond_len",
+      "read_range_first",
+      "index_read_map",
+      "index_read_map_impl",
+      "index_next",
+      "index_prev",
+      "index_next_with_direction",
+      "index_first",
+      "index_last",
+      "index_first_intern",
+      "index_last_intern",
+      "index_init",
+      "index_end"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      8134,
+      10826
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__info",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 347,
+    "methods": [
+      "index_flags",
+      "max_supported_key_part_length",
+      "info",
+      "table_flags",
+      "records_in_range",
+      "keyread_time"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      8277,
+      14639
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__txn",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 12,
+    "methods": [
+      "start_stmt"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      11547,
+      11558
+    ]
+  },
+  {
+    "unit_id": "ha_rocksdb_cc__ha_rocksdb__alter",
+    "kind": "sub_unit",
+    "parent": "ha_rocksdb_cc",
+    "source_file": "storage/rocksdb/ha_rocksdb.cc",
+    "body_loc": 372,
+    "methods": [
+      "check_if_supported_inplace_alter",
+      "prepare_inplace_alter_table",
+      "inplace_alter_table",
+      "commit_inplace_alter_table"
+    ],
+    "classes": [
+      "ha_rocksdb"
+    ],
+    "span_range": [
+      12479,
+      13144
+    ]
+  }
+]
