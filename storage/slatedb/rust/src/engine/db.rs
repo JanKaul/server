@@ -1,20 +1,32 @@
 //! SlateDB `Db` wrapper.
 //!
 //! Per `_DESIGN.md §8` the engine wraps `slatedb::Db` with our
-//! [`crate::codec::prefix::MyRocksPrefixExtractor`] wired into the
-//! `DbBuilder::with_segment_extractor` slot so per-CF / per-index bloom
-//! filtering works.
+//! [`crate::codec::prefix::MyRocksPrefixExtractor`] wired into a
+//! `BloomFilterPolicy` for per-CF / per-index bloom filtering.
+//!
+//! We deliberately do NOT use `DbBuilder::with_segment_extractor` (RFC-0024
+//! per-segment LSM state) because the segment extractor's contract requires
+//! every stored key to produce a non-empty prefix. System-CF keys can carry
+//! a different layout than the user-CF `varint(cf_id) || u32_be(index_id)`
+//! prefix, and a build-time invariant break is harder to debug than a
+//! filter miss.
 //!
 //! Construction is async (SlateDB's builder reads the manifest before
 //! `build()` returns); call sites bridge through
 //! [`crate::runtime::EngineRuntime::block_on`].
 
 use object_store::ObjectStore;
+use slatedb::filter_policy::{BloomFilterPolicy, FilterPolicy};
 use slatedb::{Db, DbBuilder};
 use slatedb::Error;
 use std::sync::Arc;
 
 use crate::codec::prefix::MyRocksPrefixExtractor;
+
+/// Bits-per-key for the bloom filter. Matches SlateDB's
+/// `default_filter_policies()` default so we don't change the false-positive
+/// rate just because we attached a prefix extractor.
+const BLOOM_BITS_PER_KEY: u32 = 10;
 
 /// Wrapper around an open `slatedb::Db` instance. Holds the segment
 /// extractor as a separate `Arc` so other engine code (e.g. the bloom
@@ -35,8 +47,11 @@ impl EngineDb {
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self, Error> {
         let extractor = Arc::new(MyRocksPrefixExtractor);
+        let bloom = BloomFilterPolicy::new(BLOOM_BITS_PER_KEY)
+            .with_prefix_extractor(Arc::clone(&extractor) as Arc<dyn slatedb::PrefixExtractor>);
+        let policies: Vec<Arc<dyn FilterPolicy>> = vec![Arc::new(bloom)];
         let db = DbBuilder::new(path, object_store)
-            .with_segment_extractor(Arc::clone(&extractor) as Arc<dyn slatedb::PrefixExtractor>)
+            .with_filter_policies(policies)
             .build()
             .await?;
         Ok(Self {
