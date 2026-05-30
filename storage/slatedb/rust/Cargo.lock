@@ -3471,14 +3471,20 @@ dependencies = [
 name = "slatedb-engine"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "aws-config",
  "aws-sdk-s3",
+ "bytes",
  "cxx",
  "object_store",
+ "once_cell",
+ "parking_lot",
  "slatedb",
  "testcontainers",
  "testcontainers-modules",
  "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]
