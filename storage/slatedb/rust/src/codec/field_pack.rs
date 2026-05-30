@@ -10,11 +10,34 @@
 //! - [`FieldPacking`] (the per-keypart descriptor owned by a `KeyDef`),
 //! - the `UNPACK_*` return-code constants.
 //!
-//! **This batch is shape-only.** `FieldPacking::setup` (the big switch over
-//! the MySQL field type that populates the four function-pointer slots)
-//! and `get_field_in_table` (which needs a `KeyDef → keynr → table_share`
-//! lookup) land when `codec::key` materialises — they need cross-module
-//! context that doesn't exist yet.
+//! ## What's translated
+//!
+//! - All four function-pointer typedefs and their value types
+//!   ([`FieldPacking`], [`PackFieldContext`], [`CollationCodec`]).
+//! - The three skip routines ([`skip_max_length`],
+//!   [`skip_variable_length`], [`skip_variable_space_pad`]) and the
+//!   flag-byte decoders backing them.
+//! - The numeric / date / fixed-binary unpack routines
+//!   ([`unpack_integer`], [`unpack_double`], [`unpack_float`],
+//!   [`unpack_newdate`], [`unpack_binary_str`]).
+//! - [`FieldPacking::setup`] — the per-MySQL-type dispatch switch that
+//!   wires the function-pointer slots. Full support for fixed-width
+//!   numeric / date / NEWDECIMAL / time-with-fsp / NEWDATE types, BLOB
+//!   sizing per the C++ prefix rule, and partial support for VARCHAR /
+//!   STRING (binary collation only — see method docs for what's
+//!   deferred).
+//!
+//! ## What's deferred
+//!
+//! - **All `pack_func` slots stay `None`.** Packing into the memcmp
+//!   image relies on MariaDB's `Field::make_sort_key`; that's a
+//!   cxx-bridge call and the bridge surface is its own deferred bear.
+//! - **Collation-aware unpack** (`unpack_binary_or_utf8_varchar`,
+//!   `unpack_utf8_str`, `unpack_unknown*`, the `dummy_make_unpack_info`
+//!   tail) — needs the `Rdb_collation_codec` registry.
+//! - **`space_xfrm` lazy init** — needs `rdb_get_mem_comparable_space`.
+//! - **`get_field_in_table`** — needs a `KeyDef → keynr → table_share`
+//!   lookup which depends on `TblDef` (not yet translated).
 
 use std::sync::Arc;
 
@@ -217,6 +240,242 @@ impl FieldPacking {
     pub fn key_part(&self) -> u32 {
         self.key_part
     }
+
+    /// Populate the per-keypart pack/unpack/skip dispatch slots based on
+    /// the column's MySQL type and collation. Faithful translation of
+    /// `Rdb_field_packing::setup` (`rdb_datadic.cc:3212`).
+    ///
+    /// Returns `true` iff index-only ("covered") reads are possible for
+    /// this field. Matches the C++'s `res` return value.
+    ///
+    /// ## What's translated today
+    ///
+    /// - Fixed-width numeric / date types (TINY .. LONGLONG, FLOAT,
+    ///   DOUBLE, NEWDECIMAL, DATETIME2, TIMESTAMP2, TIME2, YEAR,
+    ///   NEWDATE): full unpack support; `covered = true`.
+    /// - BLOB family: `max_image_len` is sized from `key_length` per the
+    ///   C++ rule and `covered = false` is returned without setting
+    ///   unpack/pack slots (matches the C++ — BLOBs use only the prefix).
+    /// - VARCHAR / STRING: type is recognised, `varchar_charset` and
+    ///   `segment_size`-related sizing happens for COLLATION_BINARY /
+    ///   COLLATION_LATIN1_BIN / COLLATION_UTF8_BIN. `skip_func` is
+    ///   wired (skip_variable_length for VARCHAR). **Unpack slots stay
+    ///   `None`** because the collation-aware unpack routines
+    ///   (`unpack_binary_or_utf8_varchar`, `unpack_utf8_str`, etc.) and
+    ///   the `Rdb_collation_codec` registry are not yet translated.
+    ///   `covered` is returned `true` only for the COLLATION_BINARY
+    ///   STRING case (CHAR with binary collation, which decodes via the
+    ///   already-landed `unpack_binary_str`).
+    ///
+    /// ## What's deferred
+    ///
+    /// - **All `pack_func` slots remain `None`.** Packing into the
+    ///   memcmp image relies on MariaDB's `Field::make_sort_key` (the
+    ///   C++'s `pack_with_make_sort_key`); that's a cxx-bridge call and
+    ///   the bridge surface is its own deferred bear. Callers that need
+    ///   packing today get `None` and can short-circuit; the typical
+    ///   handler path uses pack only on writes, which already need the
+    ///   cxx bridge for other reasons.
+    /// - **Collation-aware unpack / make_unpack_info** (every branch
+    ///   that consults `rdb_init_collation_mapping(cs)`) — needs the
+    ///   `Rdb_collation_codec` registry which depends on a MariaDB
+    ///   `CHARSET_INFO` pull and isn't on the critical path yet.
+    /// - **`space_xfrm` lazy init** — same dependency on
+    ///   `rdb_get_mem_comparable_space`.
+    pub fn setup(
+        &mut self,
+        key_descr: Option<&crate::codec::key::KeyDef>,
+        field: Option<&FieldView>,
+        keynr: u32,
+        key_part: u32,
+        key_length: u16,
+    ) -> bool {
+        use crate::codec::value::MysqlType;
+        use crate::globals::SIZEOF_HIDDEN_PK_COLUMN;
+
+        let ty = field
+            .map(|f| f.mysql_type)
+            .unwrap_or(MysqlType::LongLong);
+
+        self.keynr = keynr;
+        self.key_part = key_part;
+        self.maybe_null = field.map(|f| !f.is_not_null()).unwrap_or(false);
+
+        // Reset every slot before the switch installs them.
+        self.unpack_func = None;
+        self.make_unpack_info_func = None;
+        self.unpack_data_len = 0;
+        self.space_xfrm = None;
+
+        // `key_descr == None` ⇒ legacy format (the C++ index_flags()
+        // dummy-call path; behaviour-equivalent because the return value
+        // doesn't depend on the format choice).
+        self.use_legacy_varbinary_format =
+            key_descr.map(|k| k.use_legacy_varbinary_format()).unwrap_or(true);
+
+        // Default image length: the field's pack_length, or the hidden-PK
+        // width if `field == None`.
+        self.max_image_len = field
+            .map(|f| f.pack_length as i32)
+            .unwrap_or(SIZEOF_HIDDEN_PK_COLUMN as i32);
+
+        self.skip_func = Some(skip_max_length);
+        // `pack_func` intentionally left `None` — see method docs.
+
+        self.covered = false;
+
+        match ty {
+            MysqlType::LongLong
+            | MysqlType::Long
+            | MysqlType::Int24
+            | MysqlType::Short
+            | MysqlType::Tiny => {
+                self.unpack_func = Some(unpack_integer);
+                self.covered = true;
+                return true;
+            }
+            MysqlType::Double => {
+                self.unpack_func = Some(unpack_double);
+                self.covered = true;
+                return true;
+            }
+            MysqlType::Float => {
+                self.unpack_func = Some(unpack_float);
+                self.covered = true;
+                return true;
+            }
+            MysqlType::NewDecimal
+            | MysqlType::DateTime2
+            | MysqlType::Timestamp2
+            | MysqlType::Time2
+            | MysqlType::Year => {
+                // All packed by their Field::make_sort_key as a straight
+                // memcpy at the SQL layer, so the inverse is also a
+                // memcpy.
+                self.unpack_func = Some(unpack_binary_str);
+                self.covered = true;
+                return true;
+            }
+            MysqlType::NewDate => {
+                self.unpack_func = Some(unpack_newdate);
+                self.covered = true;
+                return true;
+            }
+            MysqlType::TinyBlob
+            | MysqlType::MediumBlob
+            | MysqlType::LongBlob
+            | MysqlType::Blob => {
+                // BLOBs use only the prefix, so they're never covered.
+                // Per the C++ (rdb_datadic.cc:3296): the codec needs to
+                // know the prefix length so the comparator knows how
+                // many bytes to look at — same formula as the C++.
+                if let Some(f) = field {
+                    let charset_extra = if f.charset_id == COLLATION_BINARY {
+                        // For binary blobs the codec stores the
+                        // pack_length so two strings differing only in
+                        // length still order correctly. We use
+                        // `pack_length` as the proxy; matches
+                        // `Field_blob::pack_length_no_ptr()` modulo the
+                        // length-prefix bytes that this branch skips
+                        // over.
+                        f.pack_length as i32
+                    } else {
+                        0
+                    };
+                    self.max_image_len = key_length as i32 + charset_extra;
+                }
+                return false;
+            }
+            _ => {}
+        }
+
+        self.unpack_info_stores_value = false;
+
+        // ---- VARCHAR + STRING (CHAR) -----------------------------------
+        let is_varchar = ty == MysqlType::Varchar;
+        let is_string_family = is_varchar || ty == MysqlType::String;
+
+        if !is_string_family {
+            // Unknown / unsupported type. Return `false` — `covered` stays
+            // `false`, dispatch slots stay as they are (skip_max_length is
+            // the safest default).
+            return false;
+        }
+
+        let Some(f) = field else {
+            // VARCHAR/STRING with null field shouldn't happen in practice;
+            // the C++ would dereference `field` unconditionally here.
+            return false;
+        };
+        self.varchar_charset = Some(f.charset_id);
+
+        if is_varchar {
+            self.skip_func = Some(skip_variable_length);
+            // pack_func intentionally left None (cxx-bridge gated).
+            self.max_image_len = if self.use_legacy_varbinary_format {
+                rdb_legacy_encoded_size(self.max_image_len as usize) as i32
+            } else {
+                rdb_encoded_size(self.max_image_len as usize) as i32
+            };
+            // 2-byte trimmed-spaces counter once field_length+8 ≥ 256
+            // (matches Rdb_field_packing::setup's `field_length + 8 >= 0x100`
+            // check at rdb_datadic.cc:3351).
+            self.unpack_info_uses_two_bytes = f.length + 8 >= 0x100;
+        }
+
+        // Collation-dependent unpack/skip refinement. Mirrors the C++
+        // switch on `cs->number`; today we only wire the COLLATION_BINARY
+        // path because that's the only one that doesn't need the codec
+        // registry or rdb_get_mem_comparable_space.
+        match f.charset_id {
+            COLLATION_BINARY => {
+                if is_varchar {
+                    // unpack_binary_or_utf8_varchar not translated yet —
+                    // leave unpack_func None. skip_variable_length is
+                    // already wired above.
+                    self.covered = false;
+                } else {
+                    // CHAR(n) with binary collation decodes via the
+                    // fixed-width memcpy we have.
+                    self.unpack_func = Some(unpack_binary_str);
+                    self.covered = true;
+                }
+            }
+            COLLATION_LATIN1_BIN | COLLATION_UTF8_BIN => {
+                // Both branches need either the space-pad pack routines
+                // (varchar) or unpack_utf8_str (CHAR with utf8_bin), all
+                // of which are deferred. Leave covered = false; the
+                // skip_variable_length default still lets the codec walk
+                // past these fields without unpacking them.
+                self.covered = false;
+            }
+            _ => {
+                // Non-binary collations need the collation codec
+                // registry. Leave slots as the defaults and report
+                // not-covered so the SQL layer doesn't try an
+                // index-only scan.
+                self.covered = false;
+            }
+        }
+
+        // Partial-key (prefix index) adjustment from rdb_datadic.cc:3489.
+        // If the column is wider than the key part (e.g. KEY(name(20)) on
+        // VARCHAR(100)), index-only reads aren't possible because the
+        // codec doesn't know whether the prefix is the full value.
+        if f.length != key_length as u32 {
+            self.covered = false;
+            if key_descr
+                .map(|k| !k.use_covered_bitmap_format())
+                .unwrap_or(true)
+            {
+                self.unpack_func = None;
+                self.make_unpack_info_func = None;
+                self.unpack_info_stores_value = true;
+            }
+        }
+
+        self.covered
+    }
 }
 
 /// Mutex protecting [`FieldPacking::space_xfrm`] lazy initialisation.
@@ -262,6 +521,30 @@ pub const RDB_ESCAPE_LENGTH: usize = 9;
 pub const VARCHAR_CMP_LESS_THAN_SPACES: u8 = 1;
 pub const VARCHAR_CMP_EQUAL_TO_SPACES: u8 = 2;
 pub const VARCHAR_CMP_GREATER_THAN_SPACES: u8 = 3;
+
+/// MariaDB collation ids that the setup switch special-cases. Numeric
+/// values come from MariaDB's `mysql/strings/ctype.h` and are stable
+/// across versions (the codec depends on them being stable too).
+pub const COLLATION_BINARY: u32 = 63;
+pub const COLLATION_LATIN1_BIN: u32 = 47;
+pub const COLLATION_UTF8_BIN: u32 = 83;
+
+/// Round `len` up to a multiple of `RDB_ESCAPE_LENGTH - 1 = 8` and then
+/// multiply by `RDB_ESCAPE_LENGTH = 9`. Each 8-byte payload chunk plus
+/// its 1-byte flag is 9 bytes on disk. Matches C++ `RDB_ENCODED_SIZE`
+/// (`rdb_datadic.cc:1786`).
+#[inline]
+pub const fn rdb_encoded_size(len: usize) -> usize {
+    let chunks = (len + (RDB_ESCAPE_LENGTH - 2)) / (RDB_ESCAPE_LENGTH - 1);
+    chunks * RDB_ESCAPE_LENGTH
+}
+
+/// Same idea, legacy rounding rule. Matches C++ `RDB_LEGACY_ENCODED_SIZE`.
+#[inline]
+pub const fn rdb_legacy_encoded_size(len: usize) -> usize {
+    let chunks = (len + (RDB_ESCAPE_LENGTH - 1)) / (RDB_ESCAPE_LENGTH - 1);
+    chunks * RDB_ESCAPE_LENGTH
+}
 
 // ----- skip functions -----
 
@@ -1037,5 +1320,253 @@ mod tests {
             UNPACK_SUCCESS
         );
         assert_eq!(&dst, image);
+    }
+
+    // ----- FieldPacking::setup -----
+
+    use crate::codec::key::{KeyDef, IndexType,
+        INDEX_INFO_VERSION_LATEST, PRIMARY_FORMAT_VERSION_LATEST,
+        SECONDARY_FORMAT_VERSION_LATEST};
+
+    fn pk_skel() -> KeyDef {
+        KeyDef::new_skeleton(
+            1,
+            7,
+            0,
+            INDEX_INFO_VERSION_LATEST as u16,
+            IndexType::Primary,
+            PRIMARY_FORMAT_VERSION_LATEST,
+            false,
+            "pk",
+        )
+    }
+
+    fn sk_skel() -> KeyDef {
+        KeyDef::new_skeleton(
+            2,
+            7,
+            1,
+            INDEX_INFO_VERSION_LATEST as u16,
+            IndexType::Secondary,
+            SECONDARY_FORMAT_VERSION_LATEST,
+            false,
+            "sk",
+        )
+    }
+
+    fn typed_field(mysql_type: MysqlType, pack_length: u32, charset: u32) -> FieldView {
+        FieldView {
+            name: "f".into(),
+            mysql_type,
+            pack_length,
+            output_offset: 0,
+            null_marker: None,
+            length: pack_length,
+            charset_id: charset,
+            flags: 0,
+            decimals: 0,
+        }
+    }
+
+    #[test]
+    fn setup_integers_wire_unpack_integer_and_covered() {
+        let key = pk_skel();
+        for (mt, pack_len) in [
+            (MysqlType::Tiny, 1u32),
+            (MysqlType::Short, 2),
+            (MysqlType::Int24, 3),
+            (MysqlType::Long, 4),
+            (MysqlType::LongLong, 8),
+        ] {
+            let mut fpi = FieldPacking::default();
+            let field = typed_field(mt, pack_len, 63);
+            let covered = fpi.setup(Some(&key), Some(&field), 0, 0, pack_len as u16);
+            assert!(covered, "{mt:?} must be covered");
+            assert_eq!(fpi.max_image_len, pack_len as i32);
+            assert!(fpi.unpack_func.is_some(), "{mt:?} unpack_func wired");
+            assert!(fpi.skip_func.is_some(), "{mt:?} skip_func wired");
+            assert!(fpi.pack_func.is_none(), "pack_func deferred (cxx bridge)");
+            assert!(fpi.make_unpack_info_func.is_none());
+        }
+    }
+
+    #[test]
+    fn setup_double_and_float() {
+        let key = pk_skel();
+        let mut fpi = FieldPacking::default();
+        let dbl = typed_field(MysqlType::Double, 8, 63);
+        assert!(fpi.setup(Some(&key), Some(&dbl), 0, 0, 8));
+        assert_eq!(fpi.max_image_len, 8);
+        assert!(fpi.covered);
+
+        let mut fpi2 = FieldPacking::default();
+        let flt = typed_field(MysqlType::Float, 4, 63);
+        assert!(fpi2.setup(Some(&key), Some(&flt), 0, 0, 4));
+        assert_eq!(fpi2.max_image_len, 4);
+        assert!(fpi2.covered);
+    }
+
+    #[test]
+    fn setup_newdate_uses_unpack_newdate() {
+        let key = pk_skel();
+        let mut fpi = FieldPacking::default();
+        let f = typed_field(MysqlType::NewDate, 3, 63);
+        assert!(fpi.setup(Some(&key), Some(&f), 0, 0, 3));
+        assert!(fpi.unpack_func.is_some());
+        // Same-fn-pointer identity check.
+        let want: IndexFieldUnpackFn = unpack_newdate;
+        assert_eq!(fpi.unpack_func.unwrap() as usize, want as usize);
+    }
+
+    #[test]
+    fn setup_decimal_temporal_use_binary_str_unpack() {
+        let key = pk_skel();
+        let want: IndexFieldUnpackFn = unpack_binary_str;
+        for mt in [
+            MysqlType::NewDecimal,
+            MysqlType::DateTime2,
+            MysqlType::Timestamp2,
+            MysqlType::Time2,
+            MysqlType::Year,
+        ] {
+            let mut fpi = FieldPacking::default();
+            let f = typed_field(mt, 8, 63);
+            assert!(fpi.setup(Some(&key), Some(&f), 0, 0, 8));
+            assert_eq!(fpi.unpack_func.unwrap() as usize, want as usize);
+        }
+    }
+
+    #[test]
+    fn setup_blob_sizes_max_image_len_and_returns_uncovered() {
+        let key = pk_skel();
+        let mut fpi = FieldPacking::default();
+        let mut f = typed_field(MysqlType::Blob, 10, COLLATION_BINARY);
+        f.pack_length = 10;
+        let covered = fpi.setup(Some(&key), Some(&f), 0, 0, 50);
+        assert!(!covered, "BLOB never covered");
+        // key_length (50) + pack_length (10) for COLLATION_BINARY.
+        assert_eq!(fpi.max_image_len, 50 + 10);
+        assert!(fpi.unpack_func.is_none(), "no unpack for BLOB");
+    }
+
+    #[test]
+    fn setup_blob_non_binary_collation_omits_extra() {
+        let key = pk_skel();
+        let mut fpi = FieldPacking::default();
+        let f = typed_field(MysqlType::Blob, 10, COLLATION_UTF8_BIN);
+        assert!(!fpi.setup(Some(&key), Some(&f), 0, 0, 50));
+        assert_eq!(fpi.max_image_len, 50);
+    }
+
+    #[test]
+    fn setup_varchar_binary_wires_skip_variable_length_and_charset() {
+        let key = sk_skel();
+        let mut fpi = FieldPacking::default();
+        let f = typed_field(MysqlType::Varchar, 100, COLLATION_BINARY);
+        let covered = fpi.setup(Some(&key), Some(&f), 0, 0, 100);
+        assert!(!covered, "VARCHAR collation-aware unpack deferred");
+        assert_eq!(fpi.varchar_charset, Some(COLLATION_BINARY));
+        let want: IndexFieldSkipFn = skip_variable_length;
+        assert_eq!(fpi.skip_func.unwrap() as usize, want as usize);
+        // 100 bytes payload, RDB_ENCODED_SIZE = ceil(100/8) * 9 = 13 * 9 = 117.
+        assert_eq!(fpi.max_image_len, 117);
+    }
+
+    #[test]
+    fn setup_string_binary_collation_uses_binary_str_unpack() {
+        // CHAR(n) with COLLATION_BINARY decodes via fixed-width memcpy.
+        let key = pk_skel();
+        let mut fpi = FieldPacking::default();
+        let f = typed_field(MysqlType::String, 20, COLLATION_BINARY);
+        assert!(fpi.setup(Some(&key), Some(&f), 0, 0, 20));
+        let want: IndexFieldUnpackFn = unpack_binary_str;
+        assert_eq!(fpi.unpack_func.unwrap() as usize, want as usize);
+    }
+
+    #[test]
+    fn setup_string_non_binary_collation_not_covered() {
+        let key = pk_skel();
+        let mut fpi = FieldPacking::default();
+        let f = typed_field(MysqlType::String, 20, COLLATION_UTF8_BIN);
+        assert!(!fpi.setup(Some(&key), Some(&f), 0, 0, 20));
+        // skip_func stays at the default skip_max_length (CHAR is fixed-width).
+        let want: IndexFieldSkipFn = skip_max_length;
+        assert_eq!(fpi.skip_func.unwrap() as usize, want as usize);
+    }
+
+    #[test]
+    fn setup_partial_key_strips_unpack_when_covered_bitmap_unavailable() {
+        // CHAR(20) with binary collation but the SK takes only the first
+        // 10 bytes. PK doesn't support covered-bitmap format ⇒ unpack
+        // must be stripped.
+        let key = pk_skel();
+        let mut fpi = FieldPacking::default();
+        let f = typed_field(MysqlType::String, 20, COLLATION_BINARY);
+        let covered = fpi.setup(Some(&key), Some(&f), 0, 0, 10);
+        assert!(!covered);
+        assert!(fpi.unpack_func.is_none(), "prefix index strips unpack");
+        assert!(fpi.unpack_info_stores_value);
+    }
+
+    #[test]
+    fn setup_hidden_pk_field_none_uses_longlong_default_and_8_bytes() {
+        let key = pk_skel();
+        let mut fpi = FieldPacking::default();
+        let covered = fpi.setup(Some(&key), None, 0, 0, 8);
+        // Hidden PK ⇒ MysqlType::LongLong default ⇒ unpack_integer wired,
+        // covered = true, max_image_len = 8.
+        assert!(covered);
+        assert_eq!(fpi.max_image_len, 8);
+        let want: IndexFieldUnpackFn = unpack_integer;
+        assert_eq!(fpi.unpack_func.unwrap() as usize, want as usize);
+    }
+
+    #[test]
+    fn setup_null_key_descr_defaults_to_legacy_varbinary() {
+        // C++ "index_flags() dummy" call path: key_descr == nullptr ⇒
+        // legacy format flag set.
+        let mut fpi = FieldPacking::default();
+        let f = typed_field(MysqlType::Varchar, 8, COLLATION_BINARY);
+        fpi.setup(None, Some(&f), 0, 0, 8);
+        assert!(fpi.use_legacy_varbinary_format);
+    }
+
+    #[test]
+    fn setup_varchar_unpack_info_uses_two_bytes_threshold() {
+        // field.length + 8 < 256  ⇒ 1 byte trimmed-spaces counter.
+        let key = sk_skel();
+        let mut fpi = FieldPacking::default();
+        let f = typed_field(MysqlType::Varchar, 100, COLLATION_BINARY);
+        fpi.setup(Some(&key), Some(&f), 0, 0, 100);
+        assert!(!fpi.unpack_info_uses_two_bytes);
+
+        // field.length + 8 >= 256  ⇒ 2 bytes.
+        let mut fpi2 = FieldPacking::default();
+        let f2 = typed_field(MysqlType::Varchar, 300, COLLATION_BINARY);
+        fpi2.setup(Some(&key), Some(&f2), 0, 0, 300);
+        assert!(fpi2.unpack_info_uses_two_bytes);
+    }
+
+    #[test]
+    fn rdb_encoded_size_matches_c_macro() {
+        // RDB_ENCODED_SIZE(0) = 0
+        assert_eq!(rdb_encoded_size(0), 0);
+        // 1..=8 bytes payload ⇒ one 9-byte chunk
+        for n in 1..=8 {
+            assert_eq!(rdb_encoded_size(n), 9, "n={n}");
+        }
+        // 9..=16 bytes ⇒ two chunks
+        for n in 9..=16 {
+            assert_eq!(rdb_encoded_size(n), 18, "n={n}");
+        }
+    }
+
+    #[test]
+    fn rdb_legacy_encoded_size_matches_c_macro() {
+        // legacy = (n + 8) / 8 * 9 ⇒ 0 stays 9 (one empty chunk encodes "len 0")
+        assert_eq!(rdb_legacy_encoded_size(0), 9);
+        assert_eq!(rdb_legacy_encoded_size(1), 9);
+        assert_eq!(rdb_legacy_encoded_size(8), 18);
+        assert_eq!(rdb_legacy_encoded_size(16), 27);
     }
 }
