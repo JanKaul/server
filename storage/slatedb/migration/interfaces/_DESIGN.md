@@ -558,3 +558,167 @@ native `flush_interval` knob (default in `Settings`), the test should:
   Level A latency check. Or `InMemory` for "this is a substrate" smoke test.
 - For prod-like Level C: minio is still the right comparator since
   object-store-tier latency is what matters at the §1 escalation threshold.
+
+## 14. Binlog-engine role (SlateDB-as-binlog)
+
+**Status:** Interface designed 2026-05-29. **Stage 2+ feature**, not part
+of the Stage 0 data-engine cut. The interface stubs land now so the API
+shape is committed and the v4 manifest reflects the future role.
+
+### 14.1 Motivation
+
+MariaDB 12.3+ introduced the `binlog_engine_hton` role
+(`sql/handler.h:1603..1737`) which lets a storage engine host the
+binlog. InnoDB ships an implementation under
+`storage/innobase/handler/innodb_binlog.cc`; the public claim (article
+"MariaDB Innovation: InnoDB-Based Binary Log") is that co-locating the
+binlog with a transactional engine **halves the number of fsyncs**
+because the binlog write rides on the same WAL fsync as the engine's
+own commit. Empirical: 24,475 → 77,232 TPS at safe production settings.
+
+SlateDB is structurally well-suited to this: a binlog is exactly a
+log-structured append-only KV stream, which is SlateDB's core
+competency. By implementing `binlog_engine_hton` we get the same
+single-fsync win for SlateDB-data + SlateDB-binlog deployments.
+
+### 14.2 Storage model — locked decisions
+
+| Decision | Choice | Rationale |
+|---|---|---|
+| Storage location | Shared SlateDB `Db` instance with the data engine, distinct `binlog:` key prefix | Maximises the single-fsync co-located-binlog win |
+| OOB shape | Chunked keys with sequential offsets (`binlog:<file_no>:<offset>`) | KV range scan in key order replaces InnoDB's Zeckendorf tree forest — no log-N seek needed on a KV substrate |
+| File model | Virtual files = key-range partitions; `file_no` is a rotation counter | Rotation = bump counter; purge = `delete_range` on the old prefix |
+| Interface scope | All 19 slots stubbed; user-XA paths Stage 2-stubbed | Internal 2PC works in Stage 1; user-XA paths return `HA_ERR_WRONG_COMMAND` until Stage 2 |
+| GTID state | Inline `ChunkType::GtidState` chunks (InnoDB-style) | Preserves on-wire compatibility; one less keyspace to maintain |
+| OOB cleanup | SlateDB native TTL on pre-commit chunks; commit-time WriteBatch re-puts without TTL | No GC pass; orphaned chunks from crashes self-expire |
+| Durability | One `WriteBatch` per commit with `await_durable=true`, fsync at the tail of `binlog_group_commit_ordered` only | Matches the article's halve-the-fsyncs result |
+
+### 14.3 Key encoding
+
+```
+key   = b"binlog:" || file_no_be8 || b":" || offset_be8        // 23 bytes fixed
+value = chunk_header (3 bytes) || payload
+         chunk_header[0] = chunk_type | CONT_flag | LAST_flag
+         chunk_header[1..3] = u16 LE payload_len
+```
+
+`chunk_type` mirrors InnoDB's `fsp_binlog_chunk_types`
+(`storage/innobase/include/fsp_binlog.h:66..86`): `Commit`, `GtidState`,
+`OobData`, `Dummy`, `XaPrepare`, `XaComplete`, `Filler`. Preserved
+bit-for-bit so a future tool could parse either engine's binlog.
+
+Metadata lives in a separate prefix:
+```
+binlog_meta:rotation              → current active file_no
+binlog_meta:file_index:<file_no>  → BinlogFileEntry-style metadata per active file
+binlog_meta:xa:<xid>              → Stage 2 only: user-XA prepare markers
+```
+
+### 14.4 Module layout (10 interface stubs)
+
+All under `storage/slatedb/migration/interfaces/`:
+
+```
+ha_slatedb_binlog_h__types.rs                    shared types (ChunkType, BinlogKey,
+                                                  EngineDataPtr, BinlogEventGroupInfo,
+                                                  BinlogXidInfo, BinlogPurgeInfo, ...)
+ha_slatedb_binlog_h__reader.rs                   BinlogReader trait (the one vtable)
+
+ha_slatedb_binlog_cc____free__lifecycle.rs       binlog_init, set_binlog_max_size
+ha_slatedb_binlog_cc____free__write_direct.rs    binlog_write_direct[_ordered]
+ha_slatedb_binlog_cc____free__group_commit.rs    binlog_group_commit_ordered  ← single fsync site
+ha_slatedb_binlog_cc____free__oob_path.rs        oob_data[_ordered], savepoint_rollback,
+                                                  oob_reset, oob_free
+ha_slatedb_binlog_cc____free__xa_path.rs         xa_prepare[_ordered], xa_rollback[_ordered],
+                                                  unlog  (all Stage 2 stubs)
+ha_slatedb_binlog_cc____free__admin.rs           status, get_filename, get_binlog_file_list,
+                                                  flush, get_init_state, reset, purge
+ha_slatedb_binlog_cc____free__get_reader.rs      get_binlog_reader factory
+ha_slatedb_binlog_cc__SlateDbBinlogReader.rs     concrete reader (impl BinlogReader)
+```
+
+Free functions throughout — the handlerton is literally a struct of
+function pointers, so a trait would add a layer with no implementations
+to vary. The only genuine vtable is `handler_binlog_reader` (the server
+creates reader objects polymorphically per dump thread); we mirror it as
+the `BinlogReader` trait.
+
+### 14.5 Coordinator interaction summary (from `sql/log.cc` analysis)
+
+**Normal commit path** (one fsync end-to-end when co-located with data):
+1. `binlog_write_direct_ordered` under `LOCK_commit_ordered` — assign
+   `(file_no, offset)`, stage chunks in a thread-local buffer.
+2. `binlog_write_direct` no lock — write the staged chunks to SlateDB
+   with `await_durable=false`.
+3. Data engine's `commit_ordered` runs (also under `LOCK_commit_ordered`,
+   also `await_durable=false`).
+4. `binlog_group_commit_ordered` (tail entry only, no lock) — **one
+   `flush_with_options(Wal)` with `await_durable=true`** — this is the
+   single fsync covering the entire commit group, both binlog and data.
+5. `binlog_unlog` — Stage 1 no-op (no XID marker needed for
+   internal-2PC; see §14.6).
+
+**OOB spill path** (large transactions):
+- Each `binlog_oob_data*` call writes chunks under `binlog:<file>:<offset>`
+  with `PutOptions::ttl = ExpireAfter(BINLOG_OOB_TTL_SECS)`.
+- On commit, the commit-time WriteBatch re-puts the chunks without TTL
+  (rationale: commit makes them permanent; pre-commit was conditional).
+- On rollback, `binlog_savepoint_rollback` or `binlog_oob_reset` issues
+  `Db::delete` on the staged keys; orphans from a crash expire naturally.
+
+**Reader path**:
+- `get_binlog_reader(wait_durable)` allocates one `SlateDbBinlogReader`.
+- `wait_durable=true` (dump thread, crash-safe replication): reader
+  refuses to emit data past `db.status().last_durable_seq`. Backed by a
+  `tokio::sync::watch::Receiver<DbStatus>` subscription.
+- `wait_durable=false` (`SHOW BINLOG EVENTS`): reader sees latest writeable seq.
+
+### 14.6 User-XA — Stage 2 stub
+
+The five user-XA slots (`binlog_write_xa_prepare[_ordered]`,
+`binlog_xa_rollback[_ordered]`, `binlog_unlog`) are all returning
+`Err(Error::invalid("non-goal: user-XA binlog (Stage 2)"))`. The
+internal-2PC path (binlog ↔ data engine for normal commits) **does
+not** go through these slots — it uses `binlog_write_direct*` only —
+so stubbing user-XA does not break the headline use case.
+
+`binlog_unlog` is a sync no-op in Stage 1 (it's the only slot called
+for both internal-2PC and user-XA). Internal-2PC needs no marker
+cleanup because we don't persist XID-keyed markers; the data engine's
+own recovery covers the participant side.
+
+Stage 2 user-XA design will need:
+- Pre-commit serialization of the txn under `binlog_meta:xa:<xid>`.
+- Recovery scan in `binlog_init` to populate `recover_xid_hash` with
+  `BinlogXidInfo` per pending XID (incl. `engine_count` from the
+  prepare record).
+- A delete-on-commit for the marker via `binlog_unlog`.
+
+### 14.7 Open questions
+
+1. **Concrete `BINLOG_OOB_TTL_SECS` default.** Tradeoff: too short and a
+   slow-running large txn loses its OOB chunks; too long and a crash
+   leaves stale data on object storage. Lean **1 hour** (matches typical
+   `wsrep_max_ws_size` upper bounds for replication).
+2. **`partial_chunk` re-entrance.** `SlateDbBinlogReader::read_binlog_data`
+   stashes partial chunks for the next call. Is this thread-safe across
+   the cxx boundary? The C++ caller is a single dump thread per reader,
+   so yes — but the contract should be documented at the cxx shim level.
+3. **Reader durable-seq subscription cost.** Each `SlateDbBinlogReader`
+   subscribes to `DbMetadataOps::subscribe()` (when `wait_durable`). At
+   N concurrent slaves we have N subscriptions. Slatedb watch channels
+   are cheap; confirm at N=100+ slaves.
+4. **Engine name for `binlog_storage_engine` sysvar.** Match the data
+   engine plugin name? Or a separate `slatedb_binlog` plugin name? Lean
+   "same plugin, both roles" — the handlerton resolution
+   (`mysqld.cc:5667..5710`) wants ONE name resolving to ONE handlerton.
+   If we want separability we need to register a second plugin that
+   shares the same Db handle — more wiring.
+5. **InnoDB-binlog co-existence.** If a deployment runs both InnoDB and
+   SlateDB, only one can be `binlog_storage_engine`. SlateDB-as-binlog
+   does NOT preclude InnoDB-as-data (or vice-versa); the binlog engine
+   choice is independent. Document this in user docs.
+6. **`set_binlog_max_size` in-flight semantics.** The C++ contract is
+   under-documented for what happens to a partially-written file when
+   the size shrinks. Lean: take effect at next rotation only.
+
