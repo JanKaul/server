@@ -4,4 +4,5 @@
 //! `cf_id` + `u32_be index_id`) that everything else in the codec layer
 //! ultimately produces / consumes.
 
+pub mod dict;
 pub mod prefix;
