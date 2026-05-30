@@ -240,7 +240,7 @@ pub mod autoinc {
     }
 }
 
-// ----- shared suffix codec for GlIndexId-keyed registries -----
+// ----- shared codecs for GlIndexId-keyed registries -----
 
 const GL_INDEX_SUFFIX_LEN: usize = 8;
 
@@ -288,24 +288,35 @@ async fn list_gl_index_marker_set(
 ///
 /// One marker row per pending-drop index at
 /// `DataDictType::DdlDropIndexOngoing`. Suffix encodes the [`GlIndexId`]
-/// as `u32_be(cf_id) || u32_be(index_id)` (8 bytes). Value is empty —
-/// presence is the marker. The compaction filter walks this registry to
-/// decide which `(cf_id, index_id)` prefixes to sweep.
+/// as `u32_be(cf_id) || u32_be(index_id)` (8 bytes). Value is
+/// `u16_be(DDL_DROP_INDEX_ONGOING_VERSION)` (2 bytes) per MyRocks
+/// (`rdb_datadic.cc:5095..5106`) — written for forward-compat even though
+/// the C++ "doesn't check version right now since currently we always
+/// store only version=1." Our read path validates the stamp loudly so a
+/// format change can't silently corrupt the registry.
+///
+/// The compaction filter walks this registry to decide which
+/// `(cf_id, index_id)` prefixes to sweep.
 pub mod dropped_indexes {
     use super::{
         delete, encode_gl_index_suffix, list_gl_index_marker_set, put, DataDictType,
     };
+    use crate::codec::key::DDL_DROP_INDEX_ONGOING_VERSION;
     use crate::globals::GlIndexId;
     use slatedb::{Db, Error};
 
-    /// Add a single index to the dropped-index registry. Idempotent — adding
-    /// an already-marked index is a no-op write of the same empty value.
+    fn encoded_version() -> [u8; 2] {
+        DDL_DROP_INDEX_ONGOING_VERSION.to_be_bytes()
+    }
+
+    /// Add a single index to the dropped-index registry. Idempotent —
+    /// adding an already-marked index re-writes the same version stamp.
     pub async fn add(db: &Db, gl: GlIndexId) -> Result<(), Error> {
         put(
             db,
             DataDictType::DdlDropIndexOngoing,
             &encode_gl_index_suffix(gl),
-            &[],
+            &encoded_version(),
         )
         .await
     }
@@ -332,23 +343,28 @@ pub mod dropped_indexes {
 ///
 /// Symmetric counterpart to [`dropped_indexes`]: one marker row per index
 /// whose CREATE INDEX is mid-flight, at `DataDictType::DdlCreateIndexOngoing`.
-/// Same suffix encoding as dropped_indexes (8-byte `u32_be(cf_id)||u32_be(index_id)`),
-/// empty value. Crash recovery walks this set to decide whether to roll
-/// the in-progress creation forward (commit) or back (drop the partial
-/// keyspace).
+/// Same suffix encoding (8-byte `u32_be(cf_id)||u32_be(index_id)`); value
+/// is `u16_be(DDL_CREATE_INDEX_ONGOING_VERSION)` per MyRocks. Crash
+/// recovery walks this set to decide whether to roll the in-progress
+/// creation forward (commit) or back (drop the partial keyspace).
 pub mod ddl_create_index_ongoing {
     use super::{
         delete, encode_gl_index_suffix, list_gl_index_marker_set, put, DataDictType,
     };
+    use crate::codec::key::DDL_CREATE_INDEX_ONGOING_VERSION;
     use crate::globals::GlIndexId;
     use slatedb::{Db, Error};
+
+    fn encoded_version() -> [u8; 2] {
+        DDL_CREATE_INDEX_ONGOING_VERSION.to_be_bytes()
+    }
 
     pub async fn add(db: &Db, gl: GlIndexId) -> Result<(), Error> {
         put(
             db,
             DataDictType::DdlCreateIndexOngoing,
             &encode_gl_index_suffix(gl),
-            &[],
+            &encoded_version(),
         )
         .await
     }
@@ -369,39 +385,56 @@ pub mod ddl_create_index_ongoing {
 
 /// Monotonic index-id allocator anchor.
 ///
-/// Singleton row at `DataDictType::MaxIndexId` (empty suffix). Value is a
-/// 4-byte big-endian `u32` — the highest index id ever allocated. The
-/// allocator pattern (read, bump, write) is owner-side; this substrate
-/// just exposes get/put on the singleton.
+/// Singleton row at `DataDictType::MaxIndexId` (empty suffix). Value is
+/// `u16_be(MAX_INDEX_ID_VERSION) || u32_be(value)` (6 bytes) per MyRocks
+/// (`rdb_datadic.cc:5334..5339`). Decoder validates the version stamp;
+/// a future version surfaces as `ErrorKind::Data`.
+///
+/// The allocator pattern (read current, write current+1) is owner-side;
+/// this substrate just exposes get/put on the singleton.
 pub mod max_index_id {
     use super::{delete, get, put, DataDictType};
+    use crate::codec::key::MAX_INDEX_ID_VERSION;
     use slatedb::{Db, Error};
 
-    fn encode(value: u32) -> [u8; 4] {
-        value.to_be_bytes()
+    const VERSION_BYTES: usize = 2;
+    const VALUE_BYTES: usize = 4;
+    pub const ENCODED_LEN: usize = VERSION_BYTES + VALUE_BYTES;
+
+    pub fn encode_value(value: u32) -> [u8; ENCODED_LEN] {
+        let mut out = [0u8; ENCODED_LEN];
+        out[..VERSION_BYTES].copy_from_slice(&MAX_INDEX_ID_VERSION.to_be_bytes());
+        out[VERSION_BYTES..].copy_from_slice(&value.to_be_bytes());
+        out
     }
 
-    fn decode(bytes: &[u8]) -> Result<u32, Error> {
-        if bytes.len() != 4 {
+    pub fn decode_value(bytes: &[u8]) -> Result<u32, Error> {
+        if bytes.len() != ENCODED_LEN {
             return Err(Error::data(format!(
-                "max_index_id value: expected 4 bytes, got {}",
+                "max_index_id value: expected {ENCODED_LEN} bytes, got {}",
                 bytes.len()
             )));
         }
-        let mut buf = [0u8; 4];
-        buf.copy_from_slice(bytes);
+        let version = u16::from_be_bytes([bytes[0], bytes[1]]);
+        if version > MAX_INDEX_ID_VERSION {
+            return Err(Error::data(format!(
+                "max_index_id: unsupported version {version} (latest is {MAX_INDEX_ID_VERSION})"
+            )));
+        }
+        let mut buf = [0u8; VALUE_BYTES];
+        buf.copy_from_slice(&bytes[VERSION_BYTES..]);
         Ok(u32::from_be_bytes(buf))
     }
 
     pub async fn read(db: &Db) -> Result<Option<u32>, Error> {
         match get(db, DataDictType::MaxIndexId, &[]).await? {
-            Some(bytes) => Ok(Some(decode(&bytes)?)),
+            Some(bytes) => Ok(Some(decode_value(&bytes)?)),
             None => Ok(None),
         }
     }
 
     pub async fn write(db: &Db, value: u32) -> Result<(), Error> {
-        put(db, DataDictType::MaxIndexId, &[], &encode(value)).await
+        put(db, DataDictType::MaxIndexId, &[], &encode_value(value)).await
     }
 
     pub async fn remove(db: &Db) -> Result<(), Error> {
@@ -1118,12 +1151,82 @@ mod tests {
         let engine = EngineDb::open_in_memory("max_idx_corrupt")
             .await
             .expect("open");
-        // Bypass the typed writer with a 3-byte payload.
+        // Bypass the typed writer with a 3-byte payload (wrong length).
         put(engine.db(), DataDictType::MaxIndexId, &[], b"abc")
             .await
             .expect("put");
         let err = max_index_id::read(engine.db()).await.unwrap_err();
         assert!(matches!(err.kind(), slatedb::ErrorKind::Data));
+        engine.close().await.expect("close");
+    }
+
+    #[test]
+    fn max_index_id_encode_format_is_version_then_u32_be() {
+        let bytes = max_index_id::encode_value(0x1234_5678);
+        assert_eq!(bytes.len(), max_index_id::ENCODED_LEN);
+        assert_eq!(
+            u16::from_be_bytes([bytes[0], bytes[1]]),
+            crate::codec::key::MAX_INDEX_ID_VERSION
+        );
+        assert_eq!(&bytes[2..], &0x1234_5678u32.to_be_bytes());
+        assert_eq!(max_index_id::decode_value(&bytes).expect("decode"), 0x1234_5678);
+    }
+
+    #[test]
+    fn max_index_id_decode_rejects_future_version() {
+        let mut bytes = [0u8; max_index_id::ENCODED_LEN];
+        bytes[..2]
+            .copy_from_slice(&(crate::codec::key::MAX_INDEX_ID_VERSION + 1).to_be_bytes());
+        assert!(matches!(
+            max_index_id::decode_value(&bytes).unwrap_err().kind(),
+            slatedb::ErrorKind::Data
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_indexes_value_carries_version_stamp() {
+        let engine = EngineDb::open_in_memory("dropped_idx_value_fmt")
+            .await
+            .expect("open");
+        let gl = crate::globals::GlIndexId { cf_id: 1, index_id: 1 };
+        dropped_indexes::add(engine.db(), gl).await.expect("add");
+
+        // Inspect the stored value directly via the substrate.
+        let suffix = encode_gl_index_suffix(gl);
+        let raw = get(engine.db(), DataDictType::DdlDropIndexOngoing, &suffix)
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(raw.len(), 2);
+        assert_eq!(
+            u16::from_be_bytes([raw[0], raw[1]]),
+            crate::codec::key::DDL_DROP_INDEX_ONGOING_VERSION
+        );
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ddl_create_index_ongoing_value_carries_version_stamp() {
+        let engine = EngineDb::open_in_memory("create_ongoing_value_fmt")
+            .await
+            .expect("open");
+        let gl = crate::globals::GlIndexId { cf_id: 1, index_id: 1 };
+        ddl_create_index_ongoing::add(engine.db(), gl)
+            .await
+            .expect("add");
+
+        let suffix = encode_gl_index_suffix(gl);
+        let raw = get(engine.db(), DataDictType::DdlCreateIndexOngoing, &suffix)
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(raw.len(), 2);
+        assert_eq!(
+            u16::from_be_bytes([raw[0], raw[1]]),
+            crate::codec::key::DDL_CREATE_INDEX_ONGOING_VERSION
+        );
+
         engine.close().await.expect("close");
     }
 
