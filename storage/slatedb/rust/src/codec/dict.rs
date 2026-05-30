@@ -107,6 +107,21 @@ pub async fn put(
     Ok(())
 }
 
+/// Append a merge operand at a system-area key. Routed through the global
+/// `EngineMergeOperator` at read/compaction time — see
+/// `engine::merge` for the routing table that maps `record_type` to its
+/// merge semantic (today: only `DataDictType::AutoInc` is wired, as
+/// MAX-merge on versioned `u64` values).
+pub async fn merge(
+    db: &Db,
+    record_type: DataDictType,
+    suffix: &[u8],
+    operand: &[u8],
+) -> Result<(), Error> {
+    db.merge(&system_key(record_type, suffix), operand).await?;
+    Ok(())
+}
+
 pub async fn delete(
     db: &Db,
     record_type: DataDictType,
@@ -129,51 +144,99 @@ pub async fn scan(
 // Substrate consumers (small managers).
 // ---------------------------------------------------------------------------
 
-/// Per-table auto-increment counter.
+/// Per-index auto-increment counter.
 ///
-/// One row per table at `DataDictType::AutoInc`, suffix = table name bytes,
-/// value = `u64` big-endian. Schema version is
-/// [`AUTO_INCREMENT_VERSION`] (callers can ignore it today — there's only
-/// one version).
+/// One row per index at `DataDictType::AutoInc`. Suffix is the
+/// `GlIndexId` encoded as `u32_be(cf_id) || u32_be(index_id)` (8 bytes).
+/// Value is `u16_be(version) || u64_be(value)` (10 bytes), where
+/// `version` is [`crate::codec::key::AUTO_INCREMENT_VERSION`] (= 1 today).
+///
+/// Two write modes match the MyRocks contract
+/// (`Rdb_dict_manager::put_auto_incr_val`):
+/// - [`write`] — Put-mode (overwrite). Used to bootstrap a fresh value
+///   or roll back to a known state.
+/// - [`bump`] — Merge-mode (MAX). Routed through the engine's
+///   [`crate::engine::merge::EngineMergeOperator`] so concurrent writers
+///   and crash recovery converge to the largest observed value.
+///   The merge operator decodes the versioned format and compares the
+///   u64 portion.
 pub mod autoinc {
-    use super::{delete, get, put, DataDictType};
+    use super::{delete, encode_gl_index_suffix, get, merge, put, DataDictType};
+    use crate::codec::key::AUTO_INCREMENT_VERSION;
+    use crate::globals::GlIndexId;
     use slatedb::{Db, Error};
 
-    fn encode_value(value: u64) -> [u8; 8] {
-        value.to_be_bytes()
+    const VERSION_BYTES: usize = 2;
+    const VALUE_BYTES: usize = 8;
+    /// On-disk encoded length: `u16_be(version) || u64_be(value)`.
+    pub const ENCODED_LEN: usize = VERSION_BYTES + VALUE_BYTES;
+
+    /// Encode `value` in the on-disk format. Public so the engine's
+    /// merge operator can validate/produce the same bytes without
+    /// going through this module's async API.
+    pub fn encode_value(value: u64) -> [u8; ENCODED_LEN] {
+        let mut out = [0u8; ENCODED_LEN];
+        out[..VERSION_BYTES].copy_from_slice(&AUTO_INCREMENT_VERSION.to_be_bytes());
+        out[VERSION_BYTES..].copy_from_slice(&value.to_be_bytes());
+        out
     }
 
-    fn decode_value(bytes: &[u8]) -> Result<u64, Error> {
-        if bytes.len() != 8 {
+    /// Decode the versioned value, validating that the on-disk version
+    /// is recognised (`<= AUTO_INCREMENT_VERSION`). Mirrors
+    /// `rdb_datadic.cc:5410` which silently treats future versions as
+    /// "value not present" — we surface that as `Err(Data)` so a
+    /// downgrade-without-migration is loud.
+    pub fn decode_value(bytes: &[u8]) -> Result<u64, Error> {
+        if bytes.len() != ENCODED_LEN {
             return Err(Error::data(format!(
-                "autoinc value: expected 8 bytes, got {}",
+                "autoinc value: expected {ENCODED_LEN} bytes, got {}",
                 bytes.len()
             )));
         }
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(bytes);
+        let version = u16::from_be_bytes([bytes[0], bytes[1]]);
+        if version > AUTO_INCREMENT_VERSION {
+            return Err(Error::data(format!(
+                "autoinc value: unsupported version {version} (latest is {AUTO_INCREMENT_VERSION})"
+            )));
+        }
+        let mut buf = [0u8; VALUE_BYTES];
+        buf.copy_from_slice(&bytes[VERSION_BYTES..]);
         Ok(u64::from_be_bytes(buf))
     }
 
-    pub async fn read(db: &Db, table_name: &str) -> Result<Option<u64>, Error> {
-        match get(db, DataDictType::AutoInc, table_name.as_bytes()).await? {
+    pub async fn read(db: &Db, gl: GlIndexId) -> Result<Option<u64>, Error> {
+        match get(db, DataDictType::AutoInc, &encode_gl_index_suffix(gl)).await? {
             Some(bytes) => Ok(Some(decode_value(&bytes)?)),
             None => Ok(None),
         }
     }
 
-    pub async fn write(db: &Db, table_name: &str, value: u64) -> Result<(), Error> {
+    /// Put-mode write — overwrites whatever's stored.
+    pub async fn write(db: &Db, gl: GlIndexId, value: u64) -> Result<(), Error> {
         put(
             db,
             DataDictType::AutoInc,
-            table_name.as_bytes(),
+            &encode_gl_index_suffix(gl),
             &encode_value(value),
         )
         .await
     }
 
-    pub async fn remove(db: &Db, table_name: &str) -> Result<(), Error> {
-        delete(db, DataDictType::AutoInc, table_name.as_bytes()).await
+    /// Merge-mode write — appends a MAX-merge operand. The current
+    /// stored value rises to `max(current, value)` after the operator
+    /// resolves it on read/compaction.
+    pub async fn bump(db: &Db, gl: GlIndexId, value: u64) -> Result<(), Error> {
+        merge(
+            db,
+            DataDictType::AutoInc,
+            &encode_gl_index_suffix(gl),
+            &encode_value(value),
+        )
+        .await
+    }
+
+    pub async fn remove(db: &Db, gl: GlIndexId) -> Result<(), Error> {
+        delete(db, DataDictType::AutoInc, &encode_gl_index_suffix(gl)).await
     }
 }
 
@@ -795,39 +858,75 @@ mod tests {
 
     // ----- autoinc -----
 
+    fn gl(cf_id: u32, index_id: u32) -> crate::globals::GlIndexId {
+        crate::globals::GlIndexId { cf_id, index_id }
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn autoinc_round_trip() {
+    async fn autoinc_put_round_trip_per_index() {
         let engine = EngineDb::open_in_memory("autoinc_rt").await.expect("open");
+        let users_pk = gl(1, 100);
 
         assert_eq!(
-            autoinc::read(engine.db(), "users").await.expect("read miss"),
+            autoinc::read(engine.db(), users_pk).await.expect("read miss"),
             None
         );
 
-        autoinc::write(engine.db(), "users", 42)
-            .await
-            .expect("write");
+        autoinc::write(engine.db(), users_pk, 42).await.expect("write");
         assert_eq!(
-            autoinc::read(engine.db(), "users").await.expect("read"),
+            autoinc::read(engine.db(), users_pk).await.expect("read"),
             Some(42)
         );
 
-        // Overwrite with a higher value.
-        autoinc::write(engine.db(), "users", 100_000)
+        // Overwrite with a higher value via Put.
+        autoinc::write(engine.db(), users_pk, 100_000)
             .await
             .expect("write");
         assert_eq!(
-            autoinc::read(engine.db(), "users").await.expect("read"),
+            autoinc::read(engine.db(), users_pk).await.expect("read"),
             Some(100_000)
         );
 
-        autoinc::remove(engine.db(), "users")
-            .await
-            .expect("remove");
+        autoinc::remove(engine.db(), users_pk).await.expect("remove");
         assert_eq!(
-            autoinc::read(engine.db(), "users").await.expect("read"),
+            autoinc::read(engine.db(), users_pk).await.expect("read"),
             None
         );
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn autoinc_bump_takes_max_via_merge_operator() {
+        let engine = EngineDb::open_in_memory("autoinc_bump")
+            .await
+            .expect("open");
+        let pk = gl(2, 200);
+
+        // Three bumps: 5, 3, 10 → MAX-merge → 10.
+        autoinc::bump(engine.db(), pk, 5).await.expect("bump 5");
+        autoinc::bump(engine.db(), pk, 3).await.expect("bump 3");
+        autoinc::bump(engine.db(), pk, 10).await.expect("bump 10");
+        assert_eq!(
+            autoinc::read(engine.db(), pk).await.expect("read"),
+            Some(10)
+        );
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn autoinc_distinct_indexes_have_independent_counters() {
+        let engine = EngineDb::open_in_memory("autoinc_per_index")
+            .await
+            .expect("open");
+        let a = gl(1, 100);
+        let b = gl(1, 101);
+
+        autoinc::write(engine.db(), a, 42).await.expect("write a");
+        autoinc::write(engine.db(), b, 99).await.expect("write b");
+        assert_eq!(autoinc::read(engine.db(), a).await.expect("read"), Some(42));
+        assert_eq!(autoinc::read(engine.db(), b).await.expect("read"), Some(99));
 
         engine.close().await.expect("close");
     }
@@ -837,16 +936,41 @@ mod tests {
         let engine = EngineDb::open_in_memory("autoinc_corrupt")
             .await
             .expect("open");
+        let pk = gl(3, 300);
 
         // Write a 3-byte payload through the raw substrate, bypassing autoinc.
-        put(engine.db(), DataDictType::AutoInc, b"weird", b"abc")
+        // Suffix must match what autoinc::read computes from GlIndexId.
+        let suffix = encode_gl_index_suffix(pk);
+        put(engine.db(), DataDictType::AutoInc, &suffix, b"abc")
             .await
             .expect("put");
 
-        let err = autoinc::read(engine.db(), "weird").await.unwrap_err();
+        let err = autoinc::read(engine.db(), pk).await.unwrap_err();
         assert!(matches!(err.kind(), slatedb::ErrorKind::Data));
 
         engine.close().await.expect("close");
+    }
+
+    #[test]
+    fn autoinc_encode_decode_round_trip() {
+        for v in [0u64, 1, 42, 0xdead_beef, u64::MAX] {
+            let bytes = autoinc::encode_value(v);
+            assert_eq!(bytes.len(), autoinc::ENCODED_LEN);
+            // Version is the leading u16 BE.
+            assert_eq!(
+                u16::from_be_bytes([bytes[0], bytes[1]]),
+                crate::codec::key::AUTO_INCREMENT_VERSION
+            );
+            assert_eq!(autoinc::decode_value(&bytes).expect("decode"), v);
+        }
+    }
+
+    #[test]
+    fn autoinc_decode_rejects_future_version() {
+        let mut bytes = [0u8; autoinc::ENCODED_LEN];
+        bytes[0..2].copy_from_slice(&(crate::codec::key::AUTO_INCREMENT_VERSION + 1).to_be_bytes());
+        let err = autoinc::decode_value(&bytes).unwrap_err();
+        assert!(matches!(err.kind(), slatedb::ErrorKind::Data));
     }
 
     // ----- dropped_indexes -----

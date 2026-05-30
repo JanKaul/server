@@ -9,17 +9,17 @@
 //!
 //! ## Routing table (today)
 //!
-//! | `cf_id`        | `record_type`             | Behaviour          |
-//! |----------------|---------------------------|--------------------|
-//! | `u32::MAX`     | `DataDictType::AutoInc`   | MAX-merge `u64_be` |
-//! | `u32::MAX`     | any other                 | reject             |
-//! | anything else  | —                         | reject             |
+//! | `cf_id`        | `record_type`             | Behaviour                         |
+//! |----------------|---------------------------|-----------------------------------|
+//! | `u32::MAX`     | `DataDictType::AutoInc`   | MAX-merge versioned `u64`         |
+//! | `u32::MAX`     | any other                 | reject                            |
+//! | anything else  | —                         | reject                            |
 //!
 //! AutoInc MAX-merge mirrors MyRocks' `Rdb_system_merge_op`: concurrent
 //! writers and crash recovery converge to the largest observed value. The
-//! operand format is the same `u64_be` that
-//! [`crate::codec::dict::autoinc`] uses at rest, so a write via
-//! `Db::merge` reaches reads as a value of the same shape.
+//! operand format is `u16_be(version) || u64_be(value)` — same as
+//! [`crate::codec::dict::autoinc::encode_value`], so a write via
+//! `Db::merge` reaches reads as a value of identical shape.
 //!
 //! ## Future extensions
 //!
@@ -40,7 +40,8 @@ use crate::globals::SYSTEM_CF_ID;
 pub struct EngineMergeOperator;
 
 enum MergeRoute {
-    MaxU64Be,
+    /// MAX-merge on the versioned `u64` autoinc format.
+    MaxAutoInc,
     Reject(String),
 }
 
@@ -59,7 +60,7 @@ impl EngineMergeOperator {
             ));
         }
         if parsed.index_id == DataDictType::AutoInc as u32 {
-            MergeRoute::MaxU64Be
+            MergeRoute::MaxAutoInc
         } else {
             MergeRoute::Reject(format!(
                 "merge: system record type {} has no merge operator wired",
@@ -77,35 +78,33 @@ impl MergeOperator for EngineMergeOperator {
         value: Bytes,
     ) -> Result<Bytes, MergeOperatorError> {
         match Self::route(key) {
-            MergeRoute::MaxU64Be => max_u64_be(existing_value, value),
+            MergeRoute::MaxAutoInc => max_autoinc(existing_value, value),
             MergeRoute::Reject(msg) => Err(MergeOperatorError::Callback { message: msg }),
         }
     }
 }
 
-fn max_u64_be(
+fn max_autoinc(
     existing: Option<Bytes>,
     operand: Bytes,
 ) -> Result<Bytes, MergeOperatorError> {
-    let new_val = decode_u64_be(&operand)?;
+    let new_val = decode_autoinc(&operand)?;
     match existing {
         Some(e) => {
-            let old_val = decode_u64_be(&e)?;
+            let old_val = decode_autoinc(&e)?;
             Ok(if new_val > old_val { operand } else { e })
         }
         None => Ok(operand),
     }
 }
 
-fn decode_u64_be(bytes: &[u8]) -> Result<u64, MergeOperatorError> {
-    if bytes.len() != 8 {
-        return Err(MergeOperatorError::Callback {
-            message: format!("merge: expected 8 bytes for u64_be operand, got {}", bytes.len()),
-        });
-    }
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(bytes);
-    Ok(u64::from_be_bytes(buf))
+/// Decode the versioned autoinc payload (`u16_be(version) || u64_be(value)`,
+/// 10 bytes). Format must match
+/// [`crate::codec::dict::autoinc::encode_value`].
+fn decode_autoinc(bytes: &[u8]) -> Result<u64, MergeOperatorError> {
+    crate::codec::dict::autoinc::decode_value(bytes).map_err(|e| MergeOperatorError::Callback {
+        message: format!("merge: {e}"),
+    })
 }
 
 #[cfg(test)]
@@ -114,12 +113,22 @@ mod tests {
     use crate::codec::dict::{self, autoinc};
     use crate::engine::db::EngineDb;
 
-    fn autoinc_key(table: &str) -> Bytes {
-        dict::system_key(DataDictType::AutoInc, table.as_bytes())
+    fn gl(cf_id: u32, index_id: u32) -> crate::globals::GlIndexId {
+        crate::globals::GlIndexId { cf_id, index_id }
     }
 
-    fn u64_be(v: u64) -> Bytes {
-        Bytes::copy_from_slice(&v.to_be_bytes())
+    /// Build an autoinc key directly from a GlIndexId (mirrors what
+    /// `codec::dict::autoinc::write` computes internally).
+    fn autoinc_key_for(g: crate::globals::GlIndexId) -> Bytes {
+        let mut suffix = [0u8; 8];
+        suffix[..4].copy_from_slice(&g.cf_id.to_be_bytes());
+        suffix[4..].copy_from_slice(&g.index_id.to_be_bytes());
+        dict::system_key(DataDictType::AutoInc, &suffix)
+    }
+
+    /// Versioned autoinc operand (matches `dict::autoinc::encode_value`).
+    fn autoinc_value(v: u64) -> Bytes {
+        Bytes::copy_from_slice(&autoinc::encode_value(v))
     }
 
     // ----- Routing-only unit tests (no SlateDB needed) -----
@@ -128,34 +137,46 @@ mod tests {
     fn autoinc_first_operand_becomes_value() {
         let op = EngineMergeOperator;
         let got = op
-            .merge(&autoinc_key("t"), None, u64_be(42))
+            .merge(&autoinc_key_for(gl(1, 100)), None, autoinc_value(42))
             .expect("merge");
-        assert_eq!(&got[..], &42u64.to_be_bytes());
+        assert_eq!(autoinc::decode_value(&got).expect("decode"), 42);
     }
 
     #[test]
     fn autoinc_keeps_larger_existing() {
         let op = EngineMergeOperator;
         let got = op
-            .merge(&autoinc_key("t"), Some(u64_be(100)), u64_be(7))
+            .merge(
+                &autoinc_key_for(gl(1, 100)),
+                Some(autoinc_value(100)),
+                autoinc_value(7),
+            )
             .expect("merge");
-        assert_eq!(&got[..], &100u64.to_be_bytes());
+        assert_eq!(autoinc::decode_value(&got).expect("decode"), 100);
     }
 
     #[test]
     fn autoinc_takes_larger_operand() {
         let op = EngineMergeOperator;
         let got = op
-            .merge(&autoinc_key("t"), Some(u64_be(7)), u64_be(100))
+            .merge(
+                &autoinc_key_for(gl(1, 100)),
+                Some(autoinc_value(7)),
+                autoinc_value(100),
+            )
             .expect("merge");
-        assert_eq!(&got[..], &100u64.to_be_bytes());
+        assert_eq!(autoinc::decode_value(&got).expect("decode"), 100);
     }
 
     #[test]
     fn autoinc_rejects_wrong_size_operand() {
         let op = EngineMergeOperator;
         let err = op
-            .merge(&autoinc_key("t"), None, Bytes::from_static(b"abc"))
+            .merge(
+                &autoinc_key_for(gl(1, 100)),
+                None,
+                Bytes::from_static(b"abc"),
+            )
             .unwrap_err();
         assert!(matches!(err, MergeOperatorError::Callback { .. }));
     }
@@ -165,7 +186,7 @@ mod tests {
         let op = EngineMergeOperator;
         let key = dict::system_key(DataDictType::TableVersion, b"t");
         let err = op
-            .merge(&key, None, u64_be(1))
+            .merge(&key, None, autoinc_value(1))
             .unwrap_err();
         let MergeOperatorError::Callback { message } = err else {
             panic!("expected Callback variant");
@@ -177,9 +198,7 @@ mod tests {
     fn user_cf_is_rejected() {
         let op = EngineMergeOperator;
         let key = crate::codec::prefix::build_key_prefix(0, 1); // user CF
-        let err = op
-            .merge(&key, None, u64_be(1))
-            .unwrap_err();
+        let err = op.merge(&key, None, autoinc_value(1)).unwrap_err();
         let MergeOperatorError::Callback { message } = err else {
             panic!("expected Callback variant");
         };
@@ -189,10 +208,7 @@ mod tests {
     #[test]
     fn unparseable_key_is_rejected() {
         let op = EngineMergeOperator;
-        // Empty key — varint decode fails.
-        let err = op
-            .merge(&Bytes::new(), None, u64_be(1))
-            .unwrap_err();
+        let err = op.merge(&Bytes::new(), None, autoinc_value(1)).unwrap_err();
         assert!(matches!(err, MergeOperatorError::Callback { .. }));
     }
 
@@ -203,16 +219,14 @@ mod tests {
         let engine = EngineDb::open_in_memory("merge_e2e_max")
             .await
             .expect("open");
-        let key = autoinc_key("users");
+        let pk = gl(7, 42);
 
-        // Three merge operands: 5, 3, 10 → MAX-merge → 10.
-        engine.db().merge(&key, &5u64.to_be_bytes()).await.expect("merge 5");
-        engine.db().merge(&key, &3u64.to_be_bytes()).await.expect("merge 3");
-        engine.db().merge(&key, &10u64.to_be_bytes()).await.expect("merge 10");
+        // Three merge operands via the typed autoinc bump path.
+        autoinc::bump(engine.db(), pk, 5).await.expect("bump 5");
+        autoinc::bump(engine.db(), pk, 3).await.expect("bump 3");
+        autoinc::bump(engine.db(), pk, 10).await.expect("bump 10");
 
-        // Routing via the dict::autoinc reader (which decodes u64_be) — proves the
-        // resolved value has the right shape.
-        let got = autoinc::read(engine.db(), "users").await.expect("read");
+        let got = autoinc::read(engine.db(), pk).await.expect("read");
         assert_eq!(got, Some(10));
 
         engine.close().await.expect("close");
@@ -223,33 +237,18 @@ mod tests {
         let engine = EngineDb::open_in_memory("merge_e2e_with_base")
             .await
             .expect("open");
+        let pk = gl(7, 42);
 
-        // Seed via the regular put-based autoinc writer.
-        autoinc::write(engine.db(), "users", 50)
-            .await
-            .expect("seed");
+        // Seed via the put-based autoinc writer.
+        autoinc::write(engine.db(), pk, 50).await.expect("seed");
 
-        // Merge a smaller value — should be ignored.
-        engine
-            .db()
-            .merge(&autoinc_key("users"), &7u64.to_be_bytes())
-            .await
-            .expect("merge");
-        assert_eq!(
-            autoinc::read(engine.db(), "users").await.expect("read"),
-            Some(50)
-        );
+        // Bump with a smaller value — should be ignored.
+        autoinc::bump(engine.db(), pk, 7).await.expect("bump small");
+        assert_eq!(autoinc::read(engine.db(), pk).await.expect("read"), Some(50));
 
-        // Merge a larger value — should win.
-        engine
-            .db()
-            .merge(&autoinc_key("users"), &99u64.to_be_bytes())
-            .await
-            .expect("merge");
-        assert_eq!(
-            autoinc::read(engine.db(), "users").await.expect("read"),
-            Some(99)
-        );
+        // Bump with a larger value — should win.
+        autoinc::bump(engine.db(), pk, 99).await.expect("bump large");
+        assert_eq!(autoinc::read(engine.db(), pk).await.expect("read"), Some(99));
 
         engine.close().await.expect("close");
     }
