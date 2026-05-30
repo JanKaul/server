@@ -40,6 +40,14 @@ use crate::codec::field_pack::FieldPacking;
 use crate::engine::comparator::KeyDirection;
 use crate::globals::GlIndexId;
 
+/// Resolved TTL column descriptor returned by
+/// [`KeyDef::extract_ttl_col`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TtlColumn {
+    pub column_name: String,
+    pub field_index: u32,
+}
+
 // ---------- layout-size constants (rdb_datadic.h:468) ----------
 
 pub const INDEX_NUMBER_SIZE: usize = 4;
@@ -467,6 +475,71 @@ impl KeyDef {
     /// decimal only — users always write decimal seconds and supporting
     /// the other bases would be a footgun. If a `0x...` value ever
     /// surfaces in a real migration it'll fail loudly here.
+    /// Read the `ttl_col=NAME` qualifier from a table comment and resolve
+    /// it against `table_share`. Returns:
+    /// - `Ok(None)` — no `ttl_col` qualifier (and no validation pressure).
+    /// - `Ok(Some({column_name, field_index}))` — a column matched name
+    ///   AND (when `skip_checks=false`) type/null requirements.
+    /// - `Err(Invalid)` — `ttl_col` was set but no column matched all the
+    ///   validation requirements. Mirrors the C++
+    ///   `ER_RDB_TTL_COL_FORMAT` failure.
+    ///
+    /// Validation when `skip_checks=false`:
+    /// - `field.name == ttl_col_str` (case-sensitive ASCII match)
+    /// - `field.mysql_type == MysqlType::LongLong`
+    /// - `field.flags & UNSIGNED_FLAG != 0` (column declared UNSIGNED)
+    /// - `field.is_not_null()` (column declared NOT NULL)
+    ///
+    /// When `skip_checks=true` only the name match runs. The C++ uses
+    /// this from inside `setup()` when the validation has already been
+    /// performed at index-create time and a redundant check would
+    /// double-emit errors.
+    pub fn extract_ttl_col(
+        comment: &str,
+        partition_name: Option<&str>,
+        table_share: &crate::codec::value::TableShareView,
+        skip_checks: bool,
+    ) -> Result<Option<TtlColumn>, slatedb::Error> {
+        let Some(m) = crate::codec::comment_parser::parse_qualifier(
+            comment,
+            crate::globals::TTL_COL_QUALIFIER,
+            partition_name,
+        ) else {
+            return Ok(None);
+        };
+
+        if skip_checks {
+            // Take the first name match without validation.
+            for (i, field) in table_share.fields.iter().enumerate() {
+                if field.name == m.value {
+                    return Ok(Some(TtlColumn {
+                        column_name: m.value,
+                        field_index: i as u32,
+                    }));
+                }
+            }
+            return Ok(None);
+        }
+
+        for (i, field) in table_share.fields.iter().enumerate() {
+            if field.name == m.value
+                && field.mysql_type == crate::codec::value::MysqlType::LongLong
+                && (field.flags & crate::codec::value::UNSIGNED_FLAG) != 0
+                && field.is_not_null()
+            {
+                return Ok(Some(TtlColumn {
+                    column_name: m.value,
+                    field_index: i as u32,
+                }));
+            }
+        }
+
+        Err(slatedb::Error::invalid(format!(
+            "ttl_col {:?}: must be NOT NULL BIGINT UNSIGNED column of the table",
+            m.value
+        )))
+    }
+
     pub fn extract_ttl_duration(
         comment: &str,
         partition_name: Option<&str>,
@@ -797,5 +870,149 @@ mod tests {
             KeyDef::extract_ttl_duration("ttl_duration=", None).expect("ok"),
             None
         );
+    }
+
+    // ----- extract_ttl_col -----
+
+    fn build_table_share(fields: Vec<crate::codec::value::FieldView>) -> crate::codec::value::TableShareView {
+        crate::codec::value::TableShareView {
+            null_bytes: 0,
+            row_length: fields.iter().map(|f| f.pack_length).sum(),
+            hidden_pk_field: None,
+            fields,
+        }
+    }
+
+    fn ttl_col_field(name: &str) -> crate::codec::value::FieldView {
+        crate::codec::value::FieldView {
+            name: name.into(),
+            mysql_type: crate::codec::value::MysqlType::LongLong,
+            pack_length: 8,
+            output_offset: 0,
+            null_marker: None, // NOT NULL
+            length: 8,
+            charset_id: 63,
+            flags: crate::codec::value::UNSIGNED_FLAG,
+            decimals: 0,
+        }
+    }
+
+    #[test]
+    fn ttl_col_missing_qualifier_is_ok_none() {
+        let ts = build_table_share(vec![ttl_col_field("created_at")]);
+        assert_eq!(
+            KeyDef::extract_ttl_col("", None, &ts, false).expect("ok"),
+            None
+        );
+        assert_eq!(
+            KeyDef::extract_ttl_col("cfname=audit", None, &ts, false).expect("ok"),
+            None
+        );
+    }
+
+    #[test]
+    fn ttl_col_validated_match_returns_column() {
+        let ts = build_table_share(vec![ttl_col_field("created_at")]);
+        let got = KeyDef::extract_ttl_col("ttl_col=created_at", None, &ts, false)
+            .expect("ok")
+            .expect("present");
+        assert_eq!(got.column_name, "created_at");
+        assert_eq!(got.field_index, 0);
+    }
+
+    #[test]
+    fn ttl_col_missing_column_in_table_is_error() {
+        let ts = build_table_share(vec![ttl_col_field("created_at")]);
+        let err = KeyDef::extract_ttl_col("ttl_col=does_not_exist", None, &ts, false)
+            .unwrap_err();
+        assert!(matches!(err.kind(), slatedb::ErrorKind::Invalid));
+    }
+
+    #[test]
+    fn ttl_col_wrong_type_is_error() {
+        let mut f = ttl_col_field("created_at");
+        f.mysql_type = crate::codec::value::MysqlType::Long; // INT, not BIGINT
+        let ts = build_table_share(vec![f]);
+        assert!(matches!(
+            KeyDef::extract_ttl_col("ttl_col=created_at", None, &ts, false)
+                .unwrap_err()
+                .kind(),
+            slatedb::ErrorKind::Invalid
+        ));
+    }
+
+    #[test]
+    fn ttl_col_signed_is_error() {
+        let mut f = ttl_col_field("created_at");
+        f.flags = 0; // strips UNSIGNED_FLAG
+        let ts = build_table_share(vec![f]);
+        assert!(matches!(
+            KeyDef::extract_ttl_col("ttl_col=created_at", None, &ts, false)
+                .unwrap_err()
+                .kind(),
+            slatedb::ErrorKind::Invalid
+        ));
+    }
+
+    #[test]
+    fn ttl_col_nullable_is_error() {
+        let mut f = ttl_col_field("created_at");
+        f.null_marker = Some((0, 1));
+        let ts = build_table_share(vec![f]);
+        assert!(matches!(
+            KeyDef::extract_ttl_col("ttl_col=created_at", None, &ts, false)
+                .unwrap_err()
+                .kind(),
+            slatedb::ErrorKind::Invalid
+        ));
+    }
+
+    #[test]
+    fn ttl_col_skip_checks_bypasses_type_and_null_validation() {
+        let mut wrong_type = ttl_col_field("created_at");
+        wrong_type.mysql_type = crate::codec::value::MysqlType::Long;
+        wrong_type.null_marker = Some((0, 1));
+        wrong_type.flags = 0;
+        let ts = build_table_share(vec![wrong_type]);
+
+        // skip_checks=true: name match alone succeeds.
+        let got = KeyDef::extract_ttl_col("ttl_col=created_at", None, &ts, true)
+            .expect("ok")
+            .expect("present");
+        assert_eq!(got.column_name, "created_at");
+        assert_eq!(got.field_index, 0);
+
+        // skip_checks=true with name miss: Ok(None), no error.
+        assert_eq!(
+            KeyDef::extract_ttl_col("ttl_col=other", None, &ts, true).expect("ok"),
+            None
+        );
+    }
+
+    #[test]
+    fn ttl_col_resolves_index_within_multi_field_table() {
+        let ts = build_table_share(vec![
+            ttl_col_field("a"),
+            ttl_col_field("b"),
+            ttl_col_field("c"),
+        ]);
+        let got = KeyDef::extract_ttl_col("ttl_col=c", None, &ts, false)
+            .expect("ok")
+            .expect("present");
+        assert_eq!(got.field_index, 2);
+    }
+
+    #[test]
+    fn ttl_col_partition_override_wins() {
+        let ts = build_table_share(vec![
+            ttl_col_field("table_level"),
+            ttl_col_field("p0_level"),
+        ]);
+        let comment = "ttl_col=table_level;p0_ttl_col=p0_level";
+        let got = KeyDef::extract_ttl_col(comment, Some("p0"), &ts, false)
+            .expect("ok")
+            .expect("present");
+        assert_eq!(got.column_name, "p0_level");
+        assert_eq!(got.field_index, 1);
     }
 }

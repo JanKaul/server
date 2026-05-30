@@ -68,12 +68,23 @@ pub enum MysqlType {
     Geometry = 255,
 }
 
+/// `UNSIGNED_FLAG` from MariaDB's `mysql_com.h`. Marshalled in via the
+/// cxx shim from `Field::flags`. Used by callers like
+/// `KeyDef::extract_ttl_col` that need to validate column attributes
+/// without re-touching the bridge.
+pub const UNSIGNED_FLAG: u32 = 32;
+
 /// Per-column field descriptor. POD across the cxx boundary.
 ///
 /// All offsets are in bytes within the row buffer; `null_marker` selects
 /// one bit within the row's leading null bitmap.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldView {
+    /// Column name as declared in the table — case-sensitive ASCII match
+    /// per MariaDB conventions. Carried so callers like
+    /// `KeyDef::extract_ttl_col` can resolve `ttl_col=NAME` qualifiers
+    /// without an extra bridge call.
+    pub name: String,
     pub mysql_type: MysqlType,
     /// Bytes this field occupies in the row buffer (the in-memory MySQL
     /// row format, not the on-disk encoding).
@@ -165,6 +176,7 @@ mod tests {
 
     fn nullable_int(output_offset: u32, null_byte: u32, null_bit: u8) -> FieldView {
         FieldView {
+            name: "i".into(),
             mysql_type: MysqlType::Long,
             pack_length: 4,
             output_offset,
@@ -178,6 +190,7 @@ mod tests {
 
     fn not_null_int(output_offset: u32) -> FieldView {
         FieldView {
+            name: "i".into(),
             mysql_type: MysqlType::Long,
             pack_length: 4,
             output_offset,
