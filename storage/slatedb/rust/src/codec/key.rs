@@ -446,6 +446,53 @@ impl KeyDef {
     pub fn gen_ttl_col_qualifier_for_partition(s: &str) -> String {
         format!("{}_{}", crate::globals::TTL_COL_QUALIFIER, s)
     }
+
+    // ----- TTL extractors (rdb_datadic.cc:607..) -----
+
+    /// Read the `ttl_duration=N` qualifier from a table comment and
+    /// return it in seconds. A partition-specific override
+    /// (`{p}_ttl_duration=N`) takes precedence when `partition_name` is
+    /// supplied — see `codec::comment_parser` for the precedence rules.
+    ///
+    /// Returns:
+    /// - `Ok(None)` — no `ttl_duration` configured, or the entry was
+    ///   malformed (matches the C++ "empty result" semantic).
+    /// - `Ok(Some(n))` — TTL duration in seconds, `n > 0`.
+    /// - `Err(Invalid)` — value was present but failed to parse as `u64`,
+    ///   or parsed to `0`. The C++ rejects both via
+    ///   `ER_RDB_TTL_DURATION_FORMAT`; we preserve that.
+    ///
+    /// **Deviation:** the C++ uses `strtoull` with base `0`, so it
+    /// accepts `0x`-prefixed hex and `0`-prefixed octal. We accept
+    /// decimal only — users always write decimal seconds and supporting
+    /// the other bases would be a footgun. If a `0x...` value ever
+    /// surfaces in a real migration it'll fail loudly here.
+    pub fn extract_ttl_duration(
+        comment: &str,
+        partition_name: Option<&str>,
+    ) -> Result<Option<u64>, slatedb::Error> {
+        let m = match crate::codec::comment_parser::parse_qualifier(
+            comment,
+            crate::globals::TTL_DURATION_QUALIFIER,
+            partition_name,
+        ) {
+            Some(m) => m,
+            None => return Ok(None),
+        };
+        let value = m.value.parse::<u64>().map_err(|_| {
+            slatedb::Error::invalid(format!(
+                "ttl_duration: expected unsigned integer, got {:?}",
+                m.value
+            ))
+        })?;
+        if value == 0 {
+            return Err(slatedb::Error::invalid(format!(
+                "ttl_duration must be > 0 (got {:?})",
+                m.value
+            )));
+        }
+        Ok(Some(value))
+    }
 }
 
 #[cfg(test)]
@@ -684,6 +731,71 @@ mod tests {
         assert_eq!(
             KeyDef::gen_ttl_col_qualifier_for_partition("p0"),
             format!("{}_p0", crate::globals::TTL_COL_QUALIFIER)
+        );
+    }
+
+    // ----- extract_ttl_duration -----
+
+    #[test]
+    fn ttl_duration_missing_is_ok_none() {
+        assert_eq!(KeyDef::extract_ttl_duration("", None).expect("ok"), None);
+        assert_eq!(
+            KeyDef::extract_ttl_duration("cfname=audit", None).expect("ok"),
+            None
+        );
+    }
+
+    #[test]
+    fn ttl_duration_plain_parses_to_seconds() {
+        assert_eq!(
+            KeyDef::extract_ttl_duration("ttl_duration=3600", None).expect("ok"),
+            Some(3600)
+        );
+    }
+
+    #[test]
+    fn ttl_duration_partition_override_wins() {
+        let comment = "ttl_duration=3600;p0_ttl_duration=60";
+        assert_eq!(
+            KeyDef::extract_ttl_duration(comment, Some("p0")).expect("ok"),
+            Some(60)
+        );
+        assert_eq!(
+            KeyDef::extract_ttl_duration(comment, Some("p9")).expect("ok"),
+            Some(3600),
+            "no partition override → fall back to table-level"
+        );
+    }
+
+    #[test]
+    fn ttl_duration_malformed_value_is_invalid() {
+        let err = KeyDef::extract_ttl_duration("ttl_duration=abc", None).unwrap_err();
+        assert!(matches!(err.kind(), slatedb::ErrorKind::Invalid));
+
+        // u64 overflow.
+        let err = KeyDef::extract_ttl_duration(
+            "ttl_duration=99999999999999999999",
+            None,
+        )
+        .unwrap_err();
+        assert!(matches!(err.kind(), slatedb::ErrorKind::Invalid));
+    }
+
+    #[test]
+    fn ttl_duration_zero_is_rejected() {
+        // Matches the C++ which treats strtoull-returns-0 as an error,
+        // intentionally conflating "0 literal" with "parse failure".
+        let err = KeyDef::extract_ttl_duration("ttl_duration=0", None).unwrap_err();
+        assert!(matches!(err.kind(), slatedb::ErrorKind::Invalid));
+    }
+
+    #[test]
+    fn ttl_duration_malformed_qualifier_is_ok_none() {
+        // The comment_parser returns None for "ttl_duration=" (no value).
+        // We surface that as Ok(None), not Err — matches C++ empty-result.
+        assert_eq!(
+            KeyDef::extract_ttl_duration("ttl_duration=", None).expect("ok"),
+            None
         );
     }
 }
