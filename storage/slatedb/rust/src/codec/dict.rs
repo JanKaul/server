@@ -370,6 +370,95 @@ pub mod binlog_info {
     }
 }
 
+/// Table-version stamp.
+///
+/// One row per table at `DataDictType::TableVersion`. Suffix is the
+/// table's logical path (e.g. `"./db_name/table_name"`); value is a
+/// u64 big-endian schema version. The C++ wraps the path in a
+/// `"MariaDB:table-version:"` literal — we drop that since we don't
+/// preserve MyRocks on-disk format compat (different engine, fresh DB).
+pub mod table_version {
+    use super::{delete, get, put, DataDictType};
+    use slatedb::{Db, Error};
+
+    fn encode(value: u64) -> [u8; 8] {
+        value.to_be_bytes()
+    }
+
+    fn decode(bytes: &[u8]) -> Result<u64, Error> {
+        if bytes.len() != 8 {
+            return Err(Error::data(format!(
+                "table_version value: expected 8 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(bytes);
+        Ok(u64::from_be_bytes(buf))
+    }
+
+    pub async fn read(db: &Db, path: &str) -> Result<Option<u64>, Error> {
+        match get(db, DataDictType::TableVersion, path.as_bytes()).await? {
+            Some(bytes) => Ok(Some(decode(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn write(db: &Db, path: &str, value: u64) -> Result<(), Error> {
+        put(db, DataDictType::TableVersion, path.as_bytes(), &encode(value)).await
+    }
+
+    pub async fn remove(db: &Db, path: &str) -> Result<(), Error> {
+        delete(db, DataDictType::TableVersion, path.as_bytes()).await
+    }
+}
+
+/// DDL-entry index-start-number record.
+///
+/// One row per table at `DataDictType::DdlEntryIndexStartNumber`. Suffix
+/// is the normalised table name (e.g. `"dbname.tablename"`); value is
+/// raw bytes whose encoding is owned by the higher-level DDL manager
+/// when that lands.
+///
+/// MyRocks' on-disk format for the value is
+/// `u16_be(version) || (u32_be(cf_id) || u32_be(index_id))*N` — the
+/// list of indexes owned by the table. The DDL manager will provide a
+/// typed encode/decode pair on top of this substrate; today's callers
+/// can shape their own.
+pub mod ddl_entry_index_start_number {
+    use super::{delete, get, put, DataDictType};
+    use bytes::Bytes;
+    use slatedb::{Db, Error};
+
+    pub async fn read(db: &Db, table_name: &str) -> Result<Option<Bytes>, Error> {
+        get(
+            db,
+            DataDictType::DdlEntryIndexStartNumber,
+            table_name.as_bytes(),
+        )
+        .await
+    }
+
+    pub async fn write(db: &Db, table_name: &str, value: &[u8]) -> Result<(), Error> {
+        put(
+            db,
+            DataDictType::DdlEntryIndexStartNumber,
+            table_name.as_bytes(),
+            value,
+        )
+        .await
+    }
+
+    pub async fn remove(db: &Db, table_name: &str) -> Result<(), Error> {
+        delete(
+            db,
+            DataDictType::DdlEntryIndexStartNumber,
+            table_name.as_bytes(),
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,6 +830,154 @@ mod tests {
             .await
             .expect("read")
             .is_none());
+
+        engine.close().await.expect("close");
+    }
+
+    // ----- table_version -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn table_version_round_trip_per_path() {
+        let engine = EngineDb::open_in_memory("tv_rt")
+            .await
+            .expect("open");
+
+        assert_eq!(
+            table_version::read(engine.db(), "./db1/t").await.expect("read"),
+            None
+        );
+
+        table_version::write(engine.db(), "./db1/t", 7)
+            .await
+            .expect("write");
+        assert_eq!(
+            table_version::read(engine.db(), "./db1/t").await.expect("read"),
+            Some(7)
+        );
+
+        // Different path is its own slot.
+        table_version::write(engine.db(), "./db2/t", 99)
+            .await
+            .expect("write 2");
+        assert_eq!(
+            table_version::read(engine.db(), "./db1/t").await.expect("read"),
+            Some(7)
+        );
+        assert_eq!(
+            table_version::read(engine.db(), "./db2/t").await.expect("read"),
+            Some(99)
+        );
+
+        // Overwrite.
+        table_version::write(engine.db(), "./db1/t", 42)
+            .await
+            .expect("overwrite");
+        assert_eq!(
+            table_version::read(engine.db(), "./db1/t").await.expect("read"),
+            Some(42)
+        );
+
+        // Remove one, leave the other.
+        table_version::remove(engine.db(), "./db1/t")
+            .await
+            .expect("remove");
+        assert_eq!(
+            table_version::read(engine.db(), "./db1/t").await.expect("read"),
+            None
+        );
+        assert_eq!(
+            table_version::read(engine.db(), "./db2/t").await.expect("read"),
+            Some(99)
+        );
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn table_version_corrupt_value_is_data_error() {
+        let engine = EngineDb::open_in_memory("tv_corrupt")
+            .await
+            .expect("open");
+        put(
+            engine.db(),
+            DataDictType::TableVersion,
+            b"./db1/t",
+            b"abc", // wrong size
+        )
+        .await
+        .expect("put");
+        let err = table_version::read(engine.db(), "./db1/t")
+            .await
+            .unwrap_err();
+        assert!(matches!(err.kind(), slatedb::ErrorKind::Data));
+        engine.close().await.expect("close");
+    }
+
+    // ----- ddl_entry_index_start_number -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ddl_entry_index_start_number_raw_round_trip() {
+        let engine = EngineDb::open_in_memory("ddl_entry_rt")
+            .await
+            .expect("open");
+
+        assert!(ddl_entry_index_start_number::read(engine.db(), "db.t")
+            .await
+            .expect("read")
+            .is_none());
+
+        // Substrate is opaque-bytes; tests use a sentinel payload that
+        // resembles the MyRocks shape (version u16_be + two pairs).
+        let payload = b"\x00\x01\x00\x00\x00\x01\x00\x00\x00\x0a\x00\x00\x00\x01\x00\x00\x00\x0b";
+        ddl_entry_index_start_number::write(engine.db(), "db.t", payload)
+            .await
+            .expect("write");
+        let got = ddl_entry_index_start_number::read(engine.db(), "db.t")
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(&got[..], payload);
+
+        ddl_entry_index_start_number::remove(engine.db(), "db.t")
+            .await
+            .expect("remove");
+        assert!(ddl_entry_index_start_number::read(engine.db(), "db.t")
+            .await
+            .expect("read")
+            .is_none());
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ddl_entry_keyed_per_table() {
+        let engine = EngineDb::open_in_memory("ddl_entry_per_table")
+            .await
+            .expect("open");
+
+        ddl_entry_index_start_number::write(engine.db(), "db.t1", b"one")
+            .await
+            .expect("write t1");
+        ddl_entry_index_start_number::write(engine.db(), "db.t2", b"two")
+            .await
+            .expect("write t2");
+
+        assert_eq!(
+            ddl_entry_index_start_number::read(engine.db(), "db.t1")
+                .await
+                .expect("read t1")
+                .expect("present")
+                .as_ref(),
+            b"one"
+        );
+        assert_eq!(
+            ddl_entry_index_start_number::read(engine.db(), "db.t2")
+                .await
+                .expect("read t2")
+                .expect("present")
+                .as_ref(),
+            b"two"
+        );
 
         engine.close().await.expect("close");
     }
