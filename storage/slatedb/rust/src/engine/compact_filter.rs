@@ -41,7 +41,7 @@ use slatedb::{
     CompactionFilterSupplier, CompactionJobContext, Db, RowEntry,
 };
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, Weak};
 
 use crate::codec::dict;
 use crate::codec::prefix::parse_key_prefix;
@@ -101,16 +101,44 @@ impl CompactionFilter for EngineCompactFilter {
     }
 }
 
-/// Per-engine supplier. Holds an `Arc<Db>` so it can read the
-/// dropped-index registry when SlateDB asks for a fresh filter at the
-/// start of each compaction job.
+/// Per-engine supplier. Holds the `Db` handle as a `Weak<Db>` to avoid
+/// the Arc cycle that would otherwise form: `Arc<Db> → Compactor →
+/// Arc<dyn CompactionFilterSupplier> → Arc<Db>`.
+///
+/// ## Lifecycle
+///
+/// The supplier is built *before* the `Db` exists (because the
+/// `CompactorBuilder` consumes it at `DbBuilder` time). Construction
+/// goes through [`new_deferred`](Self::new_deferred); the `Db` is
+/// wired in afterwards via [`install_db`](Self::install_db).
+///
+/// If `create_compaction_filter` fires before `install_db` (a wiring
+/// bug) or after the `Db` has been dropped, we return
+/// `CompactionFilterError::CreationError` with a clear message — the
+/// compaction job aborts rather than running with an empty drop set
+/// (which would silently leak dropped-index data).
 pub struct EngineCompactFilterSupplier {
-    db: Arc<Db>,
+    db: OnceLock<Weak<Db>>,
 }
 
 impl EngineCompactFilterSupplier {
-    pub fn new(db: Arc<Db>) -> Self {
-        Self { db }
+    /// Build the supplier without a `Db` reference yet. Call
+    /// [`install_db`](Self::install_db) once the `Db` is open.
+    pub fn new_deferred() -> Arc<Self> {
+        Arc::new(Self {
+            db: OnceLock::new(),
+        })
+    }
+
+    /// Wire the freshly-opened `Db` into the supplier. Subsequent
+    /// `create_compaction_filter` calls will read the dropped-index
+    /// registry through this handle.
+    ///
+    /// Stores a `Weak<Db>` to break the cycle. Calling twice is a
+    /// programmer bug and is silently ignored (the first wins) —
+    /// `OnceLock::set` returns `Err`, which we drop.
+    pub fn install_db(&self, db: &Arc<Db>) {
+        let _ = self.db.set(Arc::downgrade(db));
     }
 }
 
@@ -120,7 +148,17 @@ impl CompactionFilterSupplier for EngineCompactFilterSupplier {
         &self,
         _context: &CompactionJobContext,
     ) -> Result<Box<dyn CompactionFilter>, CompactionFilterError> {
-        let listed = dict::dropped_indexes::list(&self.db).await.map_err(|e| {
+        let weak = self.db.get().ok_or_else(|| {
+            CompactionFilterError::CreationError(Box::new(std::io::Error::other(
+                "compact_filter: supplier db not installed (call install_db before open)",
+            )))
+        })?;
+        let db = weak.upgrade().ok_or_else(|| {
+            CompactionFilterError::CreationError(Box::new(std::io::Error::other(
+                "compact_filter: db has been dropped",
+            )))
+        })?;
+        let listed = dict::dropped_indexes::list(&db).await.map_err(|e| {
             CompactionFilterError::CreationError(Box::new(std::io::Error::other(format!(
                 "compact_filter: load dropped_indexes: {e}"
             ))))
@@ -228,7 +266,8 @@ mod tests {
         let engine = EngineDb::open_in_memory("cf_supplier_freeze")
             .await
             .expect("open");
-        let supplier = EngineCompactFilterSupplier::new(Arc::clone(engine.db()));
+        let supplier = EngineCompactFilterSupplier::new_deferred();
+        supplier.install_db(engine.db());
 
         // Start with an empty registry → supplier produces a filter that drops nothing.
         let ctx = CompactionJobContext {
@@ -266,5 +305,49 @@ mod tests {
         ));
 
         engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supplier_without_install_db_errors_clearly() {
+        let supplier = EngineCompactFilterSupplier::new_deferred();
+        let ctx = CompactionJobContext {
+            destination: 0,
+            is_dest_last_run: false,
+            compaction_clock_tick: 0,
+            retention_min_seq: None,
+        };
+        let result = supplier.create_compaction_filter(&ctx).await;
+        let err = result.err().expect("expected error, got Ok");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("supplier db not installed"),
+            "expected 'not installed' message; got: {msg}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supplier_after_db_drop_errors_clearly() {
+        let supplier = EngineCompactFilterSupplier::new_deferred();
+        {
+            let engine = EngineDb::open_in_memory("cf_supplier_drop")
+                .await
+                .expect("open");
+            supplier.install_db(engine.db());
+            engine.close().await.expect("close");
+            // engine drops here; the Weak<Db> should fail to upgrade.
+        }
+        let ctx = CompactionJobContext {
+            destination: 0,
+            is_dest_last_run: false,
+            compaction_clock_tick: 0,
+            retention_min_seq: None,
+        };
+        let result = supplier.create_compaction_filter(&ctx).await;
+        let err = result.err().expect("expected error, got Ok");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("db has been dropped"),
+            "expected 'dropped' message; got: {msg}"
+        );
     }
 }

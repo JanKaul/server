@@ -17,11 +17,12 @@
 
 use object_store::ObjectStore;
 use slatedb::filter_policy::{BloomFilterPolicy, FilterPolicy};
-use slatedb::{Db, DbBuilder, MergeOperator};
+use slatedb::{CompactionFilterSupplier, CompactorBuilder, Db, DbBuilder, MergeOperator};
 use slatedb::Error;
 use std::sync::Arc;
 
 use crate::codec::prefix::MyRocksPrefixExtractor;
+use crate::engine::compact_filter::EngineCompactFilterSupplier;
 use crate::engine::merge::EngineMergeOperator;
 
 /// Bits-per-key for the bloom filter. Matches SlateDB's
@@ -47,20 +48,33 @@ impl EngineDb {
         path: impl Into<object_store::path::Path>,
         object_store: Arc<dyn ObjectStore>,
     ) -> Result<Self, Error> {
+        let path: object_store::path::Path = path.into();
         let extractor = Arc::new(MyRocksPrefixExtractor);
         let bloom = BloomFilterPolicy::new(BLOOM_BITS_PER_KEY)
             .with_prefix_extractor(Arc::clone(&extractor) as Arc<dyn slatedb::PrefixExtractor>);
         let policies: Vec<Arc<dyn FilterPolicy>> = vec![Arc::new(bloom)];
         let merge_op: Arc<dyn MergeOperator + Send + Sync> = Arc::new(EngineMergeOperator);
+
+        // Compaction-filter wiring: the supplier is built without a Db
+        // (the Weak<Db> inside breaks the Db→Compactor→Supplier→Db
+        // cycle), attached to a CompactorBuilder, then populated with
+        // the freshly-opened Db. See `engine::compact_filter` for the
+        // rationale.
+        let supplier = EngineCompactFilterSupplier::new_deferred();
+        let trait_supplier: Arc<dyn CompactionFilterSupplier> = Arc::clone(&supplier) as _;
+        let compactor_builder =
+            CompactorBuilder::new(path.clone(), Arc::clone(&object_store))
+                .with_compaction_filter_supplier(trait_supplier);
+
         let db = DbBuilder::new(path, object_store)
             .with_filter_policies(policies)
             .with_merge_operator(merge_op)
+            .with_compactor_builder(compactor_builder)
             .build()
             .await?;
-        Ok(Self {
-            db: Arc::new(db),
-            extractor,
-        })
+        let db = Arc::new(db);
+        supplier.install_db(&db);
+        Ok(Self { db, extractor })
     }
 
     /// Convenience for tests: open against an in-memory object store rooted
