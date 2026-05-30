@@ -455,6 +455,29 @@ impl KeyDef {
         format!("{}_{}", crate::globals::TTL_COL_QUALIFIER, s)
     }
 
+    // ----- diagnostic logging -----
+
+    /// Emit a structured tracing event for a checksum mismatch. Port of
+    /// `rdb_datadic.cc:1731` — same fields, formatted for structured
+    /// logging instead of the C++ `sql_print_error` text. Drops the
+    /// follow-on `my_error(ER_INTERNAL_ERROR, ...)` call; that one needs
+    /// a cxx callback into the server-side diagnostics area and lands
+    /// alongside the bridge.
+    pub fn report_checksum_mismatch(&self, is_key: bool, data: &[u8]) {
+        let kind = if is_key { "key" } else { "value" };
+        let hex = crate::utils::parse::hexdump(
+            data,
+            crate::utils::parse::RDB_MAX_HEXDUMP_LEN,
+        );
+        tracing::error!(
+            index_number = format!("0x{:x}", self.index_number),
+            index_name = %self.name,
+            bytes = data.len(),
+            hex = %hex,
+            "checksum mismatch in {kind} of key-value pair"
+        );
+    }
+
     // ----- TTL extractors (rdb_datadic.cc:607..) -----
 
     /// Read the `ttl_duration=N` qualifier from a table comment and
@@ -1000,6 +1023,30 @@ mod tests {
             .expect("ok")
             .expect("present");
         assert_eq!(got.field_index, 2);
+    }
+
+    // ----- report_checksum_mismatch (smoke tests — logging is a side effect) -----
+
+    #[test]
+    fn report_checksum_mismatch_handles_both_kinds_without_panicking() {
+        let kd = forward_pk(0xabcd_1234);
+        kd.report_checksum_mismatch(true, b"some_packed_key_bytes");
+        kd.report_checksum_mismatch(false, b"some_unpack_info_bytes");
+    }
+
+    #[test]
+    fn report_checksum_mismatch_caps_hexdump_for_oversize_payload() {
+        let kd = forward_pk(1);
+        // Larger than RDB_MAX_HEXDUMP_LEN — hexdump should truncate, not
+        // explode memory.
+        let big = vec![0xabu8; crate::utils::parse::RDB_MAX_HEXDUMP_LEN * 2];
+        kd.report_checksum_mismatch(true, &big);
+    }
+
+    #[test]
+    fn report_checksum_mismatch_handles_empty_payload() {
+        let kd = forward_pk(1);
+        kd.report_checksum_mismatch(false, b"");
     }
 
     #[test]
