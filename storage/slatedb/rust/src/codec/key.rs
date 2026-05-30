@@ -61,6 +61,17 @@ pub enum ReadKeyPart {
     Error,
 }
 
+/// Result of [`KeyDef::compare_keys`]. The C++ overloads `column_index`
+/// with the "all equal" signal by returning `key_parts`; the enum types
+/// that out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompareResult {
+    /// Every keypart compared equal.
+    Equal,
+    /// First (0-based) keypart where the keys differ.
+    DifferAt(u32),
+}
+
 // ---------- layout-size constants (rdb_datadic.h:468) ----------
 
 pub const INDEX_NUMBER_SIZE: usize = 4;
@@ -552,6 +563,105 @@ impl KeyDef {
     /// index. Vacuously true for a key with no parts.
     pub fn can_cover_lookup(&self) -> bool {
         self.pack_info.iter().all(|fp| fp.unpack_func.is_some())
+    }
+
+    /// Compare two packed keys part-by-part without unpacking; return
+    /// the first index where they differ (or `Equal` if all parts match).
+    ///
+    /// Port of `rdb_datadic.cc:1517..1581`. Returns `Err` on read
+    /// truncation or skip_func error.
+    ///
+    /// **Caveat from the C++:** compare_keys passes `nullptr` for the
+    /// skip_func's field arg, which works only for fixed-length skip
+    /// functions. Variable-length skip routines (`skip_variable_length`,
+    /// `skip_variable_space_pad`) need the field. We surface that by
+    /// taking `fields: &[Option<&FieldView>]` and pass the slot through
+    /// — `None` triggers the hidden-PK 8-byte raw skip (same as
+    /// `read_memcmp_key_part`). Callers using indexes with variable-
+    /// length columns should pass `Some(...)` for those parts.
+    ///
+    /// Null-byte handling matches the C++: when either marker is
+    /// missing or non-{0,1} the result is `Err`; when markers differ
+    /// the result is `DifferAt(i)`; when both are 0 (NULL) the part is
+    /// considered equal and the walk continues.
+    pub fn compare_keys(
+        &self,
+        key1: &[u8],
+        key2: &[u8],
+        fields: &[Option<&crate::codec::value::FieldView>],
+    ) -> Result<CompareResult, slatedb::Error> {
+        use crate::utils::buff::StringReader;
+        debug_assert_eq!(
+            fields.len(),
+            self.key_parts as usize,
+            "compare_keys: fields slice length must match self.key_parts"
+        );
+        let err = || slatedb::Error::data("compare_keys: truncated key".into());
+
+        let mut r1 = StringReader::new(key1);
+        let mut r2 = StringReader::new(key2);
+
+        r1.read(INDEX_NUMBER_SIZE).ok_or_else(err)?;
+        r2.read(INDEX_NUMBER_SIZE).ok_or_else(err)?;
+
+        for i in 0..self.key_parts as usize {
+            let fpi = &self.pack_info[i];
+
+            // Null-byte handling for maybe_null parts.
+            if fpi.maybe_null {
+                let n1 = r1.read(1).ok_or_else(err)?[0];
+                let n2 = r2.read(1).ok_or_else(err)?[0];
+                if n1 != n2 {
+                    return Ok(CompareResult::DifferAt(i as u32));
+                }
+                if n1 == 0 {
+                    // both NULL: equal at this part, advance.
+                    continue;
+                }
+                if n1 != 1 {
+                    return Err(slatedb::Error::data(format!(
+                        "compare_keys: invalid null marker 0x{:02x} at part {i}",
+                        n1
+                    )));
+                }
+            }
+
+            let before1 = r1.current_pos();
+            let before2 = r2.current_pos();
+
+            match fields[i] {
+                None => {
+                    r1.read(crate::globals::SIZEOF_HIDDEN_PK_COLUMN)
+                        .ok_or_else(err)?;
+                    r2.read(crate::globals::SIZEOF_HIDDEN_PK_COLUMN)
+                        .ok_or_else(err)?;
+                }
+                Some(f) => {
+                    let skip = fpi.skip_func.ok_or_else(|| {
+                        slatedb::Error::data(format!(
+                            "compare_keys: missing skip_func at part {i}"
+                        ))
+                    })?;
+                    if skip(fpi, f, &mut r1) != 0 {
+                        return Err(err());
+                    }
+                    if skip(fpi, f, &mut r2) != 0 {
+                        return Err(err());
+                    }
+                }
+            }
+
+            let size1 = r1.current_pos() - before1;
+            let size2 = r2.current_pos() - before2;
+            if size1 != size2 {
+                return Ok(CompareResult::DifferAt(i as u32));
+            }
+            if key1[before1..before1 + size1] != key2[before2..before2 + size2] {
+                return Ok(CompareResult::DifferAt(i as u32));
+            }
+        }
+
+        Ok(CompareResult::Equal)
     }
 
     /// Extract a mem-comparable Primary Key tuple from a row of this
@@ -1352,6 +1462,114 @@ mod tests {
         let kd = kd_with_pack_info(vec![with_info, without]);
         assert!(kd.has_unpack_info(0));
         assert!(!kd.has_unpack_info(1));
+    }
+
+    // ----- compare_keys -----
+
+    fn kd_two_part_fixed() -> KeyDef {
+        let mut kd = forward_pk(99);
+        kd.key_parts = 2;
+        kd.pack_info = (0..2)
+            .map(|_| {
+                let mut fp = crate::codec::field_pack::FieldPacking::default();
+                fp.skip_func = Some(dummy_skip_consume_4);
+                fp
+            })
+            .collect();
+        kd
+    }
+
+    #[test]
+    fn compare_keys_identical_keys_are_equal() {
+        let kd = kd_two_part_fixed();
+        let key = [0, 0, 0, 99, 1, 2, 3, 4, 5, 6, 7, 8];
+        let f = dummy_field();
+        assert_eq!(
+            kd.compare_keys(&key, &key, &[Some(&f), Some(&f)])
+                .expect("ok"),
+            CompareResult::Equal
+        );
+    }
+
+    #[test]
+    fn compare_keys_first_diff_is_in_part_0() {
+        let kd = kd_two_part_fixed();
+        let a = [0, 0, 0, 99, 1, 2, 3, 4, 5, 6, 7, 8];
+        let b = [0, 0, 0, 99, 9, 2, 3, 4, 5, 6, 7, 8];
+        let f = dummy_field();
+        assert_eq!(
+            kd.compare_keys(&a, &b, &[Some(&f), Some(&f)]).expect("ok"),
+            CompareResult::DifferAt(0)
+        );
+    }
+
+    #[test]
+    fn compare_keys_first_diff_is_in_part_1() {
+        let kd = kd_two_part_fixed();
+        let a = [0, 0, 0, 99, 1, 2, 3, 4, 5, 6, 7, 8];
+        let b = [0, 0, 0, 99, 1, 2, 3, 4, 5, 6, 7, 9];
+        let f = dummy_field();
+        assert_eq!(
+            kd.compare_keys(&a, &b, &[Some(&f), Some(&f)]).expect("ok"),
+            CompareResult::DifferAt(1)
+        );
+    }
+
+    #[test]
+    fn compare_keys_truncated_index_prefix_is_error() {
+        let kd = kd_two_part_fixed();
+        let key = [0u8, 0]; // < 4 bytes
+        let f = dummy_field();
+        assert!(kd
+            .compare_keys(&key, &key, &[Some(&f), Some(&f)])
+            .is_err());
+    }
+
+    #[test]
+    fn compare_keys_handles_both_null_parts_as_equal() {
+        let mut kd = kd_two_part_fixed();
+        kd.pack_info[0].maybe_null = true;
+        kd.pack_info[1].maybe_null = true;
+
+        // Layout: idx(4) + null(0) + null(0) — both parts NULL on both sides.
+        let key = [0u8, 0, 0, 99, 0, 0];
+        let f = dummy_field();
+        assert_eq!(
+            kd.compare_keys(&key, &key, &[Some(&f), Some(&f)])
+                .expect("ok"),
+            CompareResult::Equal
+        );
+    }
+
+    #[test]
+    fn compare_keys_differing_null_markers_yield_differ_at() {
+        let mut kd = kd_two_part_fixed();
+        kd.pack_info[0].maybe_null = true;
+        kd.pack_info[1].maybe_null = true;
+
+        // Both have a leading-byte-0-or-1 then optionally 4 value bytes.
+        let a = [0u8, 0, 0, 99, /* part 0 NULL */ 0, /* part 1 value */ 1, 1, 2, 3, 4];
+        let b = [0u8, 0, 0, 99, /* part 0 value */ 1, 1, 2, 3, 4, /* part 1 NULL */ 0];
+        let f = dummy_field();
+        // Part 0's null markers differ → DifferAt(0).
+        assert_eq!(
+            kd.compare_keys(&a, &b, &[Some(&f), Some(&f)]).expect("ok"),
+            CompareResult::DifferAt(0)
+        );
+    }
+
+    #[test]
+    fn compare_keys_invalid_null_marker_is_error() {
+        let mut kd = kd_two_part_fixed();
+        kd.pack_info[0].maybe_null = true;
+        kd.pack_info[1].maybe_null = true;
+
+        // Both sides have 0xff as the null marker — invalid (not 0 or 1).
+        let key = [0u8, 0, 0, 99, 0xff];
+        let f = dummy_field();
+        assert!(kd
+            .compare_keys(&key, &key, &[Some(&f), Some(&f)])
+            .is_err());
     }
 
     // ----- get_memcmp_sk_parts -----
