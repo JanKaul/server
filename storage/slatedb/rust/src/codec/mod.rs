@@ -5,5 +5,6 @@
 //! ultimately produces / consumes.
 
 pub mod dict;
+pub mod field_pack;
 pub mod prefix;
 pub mod value;
