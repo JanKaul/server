@@ -2,6 +2,7 @@
 #![warn(clippy::unwrap_used, clippy::expect_used)]
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+pub mod alter;
 pub mod bridge;
 pub mod codec;
 pub mod engine;
