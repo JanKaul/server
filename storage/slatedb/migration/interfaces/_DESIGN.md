@@ -781,31 +781,38 @@ to ensure the TRANSLATE author of either side knows the other side
 exists and knows that `marker_key` indirection is load-bearing
 for the eventual Stage 3+ optimization.
 
-### 14.8 Open questions
+### 14.8 Resolved decisions
 
-1. **Concrete `BINLOG_OOB_TTL_SECS` default.** Tradeoff: too short and a
-   slow-running large txn loses its OOB chunks; too long and a crash
-   leaves stale data on object storage. Lean **1 hour** (matches typical
-   `wsrep_max_ws_size` upper bounds for replication).
-2. **`partial_chunk` re-entrance.** `SlateDbBinlogReader::read_binlog_data`
-   stashes partial chunks for the next call. Is this thread-safe across
-   the cxx boundary? The C++ caller is a single dump thread per reader,
-   so yes — but the contract should be documented at the cxx shim level.
-3. **Reader durable-seq subscription cost.** Each `SlateDbBinlogReader`
-   subscribes to `DbMetadataOps::subscribe()` (when `wait_durable`). At
-   N concurrent slaves we have N subscriptions. Slatedb watch channels
-   are cheap; confirm at N=100+ slaves.
-4. **Engine name for `binlog_storage_engine` sysvar.** Match the data
-   engine plugin name? Or a separate `slatedb_binlog` plugin name? Lean
-   "same plugin, both roles" — the handlerton resolution
-   (`mysqld.cc:5667..5710`) wants ONE name resolving to ONE handlerton.
-   If we want separability we need to register a second plugin that
-   shares the same Db handle — more wiring.
-5. **InnoDB-binlog co-existence.** If a deployment runs both InnoDB and
-   SlateDB, only one can be `binlog_storage_engine`. SlateDB-as-binlog
-   does NOT preclude InnoDB-as-data (or vice-versa); the binlog engine
-   choice is independent. Document this in user docs.
-6. **`set_binlog_max_size` in-flight semantics.** The C++ contract is
-   under-documented for what happens to a partially-written file when
-   the size shrinks. Lean: take effect at next rotation only.
+All six previously-open questions ruled 2026-05-29 (lean-confirms).
+
+1. **`BINLOG_OOB_TTL_SECS` default.** **RESOLVED →** 3600 (1 hour).
+   Matches typical `wsrep_max_ws_size` upper bounds. Too-short risks
+   slow large txns losing OOB mid-flight; too-long risks crashed-txn
+   chunks lingering on object storage (cost, not correctness). Can
+   become a sysvar later if workloads need tuning.
+2. **`partial_chunk` re-entrance.** **RESOLVED →** Document
+   "single-thread-per-reader; not Send across `.await`". The C++ caller
+   is always one dump thread per reader (`sql/sql_repl.cc:2591`).
+   Zero-cost contract; no Mutex needed. Documented at the cxx shim
+   level and on the `SlateDbBinlogReader` struct doc.
+3. **Reader durable-seq subscription cost.** **RESOLVED →** One
+   `tokio::sync::watch::Receiver` per reader (the current design).
+   Confirm at N=100+ slaves with a load test in Stage 2; do not
+   redesign pre-emptively. Watch channels are O(1) per receiver and
+   SlateDB's `DbMetadataOps::subscribe()` is built for this pattern.
+4. **Engine name for `binlog_storage_engine` sysvar.** **RESOLVED →**
+   Same plugin, both roles. `binlog_storage_engine=slatedb` resolves to
+   the same handlerton as the data engine. Matches InnoDB's pattern
+   (`binlog_storage_engine=innodb`). A separate plugin for separability
+   is not worth the wiring (shared Db handle would need explicit
+   plumbing).
+5. **InnoDB-binlog co-existence.** **RESOLVED →** Document-only. The
+   server's existing single-valued sysvar already enforces "pick one";
+   the engine doesn't need init-time checks. User docs note: data
+   engine and binlog engine are independent choices; SlateDB-as-data
+   works with InnoDB-as-binlog and vice versa.
+6. **`set_binlog_max_size` in-flight semantics.** **RESOLVED →** Take
+   effect at next rotation only. The only safe interpretation — current
+   file may have committed events past the new boundary which cannot be
+   relocated. Documented in the slot's stub.
 
