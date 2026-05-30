@@ -404,6 +404,176 @@ pub fn calc_unpack_legacy_variable_format(flag: u8) -> (Option<u32>, bool) {
     (Some(used_bytes), used_bytes < max_payload)
 }
 
+// ----- unpack functions -----
+
+/// Unpack a fixed-width integer (TINY / SHORT / INT24 / LONG / LONGLONG).
+/// The encoded image is the host integer in big-endian with the sign bit
+/// flipped (for signed types). We byte-reverse back to little-endian (our
+/// only target) and undo the sign flip.
+///
+/// Translated from `Rdb_key_def::unpack_integer` (`rdb_datadic.cc:1898`).
+/// The MSAN-guarded big-endian branch is dropped: MariaDB on big-endian
+/// is not a supported target for SlateDB today.
+pub fn unpack_integer(
+    fpi: &mut FieldPacking,
+    field: &mut FieldView,
+    field_ptr: &mut [u8],
+    reader: &mut StringReader,
+    _unpack_reader: Option<&mut StringReader>,
+) -> i32 {
+    let length = fpi.max_image_len as usize;
+    let from = match reader.read(length) {
+        Some(s) => s,
+        None => return UNPACK_FAILURE,
+    };
+    if field_ptr.len() < length {
+        return UNPACK_FAILURE;
+    }
+
+    // Little-endian host: the MSB of the host integer is at index
+    // `length - 1`. The memcmp image stores MSB at index 0 with the
+    // sign bit flipped for signed types.
+    let sign_byte = from[0];
+    let signed =
+        (field.flags & crate::codec::value::UNSIGNED_FLAG) == 0;
+    field_ptr[length - 1] = if signed { sign_byte ^ 0x80 } else { sign_byte };
+    for (i, j) in (0..length - 1).zip((1..length).rev()) {
+        field_ptr[i] = from[j];
+    }
+    UNPACK_SUCCESS
+}
+
+/// Unpack a `double`. Reverses `change_double_for_sort`
+/// (`sql/filesort.cc`). Assumes IEEE 754 and that NaN / ±Inf were never
+/// persisted (the C++ assumes the same).
+///
+/// Translated from `Rdb_key_def::unpack_double` (`rdb_datadic.cc:2030`).
+pub fn unpack_double(
+    _fpi: &mut FieldPacking,
+    _field: &mut FieldView,
+    field_ptr: &mut [u8],
+    reader: &mut StringReader,
+    _unpack_reader: Option<&mut StringReader>,
+) -> i32 {
+    const ZERO_PATTERN: &[u8] = &[128, 0, 0, 0, 0, 0, 0, 0];
+    const ZERO_VAL: &[u8] = &[0u8; 8]; // IEEE 754: +0.0 is all-zero bits.
+    // f64::MANTISSA_DIGITS = 53 ⇒ exponent bits = 64 - 53 = 11.
+    unpack_floating_point(field_ptr, reader, 8, 11, ZERO_PATTERN, ZERO_VAL)
+}
+
+/// Unpack a `float`. Same approach as [`unpack_double`].
+///
+/// Translated from `Rdb_key_def::unpack_float` (`rdb_datadic.cc:2055`).
+pub fn unpack_float(
+    _fpi: &mut FieldPacking,
+    _field: &mut FieldView,
+    field_ptr: &mut [u8],
+    reader: &mut StringReader,
+    _unpack_reader: Option<&mut StringReader>,
+) -> i32 {
+    const ZERO_PATTERN: &[u8] = &[128, 0, 0, 0];
+    const ZERO_VAL: &[u8] = &[0u8; 4];
+    // f32::MANTISSA_DIGITS = 24 ⇒ exponent bits = 32 - 24 = 8.
+    unpack_floating_point(field_ptr, reader, 4, 8, ZERO_PATTERN, ZERO_VAL)
+}
+
+/// Reverse of `change_double_for_sort` (size-generic IEEE float unpack).
+/// Reads `size` bytes from `reader`, decodes them into `dst[..size]` in
+/// host byte order. Called by [`unpack_double`] and [`unpack_float`].
+fn unpack_floating_point(
+    dst: &mut [u8],
+    reader: &mut StringReader,
+    size: usize,
+    exp_digit: u32,
+    zero_pattern: &[u8],
+    zero_val: &[u8],
+) -> i32 {
+    let from = match reader.read(size) {
+        Some(s) => s,
+        None => return UNPACK_FAILURE,
+    };
+    if dst.len() < size {
+        return UNPACK_FAILURE;
+    }
+    if from == zero_pattern {
+        dst[..size].copy_from_slice(zero_val);
+        return UNPACK_SUCCESS;
+    }
+
+    // Build the unswapped image into `tmp`, then byte-reverse into `dst`.
+    let mut tmp = [0u8; 8]; // big enough for both f32 (4) and f64 (8)
+    tmp[..size].copy_from_slice(from);
+    if tmp[0] & 0x80 != 0 {
+        // Original value was positive: clear the high bit and subtract
+        // from the 2-byte exponent prefix.
+        let mut exp_part = ((tmp[0] as u16) << 8) | tmp[1] as u16;
+        exp_part &= 0x7FFF;
+        exp_part = exp_part.wrapping_sub(1u16 << (16 - 1 - exp_digit));
+        tmp[0] = (exp_part >> 8) as u8;
+        tmp[1] = exp_part as u8;
+    } else {
+        // Original value was negative: every byte was complemented.
+        for b in &mut tmp[..size] {
+            *b ^= 0xFF;
+        }
+    }
+
+    // Little-endian host: reverse `tmp[..size]` into `dst[..size]`.
+    for i in 0..size {
+        dst[i] = tmp[size - 1 - i];
+    }
+    UNPACK_SUCCESS
+}
+
+/// Unpack a `NEWDATE` (3-byte packed date). The encoded form swaps the
+/// byte order for memcmp friendliness; decoding reverses the bytes.
+///
+/// Translated from `Rdb_key_def::unpack_newdate` (`rdb_datadic.cc:2072`).
+pub fn unpack_newdate(
+    fpi: &mut FieldPacking,
+    _field: &mut FieldView,
+    field_ptr: &mut [u8],
+    reader: &mut StringReader,
+    _unpack_reader: Option<&mut StringReader>,
+) -> i32 {
+    debug_assert_eq!(fpi.max_image_len, 3, "NEWDATE max_image_len must be 3");
+    let from = match reader.read(3) {
+        Some(s) => s,
+        None => return UNPACK_FAILURE,
+    };
+    if field_ptr.len() < 3 {
+        return UNPACK_FAILURE;
+    }
+    field_ptr[0] = from[2];
+    field_ptr[1] = from[1];
+    field_ptr[2] = from[0];
+    UNPACK_SUCCESS
+}
+
+/// Unpack a fixed-width binary string by copying it over. Used for
+/// `BINARY(n)` and `CHAR(n)` under `_bin` collations where the
+/// mem-comparable form is the string itself.
+///
+/// Translated from `Rdb_key_def::unpack_binary_str` (`rdb_datadic.cc:2096`).
+pub fn unpack_binary_str(
+    fpi: &mut FieldPacking,
+    _field: &mut FieldView,
+    field_ptr: &mut [u8],
+    reader: &mut StringReader,
+    _unpack_reader: Option<&mut StringReader>,
+) -> i32 {
+    let length = fpi.max_image_len as usize;
+    let from = match reader.read(length) {
+        Some(s) => s,
+        None => return UNPACK_FAILURE,
+    };
+    if field_ptr.len() < length {
+        return UNPACK_FAILURE;
+    }
+    field_ptr[..length].copy_from_slice(from);
+    UNPACK_SUCCESS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,5 +825,217 @@ mod tests {
         buf[8] = 42; // not a VARCHAR_CMP_* value
         let mut r = StringReader::new(&buf);
         assert_eq!(skip_variable_space_pad(&fpi, &field, &mut r), UNPACK_FAILURE);
+    }
+
+    // ----- unpack functions -----
+
+    use crate::codec::value::UNSIGNED_FLAG;
+
+    fn signed_int_field(pack_len: u32) -> FieldView {
+        FieldView {
+            name: "i".into(),
+            mysql_type: MysqlType::Long,
+            pack_length: pack_len,
+            output_offset: 0,
+            null_marker: None,
+            length: pack_len,
+            charset_id: 63,
+            flags: 0,
+            decimals: 0,
+        }
+    }
+
+    fn unsigned_int_field(pack_len: u32) -> FieldView {
+        let mut f = signed_int_field(pack_len);
+        f.flags = UNSIGNED_FLAG;
+        f
+    }
+
+    #[test]
+    fn unpack_integer_signed_positive_round_trip() {
+        // 32-bit signed +1 in LE memory: [1, 0, 0, 0]. Memcmp image is
+        // BE with sign bit flipped: [0x80, 0, 0, 1].
+        let mut fpi = FieldPacking::default();
+        fpi.max_image_len = 4;
+        let mut field = signed_int_field(4);
+        let image: [u8; 4] = [0x80, 0x00, 0x00, 0x01];
+        let mut dst = [0u8; 4];
+        let mut r = StringReader::new(&image);
+        assert_eq!(
+            unpack_integer(&mut fpi, &mut field, &mut dst, &mut r, None),
+            UNPACK_SUCCESS
+        );
+        assert_eq!(dst, [0x01, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn unpack_integer_signed_negative_round_trip() {
+        // 32-bit signed -1 in LE memory: [0xFF; 4]. Memcmp image:
+        // [0xFF^0x80, 0xFF, 0xFF, 0xFF] = [0x7F, 0xFF, 0xFF, 0xFF].
+        let mut fpi = FieldPacking::default();
+        fpi.max_image_len = 4;
+        let mut field = signed_int_field(4);
+        let image: [u8; 4] = [0x7F, 0xFF, 0xFF, 0xFF];
+        let mut dst = [0u8; 4];
+        let mut r = StringReader::new(&image);
+        assert_eq!(
+            unpack_integer(&mut fpi, &mut field, &mut dst, &mut r, None),
+            UNPACK_SUCCESS
+        );
+        assert_eq!(dst, [0xFF, 0xFF, 0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn unpack_integer_unsigned_preserves_sign_byte() {
+        // unsigned 1 LE: [1, 0, 0, 0]. Memcmp image (no sign flip): [0, 0, 0, 1].
+        let mut fpi = FieldPacking::default();
+        fpi.max_image_len = 4;
+        let mut field = unsigned_int_field(4);
+        let image: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+        let mut dst = [0u8; 4];
+        let mut r = StringReader::new(&image);
+        assert_eq!(
+            unpack_integer(&mut fpi, &mut field, &mut dst, &mut r, None),
+            UNPACK_SUCCESS
+        );
+        assert_eq!(dst, [0x01, 0x00, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn unpack_integer_64bit_round_trip() {
+        // i64 = 0x0102030405060708 LE-bytes: [08, 07, 06, 05, 04, 03, 02, 01].
+        // Memcmp image (BE + flip): [0x81, 02, 03, 04, 05, 06, 07, 08].
+        let mut fpi = FieldPacking::default();
+        fpi.max_image_len = 8;
+        let mut field = signed_int_field(8);
+        let image: [u8; 8] = [0x81, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08];
+        let mut dst = [0u8; 8];
+        let mut r = StringReader::new(&image);
+        assert_eq!(
+            unpack_integer(&mut fpi, &mut field, &mut dst, &mut r, None),
+            UNPACK_SUCCESS
+        );
+        assert_eq!(dst, [0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+    }
+
+    #[test]
+    fn unpack_integer_short_read_fails() {
+        let mut fpi = FieldPacking::default();
+        fpi.max_image_len = 4;
+        let mut field = signed_int_field(4);
+        let image: [u8; 2] = [0xFF, 0xFF];
+        let mut dst = [0u8; 4];
+        let mut r = StringReader::new(&image);
+        assert_eq!(
+            unpack_integer(&mut fpi, &mut field, &mut dst, &mut r, None),
+            UNPACK_FAILURE
+        );
+    }
+
+    #[test]
+    fn unpack_double_zero_pattern() {
+        let mut fpi = FieldPacking::default();
+        let mut field = signed_int_field(8);
+        let image: [u8; 8] = [128, 0, 0, 0, 0, 0, 0, 0];
+        let mut dst = [0xFFu8; 8];
+        let mut r = StringReader::new(&image);
+        assert_eq!(
+            unpack_double(&mut fpi, &mut field, &mut dst, &mut r, None),
+            UNPACK_SUCCESS
+        );
+        assert_eq!(dst, [0u8; 8]);
+        // And the bytes interpret as 0.0.
+        assert_eq!(f64::from_le_bytes(dst), 0.0);
+    }
+
+    #[test]
+    fn unpack_double_positive_one() {
+        // 1.0 IEEE 754 double bytes (BE): [0x3F, 0xF0, 0, 0, 0, 0, 0, 0].
+        // change_double_for_sort positive path:
+        //   exp_part = 0x3FF0 + 0x10 = 0x4000 (add 1<<(16-1-11)=0x10).
+        //   set high bit ⇒ 0xC000.
+        // Encoded image: [0xC0, 0x00, 0, 0, 0, 0, 0, 0].
+        let mut fpi = FieldPacking::default();
+        let mut field = signed_int_field(8);
+        let image: [u8; 8] = [0xC0, 0x00, 0, 0, 0, 0, 0, 0];
+        let mut dst = [0u8; 8];
+        let mut r = StringReader::new(&image);
+        assert_eq!(
+            unpack_double(&mut fpi, &mut field, &mut dst, &mut r, None),
+            UNPACK_SUCCESS
+        );
+        assert_eq!(f64::from_le_bytes(dst), 1.0);
+    }
+
+    #[test]
+    fn unpack_double_negative_one() {
+        // -1.0 IEEE bytes (BE): [0xBF, 0xF0, 0, 0, 0, 0, 0, 0].
+        // change_double_for_sort negative path: XOR every byte with 0xFF
+        // ⇒ [0x40, 0x0F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF].
+        let mut fpi = FieldPacking::default();
+        let mut field = signed_int_field(8);
+        let image: [u8; 8] = [0x40, 0x0F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF];
+        let mut dst = [0u8; 8];
+        let mut r = StringReader::new(&image);
+        assert_eq!(
+            unpack_double(&mut fpi, &mut field, &mut dst, &mut r, None),
+            UNPACK_SUCCESS
+        );
+        assert_eq!(f64::from_le_bytes(dst), -1.0);
+    }
+
+    #[test]
+    fn unpack_float_zero_and_round_trip() {
+        let mut fpi = FieldPacking::default();
+        let mut field = signed_int_field(4);
+        // 0.0
+        let mut dst = [0xFFu8; 4];
+        let mut r = StringReader::new(&[128, 0, 0, 0]);
+        assert_eq!(
+            unpack_float(&mut fpi, &mut field, &mut dst, &mut r, None),
+            UNPACK_SUCCESS
+        );
+        assert_eq!(f32::from_le_bytes(dst), 0.0);
+
+        // 1.0 IEEE float bytes (BE): [0x3F, 0x80, 0, 0].
+        // positive: exp_part = 0x3F80 + 0x80 (=1<<7) = 0x4000, set high
+        // ⇒ 0xC000. Encoded: [0xC0, 0, 0, 0].
+        let mut dst2 = [0u8; 4];
+        let mut r2 = StringReader::new(&[0xC0, 0, 0, 0]);
+        assert_eq!(
+            unpack_float(&mut fpi, &mut field, &mut dst2, &mut r2, None),
+            UNPACK_SUCCESS
+        );
+        assert_eq!(f32::from_le_bytes(dst2), 1.0);
+    }
+
+    #[test]
+    fn unpack_newdate_reverses_three_bytes() {
+        let mut fpi = FieldPacking::default();
+        fpi.max_image_len = 3;
+        let mut field = signed_int_field(3);
+        let image: [u8; 3] = [0xAA, 0xBB, 0xCC];
+        let mut dst = [0u8; 3];
+        let mut r = StringReader::new(&image);
+        assert_eq!(
+            unpack_newdate(&mut fpi, &mut field, &mut dst, &mut r, None),
+            UNPACK_SUCCESS
+        );
+        assert_eq!(dst, [0xCC, 0xBB, 0xAA]);
+    }
+
+    #[test]
+    fn unpack_binary_str_memcpy() {
+        let mut fpi = FieldPacking::default();
+        fpi.max_image_len = 5;
+        let mut field = signed_int_field(5);
+        let image = b"hello";
+        let mut dst = [0u8; 5];
+        let mut r = StringReader::new(image);
+        assert_eq!(
+            unpack_binary_str(&mut fpi, &mut field, &mut dst, &mut r, None),
+            UNPACK_SUCCESS
+        );
+        assert_eq!(&dst, image);
     }
 }
