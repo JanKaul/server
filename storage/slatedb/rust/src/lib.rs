@@ -5,4 +5,5 @@
 pub mod bridge;
 pub mod error;
 pub mod globals;
+pub mod task;
 pub mod utils;
