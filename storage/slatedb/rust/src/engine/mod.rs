@@ -9,4 +9,5 @@ pub mod cf;
 pub mod cf_options;
 pub mod comparator;
 pub mod db;
+pub mod snapshot;
 pub mod txn;
