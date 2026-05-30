@@ -237,6 +237,173 @@ pub fn unpack_status_to_result(code: i32) -> Result<(), slatedb::Error> {
     }
 }
 
+// ===========================================================================
+// Pack/unpack/skip free functions
+// ===========================================================================
+//
+// Translated from `rdb_datadic.cc:1768..2108` (and the helpers around line
+// 2453). These are the concrete encode/decode routines that
+// [`FieldPacking::setup`] wires into the function-pointer slots based on
+// the column's MySQL type and collation.
+//
+// They take `&mut FieldPacking` / `&mut FieldView` to match the C++
+// `Rdb_field_packing*` / `Field*` shape even when no mutation happens;
+// keeps the function-pointer typedef stable across all variants.
+
+/// Variable-length-string segment size. Each segment is `RDB_ESCAPE_LENGTH`
+/// bytes: `RDB_ESCAPE_LENGTH - 1` data bytes + one trailing flag byte that
+/// tells the decoder how many of those data bytes are real and whether
+/// more segments follow.
+///
+/// Translated from `rdb_datadic.cc:1781` — `#define RDB_ESCAPE_LENGTH 9`.
+pub const RDB_ESCAPE_LENGTH: usize = 9;
+
+/// Variable-length-space-padded flag values (`rdb_datadic.cc:1846`).
+pub const VARCHAR_CMP_LESS_THAN_SPACES: u8 = 1;
+pub const VARCHAR_CMP_EQUAL_TO_SPACES: u8 = 2;
+pub const VARCHAR_CMP_GREATER_THAN_SPACES: u8 = 3;
+
+// ----- skip functions -----
+
+/// Skip a fixed-width keypart. Just advance `reader` by `max_image_len`
+/// bytes. Used for integers, dates, BINARY(n), and CHAR(n) with any
+/// collation (since CHAR is space-padded to its full length at the SQL
+/// layer).
+///
+/// Translated from `Rdb_key_def::skip_max_length` (`rdb_datadic.cc:1768`).
+pub fn skip_max_length(
+    fpi: &FieldPacking,
+    _field: &FieldView,
+    reader: &mut StringReader,
+) -> i32 {
+    if reader.read(fpi.max_image_len as usize).is_some() {
+        UNPACK_SUCCESS
+    } else {
+        UNPACK_FAILURE
+    }
+}
+
+/// Skip a variable-length keypart packed by `pack_with_varchar_encoding`.
+/// Reads `RDB_ESCAPE_LENGTH`-byte segments, peeks the trailing flag byte
+/// to count payload bytes, and stops when the flag marks the final
+/// segment. `field.length` caps the cumulative payload (the max VARCHAR
+/// content size in bytes) so a malformed stream can't run away.
+///
+/// Translated from `Rdb_key_def::skip_variable_length` (`rdb_datadic.cc:1798`).
+pub fn skip_variable_length(
+    fpi: &FieldPacking,
+    field: &FieldView,
+    reader: &mut StringReader,
+) -> i32 {
+    // `field.length` is the declared max content length (matches MariaDB
+    // `Field_varstring::pack_length() - length_bytes`). Use `usize::MAX`
+    // when no field is in scope (matches C++'s `dst_len = UINT_MAX`
+    // branch when `field == nullptr`); we don't model `field = None`
+    // here so length is always declared.
+    let mut dst_len = field.length as usize;
+    let use_legacy = fpi.use_legacy_varbinary_format;
+
+    loop {
+        let chunk = match reader.read(RDB_ESCAPE_LENGTH) {
+            Some(c) => c,
+            None => return UNPACK_FAILURE,
+        };
+        let flag = chunk[RDB_ESCAPE_LENGTH - 1];
+        let (used_bytes, finished) = if use_legacy {
+            calc_unpack_legacy_variable_format(flag)
+        } else {
+            calc_unpack_variable_format(flag)
+        };
+
+        let used = match used_bytes {
+            Some(n) => n as usize,
+            None => return UNPACK_FAILURE,
+        };
+        if dst_len < used {
+            return UNPACK_FAILURE;
+        }
+        if finished {
+            return UNPACK_SUCCESS;
+        }
+        dst_len -= used;
+    }
+}
+
+/// Skip a variable-length-space-padded keypart packed by
+/// `pack_with_varchar_space_pad`. Reads `segment_size`-byte chunks; the
+/// trailing byte of each chunk is a `VARCHAR_CMP_*` flag.
+/// `EQUAL_TO_SPACES` ends the field; `LESS_THAN` / `GREATER_THAN` means
+/// another chunk follows; anything else is corruption.
+///
+/// Translated from `Rdb_key_def::skip_variable_space_pad` (`rdb_datadic.cc:1854`).
+pub fn skip_variable_space_pad(
+    fpi: &FieldPacking,
+    field: &FieldView,
+    reader: &mut StringReader,
+) -> i32 {
+    let segment_size = fpi.segment_size as usize;
+    if segment_size == 0 {
+        return UNPACK_FAILURE;
+    }
+    let mut dst_len = field.length as usize;
+    let data_per_segment = segment_size - 1;
+
+    loop {
+        let chunk = match reader.read(segment_size) {
+            Some(c) => c,
+            None => return UNPACK_FAILURE,
+        };
+        let flag = chunk[segment_size - 1];
+        match flag {
+            VARCHAR_CMP_EQUAL_TO_SPACES => return UNPACK_SUCCESS,
+            VARCHAR_CMP_LESS_THAN_SPACES | VARCHAR_CMP_GREATER_THAN_SPACES => {
+                if data_per_segment > dst_len {
+                    return UNPACK_FAILURE;
+                }
+                dst_len -= data_per_segment;
+            }
+            _ => return UNPACK_FAILURE,
+        }
+    }
+}
+
+// ----- variable-format flag decoders -----
+
+/// New format (`PRIMARY_FORMAT_VERSION_UPDATE2` and later) flag byte:
+/// values `1..=RDB_ESCAPE_LENGTH-1` end the field and indicate that many
+/// of the chunk's payload bytes are real; `RDB_ESCAPE_LENGTH` means full
+/// payload and more chunks follow; anything else is corruption.
+/// Returns `(Some(used), finished)` on success, `(None, _)` on
+/// corruption.
+///
+/// Translated from `Rdb_key_def::calc_unpack_variable_format`
+/// (`rdb_datadic.cc:2469`).
+pub fn calc_unpack_variable_format(flag: u8) -> (Option<u32>, bool) {
+    if flag as usize > RDB_ESCAPE_LENGTH {
+        return (None, false);
+    }
+    if (flag as usize) < RDB_ESCAPE_LENGTH {
+        return (Some(flag as u32), true);
+    }
+    (Some((RDB_ESCAPE_LENGTH - 1) as u32), false)
+}
+
+/// Legacy format (pre-`PRIMARY_FORMAT_VERSION_UPDATE2`) flag byte: pad
+/// count is `255 - flag`; payload bytes = `RDB_ESCAPE_LENGTH-1 - pad`.
+/// Finished if fewer than full payload bytes were used.
+///
+/// Translated from `Rdb_key_def::calc_unpack_legacy_variable_format`
+/// (`rdb_datadic.cc:2453`).
+pub fn calc_unpack_legacy_variable_format(flag: u8) -> (Option<u32>, bool) {
+    let pad = 255_u32.saturating_sub(flag as u32);
+    let max_payload = (RDB_ESCAPE_LENGTH - 1) as u32;
+    if pad > max_payload {
+        return (None, false);
+    }
+    let used_bytes = max_payload - pad;
+    (Some(used_bytes), used_bytes < max_payload)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +476,184 @@ mod tests {
         assert!(matches!(e.kind(), slatedb::ErrorKind::Data));
         let e = unpack_status_to_result(42).unwrap_err();
         assert!(matches!(e.kind(), slatedb::ErrorKind::Internal));
+    }
+
+    // ----- skip + variable-format helpers -----
+
+    use crate::codec::value::MysqlType;
+
+    fn varchar_field(len: u32) -> FieldView {
+        FieldView {
+            name: "v".into(),
+            mysql_type: MysqlType::Varchar,
+            pack_length: len + 1,
+            output_offset: 0,
+            null_marker: None,
+            length: len,
+            charset_id: 63,
+            flags: 0,
+            decimals: 0,
+        }
+    }
+
+    fn int_field() -> FieldView {
+        FieldView {
+            name: "i".into(),
+            mysql_type: MysqlType::Long,
+            pack_length: 4,
+            output_offset: 0,
+            null_marker: None,
+            length: 4,
+            charset_id: 63,
+            flags: 0,
+            decimals: 0,
+        }
+    }
+
+    #[test]
+    fn skip_max_length_advances_exactly_max_image_len() {
+        let mut fpi = FieldPacking::default();
+        fpi.max_image_len = 4;
+        let field = int_field();
+        let buf = [0u8; 10];
+        let mut r = StringReader::new(&buf);
+        assert_eq!(skip_max_length(&fpi, &field, &mut r), UNPACK_SUCCESS);
+        assert_eq!(r.current_pos(), 4);
+    }
+
+    #[test]
+    fn skip_max_length_short_read_fails() {
+        let mut fpi = FieldPacking::default();
+        fpi.max_image_len = 8;
+        let field = int_field();
+        let buf = [0u8; 3];
+        let mut r = StringReader::new(&buf);
+        assert_eq!(skip_max_length(&fpi, &field, &mut r), UNPACK_FAILURE);
+    }
+
+    #[test]
+    fn calc_unpack_variable_format_table() {
+        // Terminal segments (1..=8 used bytes, finished=true).
+        for used in 1..=(RDB_ESCAPE_LENGTH - 1) as u32 {
+            let (n, done) = calc_unpack_variable_format(used as u8);
+            assert_eq!(n, Some(used));
+            assert!(done, "flag={used} must mark finished");
+        }
+        // Full-payload-with-more-to-come (flag == RDB_ESCAPE_LENGTH).
+        let (n, done) = calc_unpack_variable_format(RDB_ESCAPE_LENGTH as u8);
+        assert_eq!(n, Some((RDB_ESCAPE_LENGTH - 1) as u32));
+        assert!(!done);
+        // Invalid flag > RDB_ESCAPE_LENGTH.
+        let (n, _) = calc_unpack_variable_format(RDB_ESCAPE_LENGTH as u8 + 1);
+        assert!(n.is_none());
+        // Flag = 0 — current C++ logic returns Some(0), finished=true
+        // (you've written zero payload bytes, this segment ends the field).
+        let (n, done) = calc_unpack_variable_format(0);
+        assert_eq!(n, Some(0));
+        assert!(done);
+    }
+
+    #[test]
+    fn calc_unpack_legacy_variable_format_table() {
+        // pad = 0 (flag = 255) → full payload, more to come.
+        let (n, done) = calc_unpack_legacy_variable_format(255);
+        assert_eq!(n, Some((RDB_ESCAPE_LENGTH - 1) as u32));
+        assert!(!done);
+        // pad = 1 (flag = 254) → 7 payload bytes, finished.
+        let (n, done) = calc_unpack_legacy_variable_format(254);
+        assert_eq!(n, Some((RDB_ESCAPE_LENGTH - 2) as u32));
+        assert!(done);
+        // pad = RDB_ESCAPE_LENGTH-1 = 8 (flag = 247) → 0 bytes, finished.
+        let (n, done) = calc_unpack_legacy_variable_format(247);
+        assert_eq!(n, Some(0));
+        assert!(done);
+        // pad > max payload (flag < 247) → corruption.
+        let (n, _) = calc_unpack_legacy_variable_format(246);
+        assert!(n.is_none());
+    }
+
+    #[test]
+    fn skip_variable_length_consumes_one_terminal_segment() {
+        let fpi = FieldPacking::default();
+        let field = varchar_field(100);
+        // One segment with flag=3 ⇒ 3 payload bytes, finished.
+        let mut buf = vec![0u8; RDB_ESCAPE_LENGTH];
+        buf[RDB_ESCAPE_LENGTH - 1] = 3;
+        let mut r = StringReader::new(&buf);
+        assert_eq!(skip_variable_length(&fpi, &field, &mut r), UNPACK_SUCCESS);
+        assert_eq!(r.current_pos(), RDB_ESCAPE_LENGTH);
+    }
+
+    #[test]
+    fn skip_variable_length_consumes_multi_segment() {
+        let fpi = FieldPacking::default();
+        let field = varchar_field(100);
+        // Two segments: first full-payload+more (flag=RDB_ESCAPE_LENGTH=9),
+        // second terminal (flag=2).
+        let mut buf = vec![0u8; RDB_ESCAPE_LENGTH * 2];
+        buf[RDB_ESCAPE_LENGTH - 1] = RDB_ESCAPE_LENGTH as u8;
+        buf[RDB_ESCAPE_LENGTH * 2 - 1] = 2;
+        let mut r = StringReader::new(&buf);
+        assert_eq!(skip_variable_length(&fpi, &field, &mut r), UNPACK_SUCCESS);
+        assert_eq!(r.current_pos(), RDB_ESCAPE_LENGTH * 2);
+    }
+
+    #[test]
+    fn skip_variable_length_caps_at_field_length() {
+        // field.length = 5 but two full-payload segments (8+more) would be
+        // 16 bytes — that exceeds 5 and must be rejected.
+        let fpi = FieldPacking::default();
+        let field = varchar_field(5);
+        let mut buf = vec![0u8; RDB_ESCAPE_LENGTH * 2];
+        buf[RDB_ESCAPE_LENGTH - 1] = RDB_ESCAPE_LENGTH as u8;
+        buf[RDB_ESCAPE_LENGTH * 2 - 1] = 2;
+        let mut r = StringReader::new(&buf);
+        assert_eq!(skip_variable_length(&fpi, &field, &mut r), UNPACK_FAILURE);
+    }
+
+    #[test]
+    fn skip_variable_length_rejects_bad_flag() {
+        let fpi = FieldPacking::default();
+        let field = varchar_field(100);
+        let mut buf = vec![0u8; RDB_ESCAPE_LENGTH];
+        buf[RDB_ESCAPE_LENGTH - 1] = (RDB_ESCAPE_LENGTH + 1) as u8; // bad
+        let mut r = StringReader::new(&buf);
+        assert_eq!(skip_variable_length(&fpi, &field, &mut r), UNPACK_FAILURE);
+    }
+
+    #[test]
+    fn skip_variable_space_pad_consumes_one_terminal_segment() {
+        let mut fpi = FieldPacking::default();
+        fpi.segment_size = 9;
+        let field = varchar_field(100);
+        let mut buf = vec![0u8; 9];
+        buf[8] = VARCHAR_CMP_EQUAL_TO_SPACES;
+        let mut r = StringReader::new(&buf);
+        assert_eq!(skip_variable_space_pad(&fpi, &field, &mut r), UNPACK_SUCCESS);
+        assert_eq!(r.current_pos(), 9);
+    }
+
+    #[test]
+    fn skip_variable_space_pad_consumes_multi_segment() {
+        let mut fpi = FieldPacking::default();
+        fpi.segment_size = 9;
+        let field = varchar_field(100);
+        let mut buf = vec![0u8; 18];
+        buf[8] = VARCHAR_CMP_LESS_THAN_SPACES;
+        buf[17] = VARCHAR_CMP_EQUAL_TO_SPACES;
+        let mut r = StringReader::new(&buf);
+        assert_eq!(skip_variable_space_pad(&fpi, &field, &mut r), UNPACK_SUCCESS);
+        assert_eq!(r.current_pos(), 18);
+    }
+
+    #[test]
+    fn skip_variable_space_pad_rejects_unknown_flag() {
+        let mut fpi = FieldPacking::default();
+        fpi.segment_size = 9;
+        let field = varchar_field(100);
+        let mut buf = vec![0u8; 9];
+        buf[8] = 42; // not a VARCHAR_CMP_* value
+        let mut r = StringReader::new(&buf);
+        assert_eq!(skip_variable_space_pad(&fpi, &field, &mut r), UNPACK_FAILURE);
     }
 }
