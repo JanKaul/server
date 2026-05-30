@@ -554,6 +554,50 @@ impl KeyDef {
         self.pack_info.iter().all(|fp| fp.unpack_func.is_some())
     }
 
+    /// Total byte length of a packed key under this descriptor — the
+    /// `INDEX_NUMBER_SIZE` prefix plus each keypart's mem-comparable
+    /// bytes. Returns `None` on truncation or skip_func failure.
+    ///
+    /// Port of `rdb_datadic.cc:1591`. The MyRocks caller is `rnd_pos`
+    /// (`ha_rocksdb.cc:11184`), which only ever calls this on the
+    /// **primary key** descriptor — that's why this function does NOT
+    /// handle the nullable-part null byte. PKs are NOT NULL by SQL
+    /// convention, so the omission is sound for the only real call
+    /// site. Don't call this for secondary keys with nullable parts.
+    ///
+    /// `fields` is one entry per keypart (length must equal
+    /// `self.key_parts`). Pass `None` for the hidden-PK part — the
+    /// 8 raw bytes are consumed directly without going through
+    /// `skip_func`. Pass `Some(...)` for every other part.
+    pub fn key_length(
+        &self,
+        key: &[u8],
+        fields: &[Option<&crate::codec::value::FieldView>],
+    ) -> Option<usize> {
+        debug_assert_eq!(
+            fields.len(),
+            self.key_parts as usize,
+            "key_length: fields slice length must match self.key_parts"
+        );
+        let mut reader = crate::utils::buff::StringReader::new(key);
+        reader.read(INDEX_NUMBER_SIZE)?;
+        for (i, field) in fields.iter().enumerate() {
+            let fpi = &self.pack_info[i];
+            match field {
+                None => {
+                    reader.read(crate::globals::SIZEOF_HIDDEN_PK_COLUMN)?;
+                }
+                Some(f) => {
+                    let skip_func = fpi.skip_func?;
+                    if skip_func(fpi, f, &mut reader) != 0 {
+                        return None;
+                    }
+                }
+            }
+        }
+        Some(key.len() - reader.remaining())
+    }
+
     /// Advance `reader` past key-part `part_num`'s mem-comparable bytes
     /// without writing them anywhere. Used by upper-bound computations
     /// and by SK→PK lookups that only need to know "how long is this
@@ -1162,6 +1206,69 @@ mod tests {
         let kd = kd_with_pack_info(vec![with_info, without]);
         assert!(kd.has_unpack_info(0));
         assert!(!kd.has_unpack_info(1));
+    }
+
+    // ----- key_length -----
+
+    #[test]
+    fn key_length_two_part_pk_consumes_index_prefix_plus_skip_funcs() {
+        let mut fp0 = crate::codec::field_pack::FieldPacking::default();
+        fp0.skip_func = Some(dummy_skip_consume_4);
+        let mut fp1 = crate::codec::field_pack::FieldPacking::default();
+        fp1.skip_func = Some(dummy_skip_consume_4);
+        let kd = kd_with_pack_info(vec![fp0, fp1]);
+
+        // 4-byte index_number + 4 bytes part 0 + 4 bytes part 1 = 12.
+        let key = [0, 0, 0, 42, 1, 2, 3, 4, 5, 6, 7, 8];
+        let f = dummy_field();
+        let fields = [Some(&f), Some(&f)];
+        assert_eq!(kd.key_length(&key, &fields), Some(12));
+    }
+
+    #[test]
+    fn key_length_returns_none_when_index_prefix_truncated() {
+        let kd = kd_with_pack_info(vec![{
+            let mut f = crate::codec::field_pack::FieldPacking::default();
+            f.skip_func = Some(dummy_skip_consume_4);
+            f
+        }]);
+        let key = [0u8, 0]; // < 4 bytes
+        let f = dummy_field();
+        assert_eq!(kd.key_length(&key, &[Some(&f)]), None);
+    }
+
+    #[test]
+    fn key_length_returns_none_when_a_part_under_reads() {
+        let kd = kd_with_pack_info(vec![{
+            let mut f = crate::codec::field_pack::FieldPacking::default();
+            f.skip_func = Some(dummy_skip_consume_4);
+            f
+        }]);
+        // 4-byte index_number + only 2 of the expected 4 part bytes.
+        let key = [0u8, 0, 0, 42, 1, 2];
+        let f = dummy_field();
+        assert_eq!(kd.key_length(&key, &[Some(&f)]), None);
+    }
+
+    #[test]
+    fn key_length_handles_hidden_pk_part_as_eight_raw_bytes() {
+        let kd = kd_with_pack_info(vec![
+            crate::codec::field_pack::FieldPacking::default(), // hidden PK
+        ]);
+        // 4-byte index_number + 8 bytes hidden PK = 12.
+        let key = [0u8; 12];
+        assert_eq!(kd.key_length(&key, &[None]), Some(12));
+    }
+
+    #[test]
+    fn key_length_returns_none_when_skip_func_missing() {
+        let kd = kd_with_pack_info(vec![
+            // No skip_func assigned — setup-time bug surfaces as None.
+            crate::codec::field_pack::FieldPacking::default(),
+        ]);
+        let key = [0u8; 12];
+        let f = dummy_field();
+        assert_eq!(kd.key_length(&key, &[Some(&f)]), None);
     }
 
     // ----- read_memcmp_key_part -----
