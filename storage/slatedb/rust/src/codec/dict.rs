@@ -654,6 +654,83 @@ pub mod index_info {
     }
 }
 
+/// Per-CF flag bitmap.
+///
+/// One row per `cf_id` at `DataDictType::CfDefinition` (= 3). Suffix
+/// is the `cf_id` as `u32_be` (4 bytes). Value is
+/// `u16_be(CF_DEFINITION_VERSION) || u32_be(cf_flags)` (6 bytes),
+/// matching the C++ `Rdb_dict_manager::add_cf_flags` at
+/// `rdb_datadic.cc:4856`.
+///
+/// The flag bits are defined on `Rdb_key_def` — currently:
+/// - `REVERSE_CF_FLAG = 1` (the CF stores keys in reverse byte order)
+/// - `AUTO_CF_FLAG = 2` (deprecated)
+/// - `PER_PARTITION_CF_FLAG = 4`
+///
+/// `TblDef::put_dict` reads this row to enforce "if cf_id already
+/// exists, cf_flags must be the same"; mismatch surfaces as
+/// `ER_CF_DIFFERENT` at the handler boundary
+/// (`rdb_datadic.cc:3591..3594`).
+pub mod cf_flags {
+    use super::{delete, get, put, DataDictType, CF_DEFINITION_VERSION};
+    use slatedb::{Db, Error};
+
+    const VERSION_BYTES: usize = 2;
+    const VALUE_BYTES: usize = 4;
+    pub const ENCODED_LEN: usize = VERSION_BYTES + VALUE_BYTES;
+
+    fn encode_suffix(cf_id: u32) -> [u8; 4] {
+        cf_id.to_be_bytes()
+    }
+
+    pub fn encode_value(cf_flags: u32) -> [u8; ENCODED_LEN] {
+        let mut out = [0u8; ENCODED_LEN];
+        out[..VERSION_BYTES].copy_from_slice(&CF_DEFINITION_VERSION.to_be_bytes());
+        out[VERSION_BYTES..].copy_from_slice(&cf_flags.to_be_bytes());
+        out
+    }
+
+    pub fn decode_value(bytes: &[u8]) -> Result<u32, Error> {
+        if bytes.len() != ENCODED_LEN {
+            return Err(Error::data(format!(
+                "cf_flags value: expected {ENCODED_LEN} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let version = u16::from_be_bytes([bytes[0], bytes[1]]);
+        if version != CF_DEFINITION_VERSION {
+            return Err(Error::data(format!(
+                "cf_flags: unsupported version {version} \
+                 (latest is {CF_DEFINITION_VERSION})"
+            )));
+        }
+        let mut buf = [0u8; VALUE_BYTES];
+        buf.copy_from_slice(&bytes[VERSION_BYTES..]);
+        Ok(u32::from_be_bytes(buf))
+    }
+
+    pub async fn read(db: &Db, cf_id: u32) -> Result<Option<u32>, Error> {
+        match get(db, DataDictType::CfDefinition, &encode_suffix(cf_id)).await? {
+            Some(bytes) => Ok(Some(decode_value(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn write(db: &Db, cf_id: u32, cf_flags: u32) -> Result<(), Error> {
+        put(
+            db,
+            DataDictType::CfDefinition,
+            &encode_suffix(cf_id),
+            &encode_value(cf_flags),
+        )
+        .await
+    }
+
+    pub async fn remove(db: &Db, cf_id: u32) -> Result<(), Error> {
+        delete(db, DataDictType::CfDefinition, &encode_suffix(cf_id)).await
+    }
+}
+
 /// Per-index aggregate statistics.
 ///
 /// One row per index at `DataDictType::IndexStatistics`. Suffix is the
@@ -2030,6 +2107,65 @@ mod tests {
         .expect("put raw");
         let err = index_statistics::read(engine.db(), key_gl).await.unwrap_err();
         assert_eq!(err.kind(), slatedb::ErrorKind::Data);
+        engine.close().await.expect("close");
+    }
+
+    // ----- cf_flags -----
+
+    #[test]
+    fn cf_flags_round_trip_encode_decode() {
+        let bytes = cf_flags::encode_value(0b101);
+        assert_eq!(bytes.len(), cf_flags::ENCODED_LEN);
+        assert_eq!(&bytes[..2], &CF_DEFINITION_VERSION.to_be_bytes());
+        assert_eq!(cf_flags::decode_value(&bytes).expect("decode"), 0b101);
+    }
+
+    #[test]
+    fn cf_flags_zero_round_trips() {
+        // System CF and default CF are stamped with flags=0 in C++
+        // (rdb_datadic.cc:4767..4768); make sure that's encodable.
+        let bytes = cf_flags::encode_value(0);
+        assert_eq!(cf_flags::decode_value(&bytes).expect("decode"), 0);
+    }
+
+    #[test]
+    fn cf_flags_wrong_length_rejected() {
+        let err = cf_flags::decode_value(&[0u8; 5]).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Data);
+    }
+
+    #[test]
+    fn cf_flags_unsupported_version_rejected() {
+        let mut bytes = cf_flags::encode_value(0xff);
+        bytes[0..2].copy_from_slice(&99u16.to_be_bytes());
+        let err = cf_flags::decode_value(&bytes).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Data);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cf_flags_write_read_remove() {
+        let engine = EngineDb::open_in_memory("cf_flags_rt").await.expect("open");
+
+        assert!(cf_flags::read(engine.db(), 1).await.expect("miss").is_none());
+
+        cf_flags::write(engine.db(), 1, 0b110)
+            .await
+            .expect("write");
+        let got = cf_flags::read(engine.db(), 1)
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(got, 0b110);
+
+        // A different cf_id is independently keyed.
+        assert!(cf_flags::read(engine.db(), 2).await.expect("miss2").is_none());
+
+        cf_flags::remove(engine.db(), 1).await.expect("remove");
+        assert!(cf_flags::read(engine.db(), 1)
+            .await
+            .expect("post-rm")
+            .is_none());
+
         engine.close().await.expect("close");
     }
 }
