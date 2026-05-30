@@ -125,6 +125,122 @@ pub async fn scan(
     db.scan_prefix(&system_record_prefix(record_type)).await
 }
 
+// ---------------------------------------------------------------------------
+// Substrate consumers (small managers).
+// ---------------------------------------------------------------------------
+
+/// Per-table auto-increment counter.
+///
+/// One row per table at `DataDictType::AutoInc`, suffix = table name bytes,
+/// value = `u64` big-endian. Schema version is
+/// [`AUTO_INCREMENT_VERSION`] (callers can ignore it today — there's only
+/// one version).
+pub mod autoinc {
+    use super::{delete, get, put, DataDictType};
+    use slatedb::{Db, Error};
+
+    fn encode_value(value: u64) -> [u8; 8] {
+        value.to_be_bytes()
+    }
+
+    fn decode_value(bytes: &[u8]) -> Result<u64, Error> {
+        if bytes.len() != 8 {
+            return Err(Error::data(format!(
+                "autoinc value: expected 8 bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(bytes);
+        Ok(u64::from_be_bytes(buf))
+    }
+
+    pub async fn read(db: &Db, table_name: &str) -> Result<Option<u64>, Error> {
+        match get(db, DataDictType::AutoInc, table_name.as_bytes()).await? {
+            Some(bytes) => Ok(Some(decode_value(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn write(db: &Db, table_name: &str, value: u64) -> Result<(), Error> {
+        put(
+            db,
+            DataDictType::AutoInc,
+            table_name.as_bytes(),
+            &encode_value(value),
+        )
+        .await
+    }
+
+    pub async fn remove(db: &Db, table_name: &str) -> Result<(), Error> {
+        delete(db, DataDictType::AutoInc, table_name.as_bytes()).await
+    }
+}
+
+/// Dropped-index registry.
+///
+/// One marker row per pending-drop index at
+/// `DataDictType::DdlDropIndexOngoing`. Suffix encodes the [`GlIndexId`]
+/// as `u32_be(cf_id) || u32_be(index_id)` (8 bytes). Value is empty —
+/// presence is the marker. The compaction filter walks this registry to
+/// decide which `(cf_id, index_id)` prefixes to sweep.
+pub mod dropped_indexes {
+    use super::{delete, put, scan, system_record_prefix, DataDictType};
+    use crate::globals::GlIndexId;
+    use slatedb::{Db, Error};
+
+    const SUFFIX_LEN: usize = 8;
+
+    fn encode_suffix(gl: GlIndexId) -> [u8; SUFFIX_LEN] {
+        let mut out = [0u8; SUFFIX_LEN];
+        out[..4].copy_from_slice(&gl.cf_id.to_be_bytes());
+        out[4..].copy_from_slice(&gl.index_id.to_be_bytes());
+        out
+    }
+
+    fn decode_suffix(bytes: &[u8]) -> Result<GlIndexId, Error> {
+        if bytes.len() != SUFFIX_LEN {
+            return Err(Error::data(format!(
+                "dropped-index suffix: expected {SUFFIX_LEN} bytes, got {}",
+                bytes.len()
+            )));
+        }
+        let mut cf = [0u8; 4];
+        let mut ix = [0u8; 4];
+        cf.copy_from_slice(&bytes[..4]);
+        ix.copy_from_slice(&bytes[4..]);
+        Ok(GlIndexId {
+            cf_id: u32::from_be_bytes(cf),
+            index_id: u32::from_be_bytes(ix),
+        })
+    }
+
+    /// Add a single index to the dropped-index registry. Idempotent — adding
+    /// an already-marked index is a no-op write of the same empty value.
+    pub async fn add(db: &Db, gl: GlIndexId) -> Result<(), Error> {
+        put(db, DataDictType::DdlDropIndexOngoing, &encode_suffix(gl), &[]).await
+    }
+
+    /// Remove a single index. Idempotent — removing a missing index is a
+    /// SlateDB-level tombstone write that's a no-op on the visible state.
+    pub async fn remove(db: &Db, gl: GlIndexId) -> Result<(), Error> {
+        delete(db, DataDictType::DdlDropIndexOngoing, &encode_suffix(gl)).await
+    }
+
+    /// Snapshot the dropped-index registry. Returns rows in
+    /// byte-lexicographic order of `(cf_id, index_id)`.
+    pub async fn list(db: &Db) -> Result<Vec<GlIndexId>, Error> {
+        let prefix = system_record_prefix(DataDictType::DdlDropIndexOngoing);
+        let mut it = scan(db, DataDictType::DdlDropIndexOngoing).await?;
+        let mut out = Vec::new();
+        while let Some(kv) = it.next().await? {
+            let suffix = &kv.key[prefix.len()..];
+            out.push(decode_suffix(suffix)?);
+        }
+        Ok(out)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +362,124 @@ mod tests {
             order.push(kv.key[prefix.len()..].to_vec());
         }
         assert_eq!(order, vec![b"a".to_vec(), b"b".to_vec(), b"c".to_vec()]);
+        engine.close().await.expect("close");
+    }
+
+    // ----- autoinc -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn autoinc_round_trip() {
+        let engine = EngineDb::open_in_memory("autoinc_rt").await.expect("open");
+
+        assert_eq!(
+            autoinc::read(engine.db(), "users").await.expect("read miss"),
+            None
+        );
+
+        autoinc::write(engine.db(), "users", 42)
+            .await
+            .expect("write");
+        assert_eq!(
+            autoinc::read(engine.db(), "users").await.expect("read"),
+            Some(42)
+        );
+
+        // Overwrite with a higher value.
+        autoinc::write(engine.db(), "users", 100_000)
+            .await
+            .expect("write");
+        assert_eq!(
+            autoinc::read(engine.db(), "users").await.expect("read"),
+            Some(100_000)
+        );
+
+        autoinc::remove(engine.db(), "users")
+            .await
+            .expect("remove");
+        assert_eq!(
+            autoinc::read(engine.db(), "users").await.expect("read"),
+            None
+        );
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn autoinc_corrupt_value_surfaces_data_error() {
+        let engine = EngineDb::open_in_memory("autoinc_corrupt")
+            .await
+            .expect("open");
+
+        // Write a 3-byte payload through the raw substrate, bypassing autoinc.
+        put(engine.db(), DataDictType::AutoInc, b"weird", b"abc")
+            .await
+            .expect("put");
+
+        let err = autoinc::read(engine.db(), "weird").await.unwrap_err();
+        assert!(matches!(err.kind(), slatedb::ErrorKind::Data));
+
+        engine.close().await.expect("close");
+    }
+
+    // ----- dropped_indexes -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_indexes_empty_then_add_then_remove() {
+        let engine = EngineDb::open_in_memory("dropped_idx_basic")
+            .await
+            .expect("open");
+
+        assert!(dropped_indexes::list(engine.db())
+            .await
+            .expect("list")
+            .is_empty());
+
+        let a = crate::globals::GlIndexId {
+            cf_id: 1,
+            index_id: 100,
+        };
+        let b = crate::globals::GlIndexId {
+            cf_id: 1,
+            index_id: 101,
+        };
+        let c = crate::globals::GlIndexId {
+            cf_id: 2,
+            index_id: 1,
+        };
+
+        // Insert out of byte order; expect list to come back sorted.
+        dropped_indexes::add(engine.db(), c).await.expect("add c");
+        dropped_indexes::add(engine.db(), a).await.expect("add a");
+        dropped_indexes::add(engine.db(), b).await.expect("add b");
+
+        let listed = dropped_indexes::list(engine.db()).await.expect("list");
+        assert_eq!(listed, vec![a, b, c]);
+
+        dropped_indexes::remove(engine.db(), b)
+            .await
+            .expect("remove b");
+        let listed = dropped_indexes::list(engine.db()).await.expect("list");
+        assert_eq!(listed, vec![a, c]);
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_indexes_add_is_idempotent() {
+        let engine = EngineDb::open_in_memory("dropped_idx_idem")
+            .await
+            .expect("open");
+
+        let gl = crate::globals::GlIndexId {
+            cf_id: 7,
+            index_id: 7,
+        };
+        dropped_indexes::add(engine.db(), gl).await.expect("add 1");
+        dropped_indexes::add(engine.db(), gl).await.expect("add 2");
+
+        let listed = dropped_indexes::list(engine.db()).await.expect("list");
+        assert_eq!(listed, vec![gl]);
+
         engine.close().await.expect("close");
     }
 }
