@@ -640,6 +640,66 @@ impl KeyDef {
         Some(size)
     }
 
+    /// Extract the mem-comparable Secondary Key form **without** the
+    /// extended PK tail. Used to feed an SK row through equality /
+    /// range comparisons that should ignore the trailing PK columns.
+    ///
+    /// Port of `rdb_datadic.cc:959..988`. Output includes the leading
+    /// `INDEX_NUMBER_SIZE` bytes (it's a *full* SK key, just without
+    /// the extended PK suffix).
+    ///
+    /// Walks the first `user_defined_key_parts` entries of pack_info
+    /// via [`Self::read_memcmp_key_part`]. The C++ reads
+    /// `user_defined_key_parts` from `TABLE::key_info[m_keyno]`; we
+    /// take it as a parameter because that field is populated by
+    /// `KeyDef::setup` (deferred) and exposing the dependency at the
+    /// call site keeps this method honest.
+    ///
+    /// Returns `Some((sk_memcmp_len, n_null_fields))` on success:
+    /// - `sk_memcmp_len` — total bytes copied into `sk_buffer`
+    ///   (index prefix + each consumed part).
+    /// - `n_null_fields` — count of `read_memcmp_key_part` results
+    ///   that came back as `ReadKeyPart::Null` (i.e. the field was
+    ///   stored NULL).
+    /// Returns `None` on read truncation or a per-part `Error`.
+    pub fn get_memcmp_sk_parts(
+        &self,
+        key: &[u8],
+        user_defined_key_parts: u32,
+        sk_buffer: &mut [u8],
+        fields: &[Option<&crate::codec::value::FieldView>],
+    ) -> Option<(usize, u32)> {
+        debug_assert!(
+            user_defined_key_parts <= self.key_parts,
+            "user_defined_key_parts {} > self.key_parts {}",
+            user_defined_key_parts,
+            self.key_parts
+        );
+        debug_assert!(
+            fields.len() >= user_defined_key_parts as usize,
+            "fields slice ({}) shorter than user_defined_key_parts ({})",
+            fields.len(),
+            user_defined_key_parts
+        );
+
+        let mut reader = crate::utils::buff::StringReader::new(key);
+        let start = reader.current_pos();
+        reader.read(INDEX_NUMBER_SIZE)?;
+
+        let mut n_null_fields: u32 = 0;
+        for i in 0..user_defined_key_parts as usize {
+            match self.read_memcmp_key_part(&mut reader, i as u32, fields[i]) {
+                ReadKeyPart::Error => return None,
+                ReadKeyPart::Null => n_null_fields += 1,
+                ReadKeyPart::Ok => {}
+            }
+        }
+
+        let sk_memcmp_len = reader.current_pos() - start;
+        sk_buffer[..sk_memcmp_len].copy_from_slice(&key[start..start + sk_memcmp_len]);
+        Some((sk_memcmp_len, n_null_fields))
+    }
+
     /// Total byte length of a packed key under this descriptor — the
     /// `INDEX_NUMBER_SIZE` prefix plus each keypart's mem-comparable
     /// bytes. Returns `None` on truncation or skip_func failure.
@@ -1292,6 +1352,79 @@ mod tests {
         let kd = kd_with_pack_info(vec![with_info, without]);
         assert!(kd.has_unpack_info(0));
         assert!(!kd.has_unpack_info(1));
+    }
+
+    // ----- get_memcmp_sk_parts -----
+
+    #[test]
+    fn get_memcmp_sk_parts_strips_extended_pk_tail() {
+        // SK has 3 keyparts: 2 user-defined + 1 extended PK column.
+        let sk = sk_with_pk_extension(99, vec![None, None, Some(0)], 1);
+
+        // Input: SK_idx (4) + 2 SK cols (4 each) + 1 extended PK col (4) = 16.
+        let mut key = [0u8; 16];
+        key[..4].copy_from_slice(&99u32.to_be_bytes());
+        key[4..8].copy_from_slice(b"sk_0");
+        key[8..12].copy_from_slice(b"sk_1");
+        key[12..16].copy_from_slice(b"PKta"); // extended PK — must NOT appear in output
+
+        let mut buf = [0u8; 32];
+        let f = dummy_field();
+        let fields = [Some(&f), Some(&f), Some(&f)];
+
+        let (len, nulls) = sk
+            .get_memcmp_sk_parts(&key, 2, &mut buf, &fields)
+            .expect("ok");
+
+        // Output = SK_idx (4) + 2 SK cols (8) = 12 bytes; PK tail dropped.
+        assert_eq!(len, 12);
+        assert_eq!(nulls, 0);
+        assert_eq!(&buf[..4], &99u32.to_be_bytes());
+        assert_eq!(&buf[4..8], b"sk_0");
+        assert_eq!(&buf[8..12], b"sk_1");
+        // Trailing bytes in buf were not touched beyond `len`.
+        assert_eq!(&buf[12..16], &[0; 4]);
+    }
+
+    #[test]
+    fn get_memcmp_sk_parts_counts_null_fields() {
+        // 2 user-defined parts, both nullable; first stored as NULL,
+        // second as a value.
+        let sk = {
+            let mut k = sk_with_pk_extension(99, vec![None, None], 0);
+            k.pack_info[0].maybe_null = true;
+            k.pack_info[1].maybe_null = true;
+            k
+        };
+
+        // Layout: SK_idx (4) + null marker (1, = 0) + null marker (1, = 1) + value (4).
+        let mut key = vec![0u8; 4 + 1 + 1 + 4];
+        key[..4].copy_from_slice(&99u32.to_be_bytes());
+        key[4] = 0; // NULL
+        key[5] = 1; // value follows
+        key[6..10].copy_from_slice(b"v_v_");
+
+        let mut buf = [0u8; 32];
+        let f = dummy_field();
+        let fields = [Some(&f), Some(&f)];
+
+        let (len, nulls) = sk
+            .get_memcmp_sk_parts(&key, 2, &mut buf, &fields)
+            .expect("ok");
+        assert_eq!(len, 10);
+        assert_eq!(nulls, 1);
+    }
+
+    #[test]
+    fn get_memcmp_sk_parts_returns_none_on_truncated_input() {
+        let sk = sk_with_pk_extension(99, vec![None, None, Some(0)], 1);
+        let key = [0u8, 0, 0, 99, 1]; // index + only 1 byte of the first part
+        let mut buf = [0u8; 32];
+        let f = dummy_field();
+        assert_eq!(
+            sk.get_memcmp_sk_parts(&key, 2, &mut buf, &[Some(&f), Some(&f), Some(&f)]),
+            None
+        );
     }
 
     // ----- get_primary_key_tuple -----
