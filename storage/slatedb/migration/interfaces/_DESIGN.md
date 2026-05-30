@@ -500,26 +500,60 @@ concurrency-model and 2PC-protocol gaps.
    Confirm we limit to `aws` initially.
 7. **Compression codec.** `Settings.compression_codec` default. Lean: `zstd`
    (feature `zstd`). Confirm.
-8. **2PC implementation strategy.** *(rewritten after critique.)* SlateDB's
-   `flush_with_options(Wal)` does NOT make a `DbTransaction`'s buffered writes
-   durable — they live in-memory until commit. Two viable shapes:
-   - **(8a) Serialize-and-replay** *(recommended)*: `prepare` serializes the
-     txn's buffered writes into a `xa_prepare:<xid>` system-CF key (going
-     through the underlying `Db` and thus through the WAL with
+8. **2PC implementation strategy.** **RESOLVED 2026-05-29 → (8a)
+   serialize-and-replay with swappable marker encoding.**
+
+   SlateDB's `flush_with_options(Wal)` does NOT make a `DbTransaction`'s
+   buffered writes durable — they live in-memory until commit.
+   - **(8a) Serialize-and-replay** *(chosen)*: `prepare` serializes the
+     txn's buffered writes into a marker key (going through the
+     underlying `Db` and thus through the WAL with
      `await_durable=true`), then rolls back the in-memory txn. `commit`
      reads the marker, replays into a fresh txn, commits, deletes the
-     marker. Recovery scans `xa_prepare:*` on startup and awaits the
-     binlog coordinator's verdict per prepared xid.
-   - **(8b) Commit-and-undo**: `prepare` commits under a "prepared" flag;
-     `rollback` writes tombstones; `commit` flips the flag. Wrong recovery
-     semantic (prepared writes are visible to other readers between
-     `prepare` and `commit`), so DO NOT do this.
-   Concrete sub-questions for (8a): marker size limits (a 100 MB INSERT-batch
-   becomes a 100 MB single key — does SlateDB tolerate? cap txn size or
-   split marker across multiple keys?); recovery idempotency (crash
-   mid-replay must be safe to redo); replay durability ordering (the marker
-   write must be `await_durable=true` before binlog reports prepare
-   success).
+     marker. Recovery scans markers on startup and awaits the binlog
+     coordinator's verdict per prepared xid.
+   - **(8b) Commit-and-undo** *(rejected)*: `prepare` commits under a
+     "prepared" flag; `rollback` writes tombstones; `commit` flips the
+     flag. Wrong recovery semantic (prepared writes are visible to
+     other readers between `prepare` and `commit`).
+
+   **Swappable marker encoding requirement.** The TRANSLATE
+   implementation MUST factor the marker into two pieces:
+
+   ```
+   fn marker_key(xid) -> Bytes        // strategy-dependent (see below)
+   fn serialize_pending_ops(txn) -> Bytes  // strategy-independent
+   ```
+
+   Two strategies, selected at runtime by the binlog co-location flag:
+   - **Local mode** (Stage 0/1; binlog is NOT SlateDB):
+     `marker_key(xid) = b"xa_prepare:" || xid_bytes`.
+     `prepare()` writes `db.put(marker_key(xid), serialize_pending_ops(txn))`
+     with `await_durable=true`.
+   - **Combined mode** (Stage 3+; SlateDB-as-binlog co-located):
+     `marker_key` becomes a lookup into the binlog's `XA_PREPARE` chunk
+     position (`binlog_meta:xa:<xid> → (file_no, offset)` — see §14.7).
+     `prepare()` writes NOTHING of its own — the binlog's
+     `binlog_write_xa_prepare` chunk already contains the serialized
+     ops, written via the same SlateDB WAL fsync.
+
+   Cost in Stage 0/1: ~10 lines of indirection for the helper. Payoff
+   in Stage 3+: one fsync instead of two for XA prepare in co-located
+   deployments — the same convergence the InnoDB-as-binlog feature
+   demonstrates for InnoDB.
+
+   Sub-rulings for (8a):
+   - **Marker size cap**: split markers >4 MB across multiple keys
+     (`xa_prepare:<xid>:<chunk_no>` + header at chunk 0 with total count).
+     Matches SlateDB block-size sweetspot; avoids per-key memory pressure.
+   - **Recovery idempotency**: replay is allowed to be re-executed —
+     callers writing `merge` operands or counter ops through XA accept
+     "may be applied more than once" (matches MyRocks' MERGE-under-crash
+     behaviour). No per-marker progress tracking needed.
+   - **Durability ordering**: the marker write completes with
+     `await_durable=true` BEFORE `prepare()` returns to MariaDB.
+     Otherwise the binlog could record "prepared" for a txn that hasn't
+     reached object storage.
 9. **Concurrency model migration (post-critique).** See §5.2.
    **RESOLVED 2026-05-29 → option (A).** Embrace SSI; deprecate the
    lock sysvars; document the semantic shift in user docs and in the
@@ -694,7 +728,53 @@ Stage 2 user-XA design will need:
   prepare record).
 - A delete-on-commit for the marker via `binlog_unlog`.
 
-### 14.7 Open questions
+### 14.7 XA-prepare convergence with data-engine Q8 (Stage 3+)
+
+**Cross-reference to §11 Q8** (data-engine 2PC strategy, ruled →
+(8a) serialize-and-replay with **swappable marker encoding**).
+
+Q8's marker payload and §14's `XA_PREPARE` chunk payload are the same
+thing: "serialized buffered writes for a pending XID, durable in
+SlateDB's WAL." Today they live in different keyspaces because the
+data engine and binlog engine are designed to be independently
+deployable:
+
+| Stage | Data engine prepare-marker | Binlog XA_PREPARE chunk |
+|---|---|---|
+| 0 / 1 (SlateDB-as-data only) | `xa_prepare:<xid>` in data keyspace | n/a (no SlateDB binlog) |
+| 2 (SlateDB-as-data + SlateDB-as-binlog) | `xa_prepare:<xid>` in data keyspace | `binlog:<file>:<off>` with `ChunkType::XaPrepare` — **duplicate content** |
+| 3+ (combined-mode optimization) | reads from binlog's XA_PREPARE chunk via `binlog_meta:xa:<xid> → (file_no, offset)` lookup | unchanged (single source of truth) |
+
+The Q8 ruling mandates that the marker encoding be **swappable** —
+the helper `marker_key(xid)` is the only thing that changes between
+local mode (Stage 0/1/2) and combined mode (Stage 3+). The
+`serialize_pending_ops(txn)` payload helper is mode-independent.
+
+**Why Stage 2 stays in "duplicate content" mode rather than jumping
+straight to combined-mode:** the Stage 2 binlog itself is the
+first time `binlog_write_xa_prepare` is unstubbed (§14.6). Until
+that path has run in production, the data engine cannot safely
+rely on it for recovery. Stage 3+ is the cutover point once Stage
+2 is proven.
+
+**Why this design choice matters for engine perf:** in Stage 3+
+combined mode, an XA `prepare()` does one SlateDB WAL fsync
+covering BOTH the binlog's XA_PREPARE chunk AND the data engine's
+prepare marker (because they're the same write). Stage 0/1/2 do
+two fsyncs. This is the engine-side analog of the InnoDB-binlog
+"halve the fsyncs" result — applied to the XA prepare ceremony,
+not the normal commit path (which already benefits at Stage 2 via
+`binlog_group_commit_ordered`).
+
+**No INTERFACE changes needed.** Q8's `prepare()` body is
+`todo!()` and §14's `binlog_write_xa_prepare` is also `todo!()` /
+Stage 2 stub. The convergence happens inside those bodies at
+TRANSLATE; the public API is unaffected. This subsection exists
+to ensure the TRANSLATE author of either side knows the other side
+exists and knows that `marker_key` indirection is load-bearing
+for the eventual Stage 3+ optimization.
+
+### 14.8 Open questions
 
 1. **Concrete `BINLOG_OOB_TTL_SECS` default.** Tradeoff: too short and a
    slow-running large txn loses its OOB chunks; too long and a crash
