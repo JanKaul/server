@@ -483,23 +483,30 @@ Down from 12 to 8 in v2 because SlateDB removed several decisions;
 expanded to 10 after the interface-phase critique surfaced
 concurrency-model and 2PC-protocol gaps.
 
-1. **CF-id → key-prefix layout.** `varint(cf_id) || u32_be(index_id) || ...`
-   matches MyRocks and feeds cleanly into `PrefixExtractor`. Confirm.
-2. **CompactionFilter for dropped-index sweep.** Use SlateDB's
-   `CompactionFilter` (feature `compaction_filters`) — adds the feature flag
-   to Cargo.toml. Confirm we enable the feature.
-3. **TTL precision.** SlateDB's `Ttl::ExpireAfter(u64)` is seconds; `ExpireAt(i64)`
-   is unix epoch. MyRocks uses seconds. Match.
+1. **CF-id → key-prefix layout.** **RESOLVED 2026-05-29 →**
+   `varint(cf_id) || u32_be(index_id) || memcmp_key_bytes`. Matches MyRocks
+   bit-for-bit and feeds cleanly into SlateDB's `PrefixExtractor` (which
+   extracts the `varint(cf_id) || u32_be(index_id)` pair for per-index
+   bloom filtering).
+2. **CompactionFilter for dropped-index sweep.** **RESOLVED 2026-05-29 →
+   YES, enable.** Add `compaction_filters` to the SlateDB feature list
+   in `Cargo.toml`. Provides native `Drop`/`Modify` decisions during
+   compaction; no background scan thread needed.
+3. **TTL precision.** **RESOLVED 2026-05-29 → seconds** via
+   `Ttl::ExpireAfter(u64)` / `Ttl::ExpireAt(i64)`. Matches MyRocks.
 4. **Single-op txn vs direct `Db::put` at statement boundary** (see §6).
-   Lean: always-txn for uniformity. Confirm.
-5. **Block cache backend.** `foyer` (default in slatedb) vs `moka` (optional
-   feature). Lean: foyer. Confirm.
-6. **Object store backend(s) to enable.** Slatedb features: `aws` (default),
-   `azure`, `gcp`, `opendal`. For Stage 0 testing we use `InMemory` (no
-   feature) and `LocalFileSystem` (no feature). For prod we enable `aws`.
-   Confirm we limit to `aws` initially.
-7. **Compression codec.** `Settings.compression_codec` default. Lean: `zstd`
-   (feature `zstd`). Confirm.
+   **RESOLVED 2026-05-29 → always-txn** for uniformity. One code path;
+   `commit()` is the single conflict-error surface; per-op overhead is
+   negligible.
+5. **Block cache backend.** **RESOLVED 2026-05-29 →** `foyer` (SlateDB's
+   default; no extra feature flag).
+6. **Object store backend(s) to enable.** **RESOLVED 2026-05-29 →**
+   `aws` only for prod (Stage 0), plus `LocalFileSystem`/`InMemory` for
+   tests (both available without any cargo feature). Add `azure` / `gcp`
+   / `opendal` only when a deployment demands them.
+7. **Compression codec.** **RESOLVED 2026-05-29 →** `zstd` (feature
+   `zstd`). Best ratio of the four; lz4 alternative kept as a sysvar
+   knob for compression-CPU-bound workloads if needed later.
 8. **2PC implementation strategy.** **RESOLVED 2026-05-29 → (8a)
    serialize-and-replay with swappable marker encoding.**
 
