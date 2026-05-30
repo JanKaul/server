@@ -554,6 +554,92 @@ impl KeyDef {
         self.pack_info.iter().all(|fp| fp.unpack_func.is_some())
     }
 
+    /// Extract a mem-comparable Primary Key tuple from a row of this
+    /// **secondary** index. MyRocks uses "extended keys" — PK columns
+    /// are appended to every SK entry so an SK→PK lookup doesn't need
+    /// to re-encode the PK columns from scratch.
+    ///
+    /// Port of `rdb_datadic.cc:899..948`. The algorithm:
+    /// 1. Write `pk_descr.index_number` BE into the first 4 bytes of
+    ///    `pk_buffer`.
+    /// 2. Walk every keypart of `self` (the SK) via
+    ///    [`Self::read_memcmp_key_part`], capturing
+    ///    `(start_offset, end_offset)` for parts that are PK columns
+    ///    (per `self.pk_part_no[i] == Some(j)`).
+    /// 3. Concatenate the captured byte slices into `pk_buffer` *in
+    ///    PK-keypart order* — i.e. the slice captured at SK position `i`
+    ///    where `pk_part_no[i] == Some(j)` goes to PK position `j`,
+    ///    regardless of `i`.
+    /// 4. Return total bytes written (`INDEX_NUMBER_SIZE + sum(end-start)`).
+    ///
+    /// Returns `None` on read truncation or a `read_memcmp_key_part`
+    /// error. Caller is responsible for sizing `pk_buffer`.
+    ///
+    /// `fields` is one entry per **SK** keypart (length must equal
+    /// `self.key_parts`); pass `None` for the hidden-PK part (won't
+    /// appear in an SK, but the parameter shape stays uniform with
+    /// the other walkers).
+    pub fn get_primary_key_tuple(
+        &self,
+        pk_descr: &KeyDef,
+        key: &[u8],
+        pk_buffer: &mut [u8],
+        fields: &[Option<&crate::codec::value::FieldView>],
+    ) -> Option<usize> {
+        debug_assert_eq!(
+            self.index_type,
+            IndexType::Secondary,
+            "get_primary_key_tuple is only valid on a secondary index"
+        );
+        debug_assert_eq!(
+            fields.len(),
+            self.key_parts as usize,
+            "fields slice length must match self.key_parts"
+        );
+        debug_assert!(self.pk_key_parts > 0, "no PK columns to extract");
+        debug_assert_eq!(
+            self.pk_part_no.len(),
+            self.key_parts as usize,
+            "pk_part_no length must match key_parts"
+        );
+
+        let pk_parts = self.pk_key_parts as usize;
+        let mut starts: Vec<usize> = vec![0; pk_parts];
+        let mut ends: Vec<usize> = vec![0; pk_parts];
+
+        let mut reader = crate::utils::buff::StringReader::new(key);
+        reader.read(INDEX_NUMBER_SIZE)?;
+
+        for i in 0..self.key_parts as usize {
+            let pk_idx = self.pk_part_no[i];
+            if let Some(j) = pk_idx {
+                starts[j as usize] = reader.current_pos();
+            }
+            match self.read_memcmp_key_part(&mut reader, i as u32, fields[i]) {
+                ReadKeyPart::Error => return None,
+                ReadKeyPart::Ok | ReadKeyPart::Null => {}
+            }
+            if let Some(j) = pk_idx {
+                ends[j as usize] = reader.current_pos();
+            }
+        }
+
+        // Write the PK index_number prefix.
+        pk_buffer[..INDEX_NUMBER_SIZE]
+            .copy_from_slice(&pk_descr.index_number_storage_form);
+        let mut size = INDEX_NUMBER_SIZE;
+
+        // Concatenate captured PK part bytes in PK-keypart order.
+        for j in 0..pk_parts {
+            let part_size = ends[j] - starts[j];
+            pk_buffer[size..size + part_size]
+                .copy_from_slice(&key[starts[j]..ends[j]]);
+            size += part_size;
+        }
+
+        Some(size)
+    }
+
     /// Total byte length of a packed key under this descriptor — the
     /// `INDEX_NUMBER_SIZE` prefix plus each keypart's mem-comparable
     /// bytes. Returns `None` on truncation or skip_func failure.
@@ -1206,6 +1292,125 @@ mod tests {
         let kd = kd_with_pack_info(vec![with_info, without]);
         assert!(kd.has_unpack_info(0));
         assert!(!kd.has_unpack_info(1));
+    }
+
+    // ----- get_primary_key_tuple -----
+
+    fn sk_with_pk_extension(
+        sk_index_num: u32,
+        pk_part_no: Vec<Option<u32>>,
+        pk_key_parts: u32,
+    ) -> KeyDef {
+        let mut sk = KeyDef::new_skeleton(
+            sk_index_num,
+            7,
+            1,
+            INDEX_INFO_VERSION_LATEST as u16,
+            IndexType::Secondary,
+            SECONDARY_FORMAT_VERSION_LATEST,
+            false,
+            "sk",
+        );
+        sk.key_parts = pk_part_no.len() as u32;
+        sk.pk_part_no = pk_part_no;
+        sk.pk_key_parts = pk_key_parts;
+        // Every part uses the 4-byte skip helper.
+        sk.pack_info = (0..sk.key_parts)
+            .map(|_| {
+                let mut fp = crate::codec::field_pack::FieldPacking::default();
+                fp.skip_func = Some(dummy_skip_consume_4);
+                fp
+            })
+            .collect();
+        sk
+    }
+
+    #[test]
+    fn get_primary_key_tuple_single_pk_column_at_end_of_sk() {
+        let sk = sk_with_pk_extension(99, vec![None, Some(0)], 1);
+        let pk = forward_pk(42);
+
+        // Key layout: SK_idx (4) + SK col (4) + PK col (4) = 12 bytes.
+        let mut key = [0u8; 12];
+        key[..4].copy_from_slice(&99u32.to_be_bytes());
+        key[4..8].copy_from_slice(b"SKxx");
+        key[8..12].copy_from_slice(b"PKaa");
+
+        let mut buf = [0u8; 32];
+        let f = dummy_field();
+        let fields = [Some(&f), Some(&f)];
+        let n = sk
+            .get_primary_key_tuple(&pk, &key, &mut buf, &fields)
+            .expect("ok");
+
+        // Expected: PK_idx (4) + PK col (4) = 8 bytes.
+        assert_eq!(n, 8);
+        assert_eq!(&buf[..4], &42u32.to_be_bytes());
+        assert_eq!(&buf[4..8], b"PKaa");
+    }
+
+    #[test]
+    fn get_primary_key_tuple_reorders_pk_columns_by_pk_keypart_index() {
+        // Two-column PK extended into the SK at positions 1 and 2 in
+        // REVERSE PK order: pk_part_no[1] = Some(1), pk_part_no[2] = Some(0).
+        // Expected output places SK-position-2's bytes (PK kp 0) BEFORE
+        // SK-position-1's bytes (PK kp 1).
+        let sk = sk_with_pk_extension(
+            99,
+            vec![None, Some(1), Some(0), None],
+            2,
+        );
+        let pk = forward_pk(42);
+
+        // Key layout: SK_idx (4) + 4 cols * 4 bytes = 20 bytes.
+        let mut key = [0u8; 20];
+        key[..4].copy_from_slice(&99u32.to_be_bytes());
+        key[4..8].copy_from_slice(b"sk_0");
+        key[8..12].copy_from_slice(b"PKb1"); // pk_part_no[1] → PK keypart 1
+        key[12..16].copy_from_slice(b"PKa0"); // pk_part_no[2] → PK keypart 0
+        key[16..20].copy_from_slice(b"sk_3");
+
+        let mut buf = [0u8; 32];
+        let f = dummy_field();
+        let fields = [Some(&f), Some(&f), Some(&f), Some(&f)];
+        let n = sk
+            .get_primary_key_tuple(&pk, &key, &mut buf, &fields)
+            .expect("ok");
+
+        // PK_idx (4) + PK kp 0 (4) + PK kp 1 (4) = 12 bytes.
+        assert_eq!(n, 12);
+        assert_eq!(&buf[..4], &42u32.to_be_bytes());
+        // PK keypart 0 came from SK-position 2.
+        assert_eq!(&buf[4..8], b"PKa0");
+        // PK keypart 1 came from SK-position 1.
+        assert_eq!(&buf[8..12], b"PKb1");
+    }
+
+    #[test]
+    fn get_primary_key_tuple_returns_none_on_truncated_index_prefix() {
+        let sk = sk_with_pk_extension(99, vec![Some(0)], 1);
+        let pk = forward_pk(42);
+        let key = [0u8, 0]; // < 4 bytes
+        let mut buf = [0u8; 32];
+        let f = dummy_field();
+        assert_eq!(
+            sk.get_primary_key_tuple(&pk, &key, &mut buf, &[Some(&f)]),
+            None
+        );
+    }
+
+    #[test]
+    fn get_primary_key_tuple_returns_none_when_part_under_reads() {
+        let sk = sk_with_pk_extension(99, vec![None, Some(0)], 1);
+        let pk = forward_pk(42);
+        // SK_idx (4) + SK col (4) + only 2 bytes of PK col.
+        let key = [0u8, 0, 0, 99, 1, 2, 3, 4, 5, 6];
+        let mut buf = [0u8; 32];
+        let f = dummy_field();
+        assert_eq!(
+            sk.get_primary_key_tuple(&pk, &key, &mut buf, &[Some(&f), Some(&f)]),
+            None
+        );
     }
 
     // ----- key_length -----
