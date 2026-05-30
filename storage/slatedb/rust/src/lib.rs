@@ -3,6 +3,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 pub mod bridge;
+pub mod engine;
 pub mod error;
 pub mod globals;
 pub mod task;
