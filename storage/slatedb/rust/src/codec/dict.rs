@@ -177,6 +177,50 @@ pub mod autoinc {
     }
 }
 
+// ----- shared suffix codec for GlIndexId-keyed registries -----
+
+const GL_INDEX_SUFFIX_LEN: usize = 8;
+
+fn encode_gl_index_suffix(gl: crate::globals::GlIndexId) -> [u8; GL_INDEX_SUFFIX_LEN] {
+    let mut out = [0u8; GL_INDEX_SUFFIX_LEN];
+    out[..4].copy_from_slice(&gl.cf_id.to_be_bytes());
+    out[4..].copy_from_slice(&gl.index_id.to_be_bytes());
+    out
+}
+
+fn decode_gl_index_suffix(bytes: &[u8]) -> Result<crate::globals::GlIndexId, Error> {
+    if bytes.len() != GL_INDEX_SUFFIX_LEN {
+        return Err(Error::data(format!(
+            "gl-index dict suffix: expected {GL_INDEX_SUFFIX_LEN} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut cf = [0u8; 4];
+    let mut ix = [0u8; 4];
+    cf.copy_from_slice(&bytes[..4]);
+    ix.copy_from_slice(&bytes[4..]);
+    Ok(crate::globals::GlIndexId {
+        cf_id: u32::from_be_bytes(cf),
+        index_id: u32::from_be_bytes(ix),
+    })
+}
+
+/// Generic GlIndexId marker-set walker. Used by [`dropped_indexes`] and
+/// [`ddl_create_index_ongoing`] which share the same shape: one marker
+/// row per (cf_id, index_id) at a chosen `DataDictType`.
+async fn list_gl_index_marker_set(
+    db: &Db,
+    record_type: DataDictType,
+) -> Result<Vec<crate::globals::GlIndexId>, Error> {
+    let prefix = system_record_prefix(record_type);
+    let mut it = scan(db, record_type).await?;
+    let mut out = Vec::new();
+    while let Some(kv) = it.next().await? {
+        out.push(decode_gl_index_suffix(&kv.key[prefix.len()..])?);
+    }
+    Ok(out)
+}
+
 /// Dropped-index registry.
 ///
 /// One marker row per pending-drop index at
@@ -185,59 +229,144 @@ pub mod autoinc {
 /// presence is the marker. The compaction filter walks this registry to
 /// decide which `(cf_id, index_id)` prefixes to sweep.
 pub mod dropped_indexes {
-    use super::{delete, put, scan, system_record_prefix, DataDictType};
+    use super::{
+        delete, encode_gl_index_suffix, list_gl_index_marker_set, put, DataDictType,
+    };
     use crate::globals::GlIndexId;
     use slatedb::{Db, Error};
-
-    const SUFFIX_LEN: usize = 8;
-
-    fn encode_suffix(gl: GlIndexId) -> [u8; SUFFIX_LEN] {
-        let mut out = [0u8; SUFFIX_LEN];
-        out[..4].copy_from_slice(&gl.cf_id.to_be_bytes());
-        out[4..].copy_from_slice(&gl.index_id.to_be_bytes());
-        out
-    }
-
-    fn decode_suffix(bytes: &[u8]) -> Result<GlIndexId, Error> {
-        if bytes.len() != SUFFIX_LEN {
-            return Err(Error::data(format!(
-                "dropped-index suffix: expected {SUFFIX_LEN} bytes, got {}",
-                bytes.len()
-            )));
-        }
-        let mut cf = [0u8; 4];
-        let mut ix = [0u8; 4];
-        cf.copy_from_slice(&bytes[..4]);
-        ix.copy_from_slice(&bytes[4..]);
-        Ok(GlIndexId {
-            cf_id: u32::from_be_bytes(cf),
-            index_id: u32::from_be_bytes(ix),
-        })
-    }
 
     /// Add a single index to the dropped-index registry. Idempotent — adding
     /// an already-marked index is a no-op write of the same empty value.
     pub async fn add(db: &Db, gl: GlIndexId) -> Result<(), Error> {
-        put(db, DataDictType::DdlDropIndexOngoing, &encode_suffix(gl), &[]).await
+        put(
+            db,
+            DataDictType::DdlDropIndexOngoing,
+            &encode_gl_index_suffix(gl),
+            &[],
+        )
+        .await
     }
 
     /// Remove a single index. Idempotent — removing a missing index is a
     /// SlateDB-level tombstone write that's a no-op on the visible state.
     pub async fn remove(db: &Db, gl: GlIndexId) -> Result<(), Error> {
-        delete(db, DataDictType::DdlDropIndexOngoing, &encode_suffix(gl)).await
+        delete(
+            db,
+            DataDictType::DdlDropIndexOngoing,
+            &encode_gl_index_suffix(gl),
+        )
+        .await
     }
 
     /// Snapshot the dropped-index registry. Returns rows in
     /// byte-lexicographic order of `(cf_id, index_id)`.
     pub async fn list(db: &Db) -> Result<Vec<GlIndexId>, Error> {
-        let prefix = system_record_prefix(DataDictType::DdlDropIndexOngoing);
-        let mut it = scan(db, DataDictType::DdlDropIndexOngoing).await?;
-        let mut out = Vec::new();
-        while let Some(kv) = it.next().await? {
-            let suffix = &kv.key[prefix.len()..];
-            out.push(decode_suffix(suffix)?);
+        list_gl_index_marker_set(db, DataDictType::DdlDropIndexOngoing).await
+    }
+}
+
+/// In-progress index-create registry.
+///
+/// Symmetric counterpart to [`dropped_indexes`]: one marker row per index
+/// whose CREATE INDEX is mid-flight, at `DataDictType::DdlCreateIndexOngoing`.
+/// Same suffix encoding as dropped_indexes (8-byte `u32_be(cf_id)||u32_be(index_id)`),
+/// empty value. Crash recovery walks this set to decide whether to roll
+/// the in-progress creation forward (commit) or back (drop the partial
+/// keyspace).
+pub mod ddl_create_index_ongoing {
+    use super::{
+        delete, encode_gl_index_suffix, list_gl_index_marker_set, put, DataDictType,
+    };
+    use crate::globals::GlIndexId;
+    use slatedb::{Db, Error};
+
+    pub async fn add(db: &Db, gl: GlIndexId) -> Result<(), Error> {
+        put(
+            db,
+            DataDictType::DdlCreateIndexOngoing,
+            &encode_gl_index_suffix(gl),
+            &[],
+        )
+        .await
+    }
+
+    pub async fn remove(db: &Db, gl: GlIndexId) -> Result<(), Error> {
+        delete(
+            db,
+            DataDictType::DdlCreateIndexOngoing,
+            &encode_gl_index_suffix(gl),
+        )
+        .await
+    }
+
+    pub async fn list(db: &Db) -> Result<Vec<GlIndexId>, Error> {
+        list_gl_index_marker_set(db, DataDictType::DdlCreateIndexOngoing).await
+    }
+}
+
+/// Monotonic index-id allocator anchor.
+///
+/// Singleton row at `DataDictType::MaxIndexId` (empty suffix). Value is a
+/// 4-byte big-endian `u32` — the highest index id ever allocated. The
+/// allocator pattern (read, bump, write) is owner-side; this substrate
+/// just exposes get/put on the singleton.
+pub mod max_index_id {
+    use super::{delete, get, put, DataDictType};
+    use slatedb::{Db, Error};
+
+    fn encode(value: u32) -> [u8; 4] {
+        value.to_be_bytes()
+    }
+
+    fn decode(bytes: &[u8]) -> Result<u32, Error> {
+        if bytes.len() != 4 {
+            return Err(Error::data(format!(
+                "max_index_id value: expected 4 bytes, got {}",
+                bytes.len()
+            )));
         }
-        Ok(out)
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(bytes);
+        Ok(u32::from_be_bytes(buf))
+    }
+
+    pub async fn read(db: &Db) -> Result<Option<u32>, Error> {
+        match get(db, DataDictType::MaxIndexId, &[]).await? {
+            Some(bytes) => Ok(Some(decode(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn write(db: &Db, value: u32) -> Result<(), Error> {
+        put(db, DataDictType::MaxIndexId, &[], &encode(value)).await
+    }
+
+    pub async fn remove(db: &Db) -> Result<(), Error> {
+        delete(db, DataDictType::MaxIndexId, &[]).await
+    }
+}
+
+/// Binlog position singleton.
+///
+/// One row at `DataDictType::BinlogInfoIndexNumber` (empty suffix) whose
+/// opaque value is the serialised `(file_name, pos, gtid)` triple. The
+/// binlog manager (when translated) defines the serialisation; this
+/// substrate just reads / writes raw bytes.
+pub mod binlog_info {
+    use super::{delete, get, put, DataDictType};
+    use bytes::Bytes;
+    use slatedb::{Db, Error};
+
+    pub async fn read(db: &Db) -> Result<Option<Bytes>, Error> {
+        get(db, DataDictType::BinlogInfoIndexNumber, &[]).await
+    }
+
+    pub async fn write(db: &Db, value: &[u8]) -> Result<(), Error> {
+        put(db, DataDictType::BinlogInfoIndexNumber, &[], value).await
+    }
+
+    pub async fn clear(db: &Db) -> Result<(), Error> {
+        delete(db, DataDictType::BinlogInfoIndexNumber, &[]).await
     }
 }
 
@@ -479,6 +608,139 @@ mod tests {
 
         let listed = dropped_indexes::list(engine.db()).await.expect("list");
         assert_eq!(listed, vec![gl]);
+
+        engine.close().await.expect("close");
+    }
+
+    // ----- ddl_create_index_ongoing -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn create_index_ongoing_does_not_collide_with_drop() {
+        let engine = EngineDb::open_in_memory("create_ongoing_iso")
+            .await
+            .expect("open");
+
+        let gl = crate::globals::GlIndexId {
+            cf_id: 1,
+            index_id: 42,
+        };
+
+        // Add to BOTH registries with the same gl_index_id — they live at
+        // different DataDictType prefixes and must not bleed across.
+        dropped_indexes::add(engine.db(), gl).await.expect("drop add");
+        ddl_create_index_ongoing::add(engine.db(), gl)
+            .await
+            .expect("create add");
+
+        assert_eq!(
+            dropped_indexes::list(engine.db()).await.expect("drop list"),
+            vec![gl]
+        );
+        assert_eq!(
+            ddl_create_index_ongoing::list(engine.db())
+                .await
+                .expect("create list"),
+            vec![gl]
+        );
+
+        // Removing one leaves the other intact.
+        ddl_create_index_ongoing::remove(engine.db(), gl)
+            .await
+            .expect("create remove");
+        assert!(ddl_create_index_ongoing::list(engine.db())
+            .await
+            .expect("create list 2")
+            .is_empty());
+        assert_eq!(
+            dropped_indexes::list(engine.db()).await.expect("drop list 2"),
+            vec![gl]
+        );
+
+        engine.close().await.expect("close");
+    }
+
+    // ----- max_index_id -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_index_id_round_trip() {
+        let engine = EngineDb::open_in_memory("max_idx_rt")
+            .await
+            .expect("open");
+
+        assert_eq!(max_index_id::read(engine.db()).await.expect("read"), None);
+        max_index_id::write(engine.db(), 1)
+            .await
+            .expect("write 1");
+        assert_eq!(
+            max_index_id::read(engine.db()).await.expect("read"),
+            Some(1)
+        );
+        max_index_id::write(engine.db(), 12345)
+            .await
+            .expect("write bump");
+        assert_eq!(
+            max_index_id::read(engine.db()).await.expect("read"),
+            Some(12345)
+        );
+        max_index_id::remove(engine.db())
+            .await
+            .expect("remove");
+        assert_eq!(max_index_id::read(engine.db()).await.expect("read"), None);
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn max_index_id_corrupt_value_is_data_error() {
+        let engine = EngineDb::open_in_memory("max_idx_corrupt")
+            .await
+            .expect("open");
+        // Bypass the typed writer with a 3-byte payload.
+        put(engine.db(), DataDictType::MaxIndexId, &[], b"abc")
+            .await
+            .expect("put");
+        let err = max_index_id::read(engine.db()).await.unwrap_err();
+        assert!(matches!(err.kind(), slatedb::ErrorKind::Data));
+        engine.close().await.expect("close");
+    }
+
+    // ----- binlog_info -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binlog_info_round_trip_and_clear() {
+        let engine = EngineDb::open_in_memory("binlog_info_rt")
+            .await
+            .expect("open");
+
+        assert!(binlog_info::read(engine.db())
+            .await
+            .expect("read")
+            .is_none());
+
+        binlog_info::write(engine.db(), b"mariadb-bin.000001\x00\x00\x00pos:42")
+            .await
+            .expect("write");
+        let got = binlog_info::read(engine.db())
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(&got[..], b"mariadb-bin.000001\x00\x00\x00pos:42");
+
+        // Overwrite with a different payload.
+        binlog_info::write(engine.db(), b"new-bin-position")
+            .await
+            .expect("rewrite");
+        let got = binlog_info::read(engine.db())
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(&got[..], b"new-bin-position");
+
+        binlog_info::clear(engine.db()).await.expect("clear");
+        assert!(binlog_info::read(engine.db())
+            .await
+            .expect("read")
+            .is_none());
 
         engine.close().await.expect("close");
     }
