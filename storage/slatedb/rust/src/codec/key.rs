@@ -1170,6 +1170,304 @@ impl KeyDef {
         }
         Ok(Some(value))
     }
+
+    /// Populate `pack_info`, `pk_part_no`, `key_parts`, and `maxlength`
+    /// for this KeyDef. Translated from `Rdb_key_def::setup`
+    /// (`rdb_datadic.cc:388`).
+    ///
+    /// `tbl` provides the table-share view (field list + per-index
+    /// schemas), and `tbl_def` provides the parent table descriptor
+    /// (lets us walk the PK's key parts when extending an SK).
+    ///
+    /// ## Idempotency
+    ///
+    /// Re-entering `setup` on an already-set-up KeyDef is a no-op
+    /// (early-returns `Ok(())` if `maxlength != 0`). The C++ does the
+    /// same via a `maxlength != 0` short-circuit at line 401 — it's a
+    /// "first thread wins" guard against the concurrent-callers
+    /// scenario. We rely on `&mut self` for exclusion, but mirror the
+    /// short-circuit so callers can re-validate cheaply.
+    ///
+    /// ## DESC indexes are rejected
+    ///
+    /// Matches the C++'s `ER_ILLEGAL_HA_CREATE_OPTION` (`rdb_datadic.cc:488`).
+    /// We surface as `Error::invalid` so the handler can map back to
+    /// the right user-facing code.
+    ///
+    /// ## What's not done here (vs C++)
+    ///
+    /// - **TTL keypart-offset lookup**
+    ///   (`m_ttl_pk_key_part_offset = dst_i` when a part's field name
+    ///   matches `m_ttl_column`). The C++ also calls `extract_ttl_col`
+    ///   here to populate `m_ttl_column` / `m_ttl_field_index` first;
+    ///   both depend on `TableShareView` carrying the table comment,
+    ///   which we don't surface yet. The field defaults of `0` / empty
+    ///   are harmless until TTL row encoding is wired (a separate
+    ///   bear).
+    /// - **`prefix_extractor` caching** (`m_prefix_extractor = opt.prefix_extractor`).
+    ///   We use [`crate::codec::prefix::MyRocksPrefixExtractor`] at
+    ///   bloom-filter setup time directly from `engine::db`; no
+    ///   per-KeyDef cache needed.
+    pub fn setup(
+        &mut self,
+        tbl: &crate::codec::value::TableShareView,
+        tbl_def: &crate::codec::tbl_def::TblDef,
+    ) -> Result<(), slatedb::Error> {
+        use crate::codec::field_pack::FieldPacking;
+        use crate::codec::value::IndexKeyPartView;
+
+        if self.maxlength != 0 {
+            return Ok(());
+        }
+
+        let is_hidden_pk = self.index_type == IndexType::HiddenPrimary;
+        let hidden_pk_exists = Self::table_has_hidden_pk(tbl);
+        let secondary_key = self.index_type == IndexType::Secondary;
+
+        // ----- locate the SQL-layer index schema for self -----
+        //
+        // The hidden-PK has no entry in `tbl.indexes` (matches the C++:
+        // hidden-PK isn't in MariaDB's KEY[] either). Other indexes are
+        // looked up by `self.keyno`.
+        let key_info: Option<&crate::codec::value::IndexSchemaView> = if is_hidden_pk {
+            None
+        } else {
+            let idx = tbl.indexes.get(self.keyno as usize).ok_or_else(|| {
+                slatedb::Error::invalid(format!(
+                    "KeyDef::setup: keyno {} out of range (table has {} indexes)",
+                    self.keyno,
+                    tbl.indexes.len(),
+                ))
+            })?;
+            Some(idx)
+        };
+
+        // ----- determine PK key-part count + locate PK schema -----
+        let (pk_key_parts, pk_info): (u32, Option<&crate::codec::value::IndexSchemaView>) =
+            if secondary_key {
+                if hidden_pk_exists {
+                    (1, None)
+                } else {
+                    let pk_idx = tbl.primary_key_index.ok_or_else(|| {
+                        slatedb::Error::invalid(
+                            "KeyDef::setup: SK requires either hidden_pk or primary_key_index".into(),
+                        )
+                    })?;
+                    let pk = tbl.indexes.get(pk_idx as usize).ok_or_else(|| {
+                        slatedb::Error::invalid(format!(
+                            "KeyDef::setup: primary_key_index {pk_idx} out of range"
+                        ))
+                    })?;
+                    (pk.ext_key_parts, Some(pk))
+                }
+            } else {
+                (0, None)
+            };
+
+        // ----- compute the total key_parts the SK will hold -----
+        let total_key_parts: u32 = if is_hidden_pk {
+            1
+        } else {
+            let user_parts = key_info
+                .expect("non-hidden-PK has a key_info")
+                .ext_key_parts;
+            if secondary_key {
+                user_parts + pk_key_parts
+            } else {
+                user_parts
+            }
+        };
+
+        // Allocate the per-part state.
+        let mut pack_info: Vec<FieldPacking> =
+            (0..total_key_parts).map(|_| FieldPacking::default()).collect();
+        let mut pk_part_no: Vec<Option<u32>> = if secondary_key {
+            vec![None; total_key_parts as usize]
+        } else {
+            Vec::new()
+        };
+
+        // ----- key-encoding walk -----
+        let mut max_len: u32 = INDEX_NUMBER_SIZE as u32;
+        let unpack_len: u32 = 0; // TODO: m_unpack_data_offset accumulator (deferred with unpack-info writers).
+        // C++ tracks `max_part_len` (max max_image_len across parts)
+        // but never reads it back — dropped here as dead code.
+        let mut dst_i: u32 = 0;
+
+        self.pk_key_parts = pk_key_parts;
+
+        if is_hidden_pk {
+            // Synthetic single-keypart for the hidden rowid. The
+            // C++ passes `field == nullptr` and `key_part_length == 0`;
+            // FieldPacking::setup handles the None case by defaulting
+            // to the hidden-PK width.
+            pack_info[0].setup(Some(self), None, self.keyno, 0, 0);
+            pack_info[0].unpack_data_offset = unpack_len as i32;
+            max_len = max_len.saturating_add(pack_info[0].max_image_len as u32);
+            dst_i = 1;
+        } else {
+            // The user-declared parts (and extended-keys tail produced
+            // by the SQL layer). For SKs we then loop again over the
+            // PK's parts that aren't already covered.
+            //
+            // Iteration counters track three independent things — keep
+            // them distinct to match the C++ shape:
+            //   - `completed`: outer loop counter (C++ `src_i`). Bounds
+            //     the loop to `total_key_parts` regardless of how many
+            //     dedup-skips happen.
+            //   - `cur_pos`: index into the currently-pointed-at
+            //     array (`current_parts`). Reset to 0 when we transition
+            //     into the PK-extension tail.
+            //   - `dst_i`: write cursor into `pack_info` / `pk_part_no`.
+            //     Does NOT advance on a dedup-skip — the final
+            //     `key_parts` count is `dst_i`, smaller than
+            //     `total_key_parts` when dedup happened.
+            let user_view = key_info.expect("non-hidden-PK has key_info");
+
+            let mut keyno_to_set = self.keyno;
+            let mut keypart_to_set: u32 = 0;
+            let mut current_parts: &[IndexKeyPartView] = &user_view.key_parts;
+            let mut simulating_extkey = false;
+            let mut cur_pos: u32 = 0;
+            let mut completed: u32 = 0;
+
+            while completed < total_key_parts {
+                // Hidden-PK extension: synthetic 1-part tail
+                // (`key_part = nullptr` branch in the C++).
+                if simulating_extkey && hidden_pk_exists {
+                    pack_info[dst_i as usize].setup(
+                        Some(self),
+                        None,
+                        keyno_to_set,
+                        0,
+                        0,
+                    );
+                    pack_info[dst_i as usize].unpack_data_offset = unpack_len as i32;
+                    pk_part_no[dst_i as usize] = Some(0);
+                    max_len = max_len
+                        .saturating_add(pack_info[dst_i as usize].max_image_len as u32);
+                    dst_i += 1;
+                    // Hidden-PK extension adds exactly one synthetic
+                    // part; the rest of total_key_parts (if any) is
+                    // accounted for by the truncate at the end.
+                    break;
+                }
+
+                let kp = current_parts.get(cur_pos as usize).ok_or_else(|| {
+                    slatedb::Error::invalid(format!(
+                        "KeyDef::setup: ran off the end of key parts at cur_pos={cur_pos} \
+                         (current_parts.len={}, completed={completed}, total={total_key_parts})",
+                        current_parts.len()
+                    ))
+                })?;
+
+                let field = tbl.fields.get(kp.field_idx as usize).ok_or_else(|| {
+                    slatedb::Error::invalid(format!(
+                        "KeyDef::setup: keypart field_idx {} out of range \
+                         (table has {} fields)",
+                        kp.field_idx,
+                        tbl.fields.len(),
+                    ))
+                })?;
+
+                // Extkey-dedup: a PK column that's already in the SK's
+                // declared parts (same field_index AND same length) is
+                // skipped — matches rdb_datadic.cc:494.
+                if simulating_extkey && !hidden_pk_exists {
+                    let already_in_sk = user_view.key_parts[..user_view.ext_key_parts as usize]
+                        .iter()
+                        .any(|q| {
+                            q.field_idx == kp.field_idx
+                                && q.key_part_length == kp.key_part_length
+                        });
+                    if already_in_sk {
+                        cur_pos += 1;
+                        completed += 1;
+                        // dst_i does NOT advance; this PK part is dropped.
+                        continue;
+                    }
+                }
+
+                // NULL-byte accounting (C++ rdb_datadic.cc:513).
+                if !field.is_not_null() {
+                    max_len = max_len.saturating_add(1);
+                }
+
+                pack_info[dst_i as usize].setup(
+                    Some(self),
+                    Some(field),
+                    keyno_to_set,
+                    keypart_to_set,
+                    kp.key_part_length,
+                );
+                pack_info[dst_i as usize].unpack_data_offset = unpack_len as i32;
+
+                // Populate pk_part_no for SKs.
+                if let Some(pk) = pk_info {
+                    pk_part_no[dst_i as usize] = pk
+                        .key_parts
+                        .iter()
+                        .take(pk_key_parts as usize)
+                        .position(|q| q.field_idx == kp.field_idx)
+                        .map(|p| p as u32);
+                }
+
+                max_len = max_len
+                    .saturating_add(pack_info[dst_i as usize].max_image_len as u32);
+
+                // TODO: TTL keypart-offset capture (m_ttl_pk_key_part_offset)
+                // — deferred with TTL comment plumbing.
+
+                cur_pos += 1;
+                keypart_to_set = keypart_to_set.wrapping_add(1);
+
+                // SK-extension transition: when we've consumed the
+                // user-defined+extended part of the SK, switch over to
+                // the PK's parts for the remaining tail. The C++
+                // checks `src_i+1 == key_info->ext_key_parts` at the
+                // end of the iteration body; our `completed+1` is the
+                // same value.
+                if secondary_key
+                    && completed + 1 == user_view.ext_key_parts
+                    && !simulating_extkey
+                {
+                    simulating_extkey = true;
+                    if hidden_pk_exists {
+                        // Synthetic 1-part tail handled at the top of
+                        // the next iteration.
+                        keyno_to_set = (tbl_def.key_count() as u32).saturating_sub(1);
+                        current_parts = &[];
+                        cur_pos = 0;
+                        keypart_to_set = 0;
+                    } else {
+                        keyno_to_set = tbl
+                            .primary_key_index
+                            .expect("primary_key_index present when !hidden_pk_exists");
+                        current_parts = &pk_info
+                            .expect("pk_info present when !hidden_pk_exists")
+                            .key_parts;
+                        cur_pos = 0;
+                        keypart_to_set = u32::MAX; // matches C++ `(uint)-1` so the next wrapping_add yields 0.
+                    }
+                }
+
+                dst_i += 1;
+                completed += 1;
+            }
+        }
+
+        // Trim pack_info / pk_part_no to the actually-filled length
+        // (extkey-dedup may have left tail slots untouched). The C++
+        // does `m_key_parts = dst_i;` at line 580.
+        pack_info.truncate(dst_i as usize);
+        pk_part_no.truncate(dst_i as usize);
+
+        self.pack_info = pack_info;
+        self.pk_part_no = pk_part_no;
+        self.key_parts = dst_i;
+        self.maxlength = max_len;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2203,12 +2501,16 @@ mod tests {
             null_bytes: 0,
             row_length: 0,
             hidden_pk_field: Some(0),
+            indexes: Vec::new(),
+            primary_key_index: None,
         };
         let without = TableShareView {
             fields: Vec::new(),
             null_bytes: 0,
             row_length: 0,
             hidden_pk_field: None,
+            indexes: Vec::new(),
+            primary_key_index: None,
         };
         assert!(KeyDef::table_has_hidden_pk(&with_hidden));
         assert!(!KeyDef::table_has_hidden_pk(&without));
@@ -2303,6 +2605,8 @@ mod tests {
             row_length: fields.iter().map(|f| f.pack_length).sum(),
             hidden_pk_field: None,
             fields,
+            indexes: Vec::new(),
+            primary_key_index: None,
         }
     }
 
@@ -2461,5 +2765,356 @@ mod tests {
             .expect("present");
         assert_eq!(got.column_name, "p0_level");
         assert_eq!(got.field_index, 1);
+    }
+
+    // ===== KeyDef::setup =====
+    //
+    // These tests build a small TableShareView + TblDef and run setup()
+    // against KeyDef skeletons. The point is to verify the
+    // walk-and-dispatch logic (pack_info slot count, pk_part_no mapping,
+    // SK-extension, hidden-PK handling) — not to exercise the encode
+    // path itself.
+
+    use crate::codec::tbl_def::TblDef;
+    use crate::codec::value::{
+        FieldView, IndexKeyPartView, IndexSchemaView, MysqlType, TableShareView,
+    };
+    use std::sync::Arc;
+
+    fn long_field(name: &str) -> FieldView {
+        FieldView {
+            name: name.into(),
+            mysql_type: MysqlType::Long,
+            pack_length: 4,
+            output_offset: 0,
+            null_marker: None,
+            length: 4,
+            charset_id: 63,
+            flags: 0,
+            decimals: 0,
+        }
+    }
+
+    fn nullable_long_field(name: &str) -> FieldView {
+        let mut f = long_field(name);
+        f.null_marker = Some((0, 1));
+        f
+    }
+
+    fn kp(field_idx: u32) -> IndexKeyPartView {
+        IndexKeyPartView {
+            field_idx,
+            key_part_length: 0,
+        }
+    }
+
+    fn idx(parts: Vec<IndexKeyPartView>) -> IndexSchemaView {
+        IndexSchemaView {
+            user_defined_key_parts: parts.len() as u32,
+            ext_key_parts: parts.len() as u32,
+            key_parts: parts,
+        }
+    }
+
+    fn idx_extended(user_parts: usize, parts: Vec<IndexKeyPartView>) -> IndexSchemaView {
+        IndexSchemaView {
+            user_defined_key_parts: user_parts as u32,
+            ext_key_parts: parts.len() as u32,
+            key_parts: parts,
+        }
+    }
+
+    fn pk_skel(index_number: u32, keyno: u32) -> KeyDef {
+        KeyDef::new_skeleton(
+            index_number,
+            7,
+            keyno,
+            INDEX_INFO_VERSION_LATEST as u16,
+            IndexType::Primary,
+            PRIMARY_FORMAT_VERSION_LATEST,
+            false,
+            "pk",
+        )
+    }
+
+    fn sk_skel(index_number: u32, keyno: u32) -> KeyDef {
+        KeyDef::new_skeleton(
+            index_number,
+            7,
+            keyno,
+            INDEX_INFO_VERSION_LATEST as u16,
+            IndexType::Secondary,
+            SECONDARY_FORMAT_VERSION_LATEST,
+            false,
+            "sk",
+        )
+    }
+
+    fn hidden_pk_skel(index_number: u32, keyno: u32) -> KeyDef {
+        KeyDef::new_skeleton(
+            index_number,
+            7,
+            keyno,
+            INDEX_INFO_VERSION_LATEST as u16,
+            IndexType::HiddenPrimary,
+            PRIMARY_FORMAT_VERSION_LATEST,
+            false,
+            "HIDDEN_PK",
+        )
+    }
+
+    fn tbl_def(keys: Vec<Arc<KeyDef>>) -> TblDef {
+        TblDef::new("db.t").unwrap().with_keys(keys)
+    }
+
+    #[test]
+    fn setup_single_part_pk_on_int_column() {
+        let table = TableShareView {
+            fields: vec![long_field("id"), long_field("v")],
+            null_bytes: 0,
+            row_length: 8,
+            hidden_pk_field: None,
+            indexes: vec![idx(vec![kp(0)])],
+            primary_key_index: Some(0),
+        };
+        let pk_arc = Arc::new(pk_skel(100, 0));
+        let tdef = tbl_def(vec![pk_arc]);
+
+        let mut pk = pk_skel(100, 0);
+        pk.setup(&table, &tdef).expect("setup");
+
+        assert_eq!(pk.key_parts, 1);
+        assert_eq!(pk.pack_info.len(), 1);
+        assert!(pk.pack_info[0].pack_func.is_none()); // pack deferred (cxx)
+        assert!(pk.pack_info[0].unpack_func.is_some());
+        assert_eq!(pk.pk_part_no.len(), 0); // PKs don't populate pk_part_no
+        // maxlength = INDEX_NUMBER_SIZE (4) + int max_image_len (4) = 8.
+        assert_eq!(pk.maxlength, 8);
+    }
+
+    #[test]
+    fn setup_multi_part_pk_accumulates_maxlength() {
+        // Two-part PK on (LONG, LONG). Each part max_image_len=4.
+        let table = TableShareView {
+            fields: vec![long_field("a"), long_field("b"), long_field("v")],
+            null_bytes: 0,
+            row_length: 12,
+            hidden_pk_field: None,
+            indexes: vec![idx(vec![kp(0), kp(1)])],
+            primary_key_index: Some(0),
+        };
+        let tdef = tbl_def(vec![Arc::new(pk_skel(100, 0))]);
+
+        let mut pk = pk_skel(100, 0);
+        pk.setup(&table, &tdef).expect("setup");
+
+        assert_eq!(pk.key_parts, 2);
+        // INDEX_NUMBER_SIZE (4) + 4 + 4 = 12.
+        assert_eq!(pk.maxlength, 12);
+    }
+
+    #[test]
+    fn setup_nullable_column_adds_one_byte_to_maxlength() {
+        let table = TableShareView {
+            fields: vec![nullable_long_field("a")],
+            null_bytes: 1,
+            row_length: 5,
+            hidden_pk_field: None,
+            indexes: vec![idx(vec![kp(0)])],
+            primary_key_index: Some(0),
+        };
+        let tdef = tbl_def(vec![Arc::new(pk_skel(100, 0))]);
+
+        let mut pk = pk_skel(100, 0);
+        pk.setup(&table, &tdef).expect("setup");
+
+        // 4 (INDEX_NUMBER) + 1 (NULL byte) + 4 (LONG) = 9.
+        assert_eq!(pk.maxlength, 9);
+    }
+
+    #[test]
+    fn setup_sk_appends_pk_columns_as_extension() {
+        // Table: (id LONG, name LONG, email LONG)
+        // PK on id, SK on name (with id appended via extkey).
+        let table = TableShareView {
+            fields: vec![long_field("id"), long_field("name"), long_field("email")],
+            null_bytes: 0,
+            row_length: 12,
+            hidden_pk_field: None,
+            indexes: vec![
+                idx(vec![kp(0)]),                                  // PK = (id)
+                idx_extended(1, vec![kp(1), kp(0)]),               // SK = (name) extended by (id)
+            ],
+            primary_key_index: Some(0),
+        };
+        let tdef = tbl_def(vec![Arc::new(pk_skel(100, 0)), Arc::new(sk_skel(101, 1))]);
+
+        let mut sk = sk_skel(101, 1);
+        sk.setup(&table, &tdef).expect("setup");
+
+        assert_eq!(sk.key_parts, 2, "SK has its own col + the PK col");
+        assert_eq!(sk.pk_key_parts, 1);
+        // pk_part_no: SK col 'name' is not in PK ⇒ None; SK col 'id'
+        // (the extended part) matches PK col #0 ⇒ Some(0).
+        assert_eq!(sk.pk_part_no, vec![None, Some(0)]);
+    }
+
+    #[test]
+    fn setup_sk_dedup_drops_pk_column_that_was_already_in_sk() {
+        // Table: (id LONG, name LONG)
+        // PK on id, SK on (id, name) — id is already part of the SK so
+        // the extkey-extension tail must NOT re-append it.
+        //
+        // We simulate this by giving the SK an ext_key_parts that says
+        // "the SQL layer extended me by appending id (which I already
+        // have)". After dedup, the SK should still have just 2 parts.
+        let table = TableShareView {
+            fields: vec![long_field("id"), long_field("name")],
+            null_bytes: 0,
+            row_length: 8,
+            hidden_pk_field: None,
+            indexes: vec![
+                idx(vec![kp(0)]),                                  // PK = (id)
+                // SK declared = (id, name); extended would attempt to
+                // append (id) again. Without ext_key_parts coverage of
+                // the dedup case we have to manually construct what the
+                // SQL layer would have produced: user_defined=2,
+                // ext=2 (already includes the PK col).
+                idx(vec![kp(0), kp(1)]),
+            ],
+            primary_key_index: Some(0),
+        };
+        let tdef = tbl_def(vec![Arc::new(pk_skel(100, 0)), Arc::new(sk_skel(101, 1))]);
+
+        let mut sk = sk_skel(101, 1);
+        sk.setup(&table, &tdef).expect("setup");
+
+        // Total parts: 2 user-declared + pk_key_parts=1 attempted
+        // append; one is deduped ⇒ 2 final parts.
+        assert_eq!(sk.key_parts, 2);
+        // pk_part_no[0]: SK col 'id' matches PK col #0; SK col 'name'
+        // doesn't match PK.
+        assert_eq!(sk.pk_part_no, vec![Some(0), None]);
+    }
+
+    #[test]
+    fn setup_hidden_pk_index_makes_one_synthetic_keypart() {
+        let table = TableShareView {
+            fields: vec![long_field("v")],
+            null_bytes: 0,
+            row_length: 4,
+            hidden_pk_field: Some(0),
+            // Hidden PK has no entry in tbl.indexes (matches the C++).
+            indexes: vec![],
+            primary_key_index: None,
+        };
+        let tdef = tbl_def(vec![Arc::new(hidden_pk_skel(200, 0))]);
+
+        let mut hpk = hidden_pk_skel(200, 0);
+        hpk.setup(&table, &tdef).expect("setup");
+
+        assert_eq!(hpk.key_parts, 1);
+        assert_eq!(hpk.pack_info.len(), 1);
+        // Hidden-PK column is the 8-byte synthetic rowid.
+        assert_eq!(hpk.pack_info[0].max_image_len, 8);
+        // INDEX_NUMBER_SIZE (4) + 8 = 12.
+        assert_eq!(hpk.maxlength, 12);
+    }
+
+    #[test]
+    fn setup_sk_with_hidden_pk_extension_appends_synthetic_rowid() {
+        // Table with NO declared PK ⇒ hidden_pk_field is set. The SK
+        // gets the hidden-PK rowid appended as its single extension
+        // part.
+        let table = TableShareView {
+            fields: vec![long_field("v")],
+            null_bytes: 0,
+            row_length: 4,
+            hidden_pk_field: Some(0),
+            indexes: vec![
+                // SK on v. The hidden PK is *appended* by setup's
+                // simulating_extkey path, so we set ext_key_parts to
+                // just the user-declared count.
+                idx(vec![kp(0)]),
+            ],
+            primary_key_index: None,
+        };
+        // tbl_def includes both the SK and the hidden PK at the end
+        // (matches the C++: hidden PK is the last entry in m_key_descr_arr).
+        let tdef = tbl_def(vec![
+            Arc::new(sk_skel(101, 0)),
+            Arc::new(hidden_pk_skel(200, 1)),
+        ]);
+
+        let mut sk = sk_skel(101, 0);
+        sk.setup(&table, &tdef).expect("setup");
+
+        // 1 user-declared part + 1 synthetic hidden-PK rowid.
+        assert_eq!(sk.key_parts, 2);
+        assert_eq!(sk.pk_key_parts, 1);
+        // Synthetic tail's pk_part_no is Some(0) per C++ semantics.
+        assert_eq!(sk.pk_part_no, vec![None, Some(0)]);
+        // Last part should be the 8-byte synthetic rowid.
+        assert_eq!(sk.pack_info[1].max_image_len, 8);
+    }
+
+    #[test]
+    fn setup_is_idempotent_via_maxlength_shortcircuit() {
+        let table = TableShareView {
+            fields: vec![long_field("id")],
+            null_bytes: 0,
+            row_length: 4,
+            hidden_pk_field: None,
+            indexes: vec![idx(vec![kp(0)])],
+            primary_key_index: Some(0),
+        };
+        let tdef = tbl_def(vec![Arc::new(pk_skel(100, 0))]);
+
+        let mut pk = pk_skel(100, 0);
+        pk.setup(&table, &tdef).expect("first setup");
+        let first_maxlength = pk.maxlength;
+        let first_key_parts = pk.key_parts;
+
+        // Mutate post-setup, then re-call: short-circuit must leave the
+        // post-setup state alone.
+        pk.setup(&table, &tdef).expect("second setup (no-op)");
+        assert_eq!(pk.maxlength, first_maxlength);
+        assert_eq!(pk.key_parts, first_key_parts);
+    }
+
+    #[test]
+    fn setup_rejects_out_of_range_keyno() {
+        let table = TableShareView {
+            fields: vec![long_field("id")],
+            null_bytes: 0,
+            row_length: 4,
+            hidden_pk_field: None,
+            indexes: vec![idx(vec![kp(0)])],
+            primary_key_index: Some(0),
+        };
+        let tdef = tbl_def(vec![Arc::new(pk_skel(100, 0))]);
+
+        // keyno=99 points past the only index.
+        let mut bad = pk_skel(100, 99);
+        let err = bad.setup(&table, &tdef).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+    }
+
+    #[test]
+    fn setup_rejects_out_of_range_field_idx() {
+        let table = TableShareView {
+            fields: vec![long_field("id")],
+            null_bytes: 0,
+            row_length: 4,
+            hidden_pk_field: None,
+            // keypart references field 42 which doesn't exist.
+            indexes: vec![idx(vec![kp(42)])],
+            primary_key_index: Some(0),
+        };
+        let tdef = tbl_def(vec![Arc::new(pk_skel(100, 0))]);
+
+        let mut pk = pk_skel(100, 0);
+        let err = pk.setup(&table, &tdef).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
     }
 }

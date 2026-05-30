@@ -139,11 +139,43 @@ impl FieldView {
     }
 }
 
+/// One keypart of one index. POD across the cxx boundary.
+///
+/// `field_idx` mirrors MariaDB's `KEY_PART_INFO::field->field_index`.
+/// `key_part_length` mirrors `KEY_PART_INFO::length` — the byte length
+/// of this keypart's mem-comparable image. `0` means "use the field's
+/// full pack_length"; non-zero means a prefix index
+/// (`KEY(name(20))` ⇒ `key_part_length = 20`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexKeyPartView {
+    pub field_idx: u32,
+    pub key_part_length: u16,
+}
+
+/// One index's schema. POD across the cxx boundary.
+///
+/// Covers the metadata the codec needs from MariaDB's `KEY` struct
+/// (`include/my_base.h` + `sql/sql_class.h`) without leaking the C++
+/// type. The corresponding [`crate::codec::key::KeyDef`] is built from
+/// this view via `KeyDef::setup`.
+#[derive(Debug, Clone)]
+pub struct IndexSchemaView {
+    /// Number of user-declared key parts — what `CREATE INDEX` listed.
+    /// Doesn't include the extended-keys tail.
+    pub user_defined_key_parts: u32,
+    /// Total key parts including the extended-keys tail (PK columns
+    /// appended by the SQL layer for non-unique SKs).
+    /// `key_parts.len() == ext_key_parts as usize`.
+    pub ext_key_parts: u32,
+    /// All key parts in order, length `== ext_key_parts`.
+    pub key_parts: Vec<IndexKeyPartView>,
+}
+
 /// Per-table layout descriptor. POD across the cxx boundary.
 ///
-/// Holds the field list and the row-layout constants the codec needs.
-/// Keys are described by separate per-index types (KeyDef → FieldPacking)
-/// landed in later batches.
+/// Holds the field list, row-layout constants, and the per-index
+/// schema views the codec needs to build [`crate::codec::key::KeyDef`]
+/// instances.
 #[derive(Debug, Clone)]
 pub struct TableShareView {
     pub fields: Vec<FieldView>,
@@ -155,6 +187,15 @@ pub struct TableShareView {
     /// Index into `fields` of the column whose `output_offset` is the
     /// hidden-PK rowid, or `None` if the table declares an explicit PK.
     pub hidden_pk_field: Option<u32>,
+    /// Per-index schemas in the same order they appear in MariaDB's
+    /// `TABLE_SHARE::key_info[]`. The `keynr` field on each
+    /// [`crate::codec::key::KeyDef`] is the index into this `Vec`.
+    pub indexes: Vec<IndexSchemaView>,
+    /// `Some(i)` ⇒ `indexes[i]` is the declared PRIMARY KEY. `None`
+    /// ⇒ the table uses a hidden-PK index (which is appended at the
+    /// end of `indexes` and identified by `IndexType::HiddenPrimary`
+    /// on its KeyDef).
+    pub primary_key_index: Option<u32>,
 }
 
 impl TableShareView {
@@ -262,6 +303,8 @@ mod tests {
             null_bytes: 1,
             row_length: 17,
             hidden_pk_field: None,
+            indexes: Vec::new(),
+            primary_key_index: None,
         };
         assert_eq!(t.nullable_field_count(), 2);
     }
@@ -273,6 +316,8 @@ mod tests {
             null_bytes: 0,
             row_length: 4,
             hidden_pk_field: None,
+            indexes: Vec::new(),
+            primary_key_index: None,
         };
         let buf = t.new_row_buffer();
         assert_eq!(buf.len(), 4);
