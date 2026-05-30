@@ -56,6 +56,27 @@ pub const CF_NUMBER_SIZE: usize = 4;
 pub const CF_FLAG_SIZE: usize = 4;
 pub const PACKED_SIZE: usize = 4;
 
+// ---------- unpack-info / checksum format (rdb_datadic.h:162..194) ----------
+
+/// Two CRC32 checksums (key + value) live at the tail of the unpack_info
+/// blob when the index uses the checksum-trailer format.
+pub const RDB_CHECKSUM_SIZE: usize = 4;
+/// Wire size of the trailer: `tag(1) || crc32_key(4) || crc32_value(4)`.
+pub const RDB_CHECKSUM_CHUNK_SIZE: usize = 2 * RDB_CHECKSUM_SIZE + 1;
+pub const RDB_CHECKSUM_DATA_TAG: u8 = 0x01;
+
+/// `tag(1) || u16_be(total_skip_length_incl_header)`.
+pub const RDB_UNPACK_DATA_TAG: u8 = 0x02;
+const RDB_UNPACK_DATA_LEN_SIZE: usize = 2;
+pub const RDB_UNPACK_HEADER_SIZE: usize = 1 + RDB_UNPACK_DATA_LEN_SIZE;
+
+/// `tag(1) || u16_be(total_skip_length_incl_header) || u16_be(covered_bitmap)`.
+pub const RDB_UNPACK_COVERED_DATA_TAG: u8 = 0x03;
+const RDB_UNPACK_COVERED_DATA_LEN_SIZE: usize = 2;
+const RDB_COVERED_BITMAP_SIZE: usize = 2;
+pub const RDB_UNPACK_COVERED_HEADER_SIZE: usize =
+    1 + RDB_UNPACK_COVERED_DATA_LEN_SIZE + RDB_COVERED_BITMAP_SIZE;
+
 // ---------- CF bit-flags persisted in the data dictionary (rdb_datadic.h:477) ----------
 
 pub const REVERSE_CF_FLAG: u32 = 1;
@@ -440,7 +461,62 @@ impl KeyDef {
 
     /// `RDB_UNPACK_DATA_TAG (0x02)` or `RDB_UNPACK_COVERED_DATA_TAG (0x03)`.
     pub fn is_unpack_data_tag(c: u8) -> bool {
-        c == 0x02 || c == 0x03
+        c == RDB_UNPACK_DATA_TAG || c == RDB_UNPACK_COVERED_DATA_TAG
+    }
+
+    /// Header byte length for an unpack-info blob keyed by its leading tag.
+    /// `Some(3)` for `RDB_UNPACK_DATA_TAG`, `Some(5)` for
+    /// `RDB_UNPACK_COVERED_DATA_TAG`, `None` for anything else (callers
+    /// must have established `is_unpack_data_tag` first — `None` then
+    /// signals corruption).
+    pub fn get_unpack_header_size(tag: u8) -> Option<usize> {
+        match tag {
+            RDB_UNPACK_DATA_TAG => Some(RDB_UNPACK_HEADER_SIZE),
+            RDB_UNPACK_COVERED_DATA_TAG => Some(RDB_UNPACK_COVERED_HEADER_SIZE),
+            _ => None,
+        }
+    }
+
+    /// True iff the unpack_info blob carries a CRC32 checksum trailer.
+    ///
+    /// Algorithm (rdb_datadic.cc:1032..1049):
+    /// 1. Empty → false.
+    /// 2. If the leading byte is an unpack-data tag AND the buffer is
+    ///    long enough to contain that tag's header, read the
+    ///    u16-big-endian total-skip-length at `[1..3]` and skip those
+    ///    bytes. (The C++ `SHIP_ASSERT`s that `len >= skip_len`; we
+    ///    conservatively return `false` on malformed lengths rather
+    ///    than panic, since this function is queried at read time on
+    ///    bytes from the store.)
+    /// 3. Remaining must be exactly `RDB_CHECKSUM_CHUNK_SIZE` (9) bytes
+    ///    leading with `RDB_CHECKSUM_DATA_TAG (0x01)`.
+    pub fn unpack_info_has_checksum(unpack_info: &[u8]) -> bool {
+        let mut remaining: &[u8] = unpack_info;
+        if remaining.is_empty() {
+            return false;
+        }
+        if Self::is_unpack_data_tag(remaining[0]) {
+            if let Some(hdr_size) = Self::get_unpack_header_size(remaining[0]) {
+                if remaining.len() >= hdr_size {
+                    let skip_len =
+                        u16::from_be_bytes([remaining[1], remaining[2]]) as usize;
+                    if remaining.len() < skip_len {
+                        return false;
+                    }
+                    remaining = &remaining[skip_len..];
+                }
+            }
+        }
+        remaining.len() == RDB_CHECKSUM_CHUNK_SIZE
+            && remaining[0] == RDB_CHECKSUM_DATA_TAG
+    }
+
+    /// True iff `table` has no explicit primary key (uses a hidden rowid).
+    /// In MyRocks: `table->s->primary_key == MAX_KEY`. In our world:
+    /// the `TableShareView.hidden_pk_field` slot is populated for the
+    /// hidden rowid column.
+    pub fn table_has_hidden_pk(table: &crate::codec::value::TableShareView) -> bool {
+        table.hidden_pk_field.is_some()
     }
 
     // ----- qualifier formatters (table-comment helpers) -----
@@ -812,6 +888,92 @@ mod tests {
         assert!(KeyDef::is_unpack_data_tag(0x03));
         assert!(!KeyDef::is_unpack_data_tag(0x01));
         assert!(!KeyDef::is_unpack_data_tag(0xff));
+    }
+
+    #[test]
+    fn unpack_header_sizes_match_constants() {
+        assert_eq!(
+            KeyDef::get_unpack_header_size(RDB_UNPACK_DATA_TAG),
+            Some(3)
+        );
+        assert_eq!(
+            KeyDef::get_unpack_header_size(RDB_UNPACK_COVERED_DATA_TAG),
+            Some(5)
+        );
+        assert!(KeyDef::get_unpack_header_size(RDB_CHECKSUM_DATA_TAG).is_none());
+        assert!(KeyDef::get_unpack_header_size(0xff).is_none());
+    }
+
+    #[test]
+    fn unpack_info_has_checksum_empty_is_false() {
+        assert!(!KeyDef::unpack_info_has_checksum(&[]));
+    }
+
+    #[test]
+    fn unpack_info_has_checksum_pure_checksum_chunk_is_true() {
+        // Just the 9-byte checksum chunk, no preceding unpack-data header.
+        let mut chunk = [0u8; RDB_CHECKSUM_CHUNK_SIZE];
+        chunk[0] = RDB_CHECKSUM_DATA_TAG;
+        assert!(KeyDef::unpack_info_has_checksum(&chunk));
+    }
+
+    #[test]
+    fn unpack_info_has_checksum_after_unpack_data_header_is_true() {
+        // Format: unpack tag (1) + u16_be skip_len (2) + payload, then
+        // checksum-chunk (9). Total skip_len = header(3) + payload(2) = 5.
+        let mut buf = vec![0u8; 5 + RDB_CHECKSUM_CHUNK_SIZE];
+        buf[0] = RDB_UNPACK_DATA_TAG;
+        buf[1..3].copy_from_slice(&5u16.to_be_bytes()); // total skip incl. header
+        // payload bytes 3..5 are anything; defaults zero.
+        buf[5] = RDB_CHECKSUM_DATA_TAG;
+        // rest of checksum chunk is zero bytes; doesn't matter for the predicate.
+        assert!(KeyDef::unpack_info_has_checksum(&buf));
+    }
+
+    #[test]
+    fn unpack_info_has_checksum_no_trailer_is_false() {
+        // Unpack-data header + payload but no checksum chunk.
+        let mut buf = vec![0u8; 8];
+        buf[0] = RDB_UNPACK_DATA_TAG;
+        buf[1..3].copy_from_slice(&8u16.to_be_bytes()); // skip entire buffer
+        assert!(!KeyDef::unpack_info_has_checksum(&buf));
+    }
+
+    #[test]
+    fn unpack_info_has_checksum_malformed_skip_len_is_false() {
+        // skip_len says "skip past end of buffer" — corruption; conservative
+        // answer is no-checksum.
+        let mut buf = vec![0u8; 4];
+        buf[0] = RDB_UNPACK_DATA_TAG;
+        buf[1..3].copy_from_slice(&99u16.to_be_bytes());
+        assert!(!KeyDef::unpack_info_has_checksum(&buf));
+    }
+
+    #[test]
+    fn unpack_info_has_checksum_wrong_leading_byte_after_skip_is_false() {
+        // Looks like a checksum chunk in length but the tag byte is wrong.
+        let mut chunk = [0u8; RDB_CHECKSUM_CHUNK_SIZE];
+        chunk[0] = 0xfe;
+        assert!(!KeyDef::unpack_info_has_checksum(&chunk));
+    }
+
+    #[test]
+    fn table_has_hidden_pk_reads_the_field_slot() {
+        use crate::codec::value::TableShareView;
+        let with_hidden = TableShareView {
+            fields: Vec::new(),
+            null_bytes: 0,
+            row_length: 0,
+            hidden_pk_field: Some(0),
+        };
+        let without = TableShareView {
+            fields: Vec::new(),
+            null_bytes: 0,
+            row_length: 0,
+            hidden_pk_field: None,
+        };
+        assert!(KeyDef::table_has_hidden_pk(&with_hidden));
+        assert!(!KeyDef::table_has_hidden_pk(&without));
     }
 
     #[test]
