@@ -1,11 +1,17 @@
 //! Per-CF options parsing.
 //!
-//! Translated from `storage/rocksdb/rdb_cf_options.{h,cc}`. Per
-//! `_DESIGN.md §1`, SlateDB has one global block cache / filter policy /
-//! compression codec; per-CF tuning knobs from MyRocks are accepted by the
-//! parser for backwards compatibility but recorded as `silently_ignored` and
-//! discarded. Only `comparator` (forward/reverse) and `ttl_duration` are
-//! actually consumed.
+//! **Current status:** SlateDB 0.13 has no per-CF tuning surface, so the
+//! parsed `CfOptionsSnapshot`s built here are largely advisory. Only
+//! `comparator` (forward/reverse, consumed at index encode time) and
+//! `ttl_duration` (consumed at write time via `PutOptions::ttl` once that
+//! path lands) actually affect runtime behaviour today; everything else
+//! is recorded in `silently_ignored` for audit.
+//!
+//! **Why the shape exists anyway:** users migrating from MyRocks set the
+//! `rocksdb_default_cf_options` / `rocksdb_override_cf_options` sysvars
+//! and we must accept the grammar without erroring. If SlateDB adds
+//! per-CF tuning in the future, the per-CF map already built here is
+//! the natural place to feed into the SlateDB CF API.
 //!
 //! The override-map parser preserves the MyRocks grammar:
 //! `cf_name1={key=val;…};cf_name2={key=val;…}` with brace-balanced inner

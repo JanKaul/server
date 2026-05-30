@@ -1,22 +1,36 @@
 //! CF (column family) → key-prefix mapper.
 //!
-//! Per `_DESIGN.md §1` SlateDB has exactly one physical CF. Our MyRocks-side
-//! notion of a CF is the `cf_id` byte prefix prepended to every key.
+//! **Current status:** SlateDB 0.13 has no notion of column families, so the
+//! engine runs in a degenerate single-CF mode: `cf_id = 0` for all user
+//! data, `cf_id = u32::MAX` for system metadata, no name registry needed.
+//! Per `_DESIGN.md §1 + §2` the CF concept maps to a `varint(cf_id)` byte
+//! prefix on every key.
 //!
-//! This module lands the **in-memory subset** of the manager:
-//! - [`CfHandle`] — `(cf_id, direction)` replacement for the C++
-//!   `ColumnFamilyHandle*`.
-//! - [`CfManager`] — `name ↔ id` maps and `next_cf_id` allocator.
-//! - [`CfManager::parse_direction`] — the legacy MyRocks `rev:` /
-//!   `$per_index_cf$rev` name prefix detector.
-//! - In-memory `get_*` lookups.
+//! **Why the manager shape exists anyway:** SlateDB has discussed adding
+//! column families post-1.0. If/when that lands, the engine grows real
+//! CF resources — creation goes through a SlateDB API call, the registry
+//! caches handles, and lookups become useful. We preserve the shape now
+//! so handler code can take `CfHandle` and call
+//! [`CfManager::get_cf_by_name`] / [`get_cf_by_id`](CfManager::get_cf_by_id)
+//! today without rewrites later. The in-memory state already matches what
+//! a cached registry would hold.
 //!
-//! Persistence (`load_from_system_cf`, `get_or_create_cf` persistence,
-//! `drop_cf` tombstone) is deferred until the system-CF read/write helper
-//! lands — those routines need to scan the `SYSTEM_CF_ID` prefix and write
-//! `cf_name → cf_id` rows back through a `WriteBatch`. Until that batch
-//! ships, the in-memory bits stand alone for unit testing the manager's
-//! bookkeeping logic.
+//! What lives here today:
+//! - [`CfHandle`] — `(cf_id, direction)` newtype. Used at every site that
+//!   identifies a CF.
+//! - [`CfManager`] — in-memory `name ↔ id` maps + `next_cf_id` allocator.
+//!   Today the default CF is pre-seeded and nothing else is registered.
+//! - [`CfManager::parse_direction`] — recognises the legacy MyRocks
+//!   `rev:` / `$per_index_cf$rev` name prefixes used to flag reverse-
+//!   encoded indexes in pre-existing dumps.
+//!
+//! What's stubbed today:
+//! - [`load_from_system_cf`](CfManager::load_from_system_cf),
+//!   [`get_or_create_cf`](CfManager::get_or_create_cf), and
+//!   [`drop_cf`](CfManager::drop_cf) all return `Err(Internal)` and will
+//!   route to the SlateDB CF API once it exists. They are deliberately
+//!   *not* shimmed via system-CF rows — that would build a code path that
+//!   gets thrown away the moment SlateDB ships real CFs.
 
 use parking_lot::RwLock;
 use slatedb::Error;
@@ -112,26 +126,26 @@ impl CfManager {
         self.inner.read().next_cf_id
     }
 
-    // ----- in-memory installer used by tests and (later) the persistence
-    // load path. Kept crate-public so the system-CF loader can repopulate
-    // the map from disk without going through `get_or_create_cf`.
+    // ----- in-memory registrar -----
+    //
+    // Adds a single CF to the in-memory registry. Today this is used by
+    // the unit tests; when SlateDB ships CF support, the per-open load
+    // path will call it for each CF the underlying engine reports.
 
-    // Allowed dead_code: the system-CF loader will call this once landed;
-    // until then only the tests exercise it.
     #[allow(dead_code)]
-    pub(crate) fn install(&self, name: &str, handle: CfHandle) -> Result<(), Error> {
+    pub(crate) fn register(&self, name: &str, handle: CfHandle) -> Result<(), Error> {
         if name == DEFAULT_SYSTEM_CF_NAME || handle.id == SYSTEM_CF_ID {
             return Err(Error::invalid("system CF name/id is reserved".into()));
         }
         let mut g = self.inner.write();
         if g.name_to_handle.contains_key(name) {
             return Err(Error::invalid(format!(
-                "cf '{name}' already installed"
+                "cf '{name}' already registered"
             )));
         }
         if g.id_to_name.contains_key(&handle.id) {
             return Err(Error::invalid(format!(
-                "cf id {} already installed",
+                "cf id {} already registered",
                 handle.id
             )));
         }
@@ -143,20 +157,20 @@ impl CfManager {
         Ok(())
     }
 
-    // ----- persistence-bound routines (system-CF helper not yet landed) -----
+    // ----- CF lifecycle (waits on upstream SlateDB CF support) -----
+    //
+    // These return `Err(Internal)` today. When SlateDB adds CF support
+    // they will route to the SlateDB API — NOT to system-CF row writes,
+    // which would be a throwaway implementation.
 
-    /// Re-populate the maps from the system CF prefix at startup.
-    pub async fn load_from_system_cf(&self) -> Result<(), Error> {
-        // TRANSLATE-DEFER: needs the system-CF read helper. Will scan
-        // `varint(SYSTEM_CF_ID) || u32_be(CF_DEFINITION) || …` rows and
-        // call `install()` for each surviving CF.
+    /// Re-populate the registry from the underlying engine at open time.
+    pub async fn load_from_engine(&self) -> Result<(), Error> {
         Err(Error::internal(
-            "CfManager::load_from_system_cf: system-CF helper not landed".into(),
+            "CfManager::load_from_engine: waits on SlateDB CF support".into(),
         ))
     }
 
-    /// Look up by name, or allocate a fresh `cf_id`. Persists the mapping
-    /// in the system CF.
+    /// Look up by name, or create a fresh CF.
     pub async fn get_or_create_cf(
         &self,
         cf_name: Option<&str>,
@@ -168,20 +182,15 @@ impl CfManager {
         if let Some(h) = self.get_cf_by_name(name) {
             return Ok(h);
         }
-        // TRANSLATE-DEFER: needs the system-CF write helper. Body will:
-        //   1. allocate next_cf_id under the inner write lock,
-        //   2. write `cf_name → handle` to the system CF prefix,
-        //   3. call self.install(name, handle).
         Err(Error::internal(
-            "CfManager::get_or_create_cf: system-CF helper not landed".into(),
+            "CfManager::get_or_create_cf: waits on SlateDB CF support".into(),
         ))
     }
 
-    /// Soft-drop a CF (writes a tombstone in the system CF).
+    /// Drop a CF.
     pub async fn drop_cf(&self, _cf_name: &str) -> Result<(), Error> {
-        // TRANSLATE-DEFER: needs the system-CF write helper.
         Err(Error::internal(
-            "CfManager::drop_cf: system-CF helper not landed".into(),
+            "CfManager::drop_cf: waits on SlateDB CF support".into(),
         ))
     }
 }
@@ -219,16 +228,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn install_records_both_directions_and_bumps_next_id() {
-        let (engine, mgr) = fresh_manager("cf_install").await;
-        mgr.install(
+    async fn register_records_both_directions_and_bumps_next_id() {
+        let (engine, mgr) = fresh_manager("cf_register").await;
+        mgr.register(
             "user_cf",
             CfHandle {
                 id: 5,
                 direction: KeyDirection::Reverse,
             },
         )
-        .expect("install");
+        .expect("register");
         assert_eq!(mgr.get_cf_by_name("user_cf").map(|h| h.id), Some(5));
         assert_eq!(
             mgr.get_cf_by_id(5).map(|h| h.direction),
@@ -239,19 +248,19 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn install_rejects_duplicates_and_system_ids() {
+    async fn register_rejects_duplicates_and_system_ids() {
         let (engine, mgr) = fresh_manager("cf_dup").await;
-        mgr.install(
+        mgr.register(
             "first",
             CfHandle {
                 id: 1,
                 direction: KeyDirection::Forward,
             },
         )
-        .expect("install");
+        .expect("register");
         // Duplicate name:
         assert!(mgr
-            .install(
+            .register(
                 "first",
                 CfHandle {
                     id: 99,
@@ -261,7 +270,7 @@ mod tests {
             .is_err());
         // Duplicate id:
         assert!(mgr
-            .install(
+            .register(
                 "second",
                 CfHandle {
                     id: 1,
@@ -271,7 +280,7 @@ mod tests {
             .is_err());
         // System id reserved:
         assert!(mgr
-            .install(
+            .register(
                 "third",
                 CfHandle {
                     id: SYSTEM_CF_ID,
@@ -281,7 +290,7 @@ mod tests {
             .is_err());
         // System name reserved:
         assert!(mgr
-            .install(
+            .register(
                 DEFAULT_SYSTEM_CF_NAME,
                 CfHandle {
                     id: 7,
@@ -293,12 +302,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn deferred_persistence_methods_surface_a_clear_error() {
+    async fn lifecycle_methods_surface_a_clear_error_until_slatedb_cf_support() {
         let (engine, mgr) = fresh_manager("cf_deferred").await;
-        assert!(mgr.load_from_system_cf().await.is_err());
+        assert!(mgr.load_from_engine().await.is_err());
         assert!(mgr.get_or_create_cf(Some("brand_new")).await.is_err());
         assert!(mgr.drop_cf("brand_new").await.is_err());
-        // Pre-existing default CF still resolves without touching persistence:
+        // Pre-existing default CF still resolves without hitting the engine:
         assert!(mgr.get_or_create_cf(Some(DEFAULT_CF_NAME)).await.is_ok());
         engine.close().await.expect("close");
     }
