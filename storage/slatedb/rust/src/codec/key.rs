@@ -519,6 +519,33 @@ impl KeyDef {
         table.hidden_pk_field.is_some()
     }
 
+    /// True iff key-part `kp` can be unpacked from its mem-comparable
+    /// image. Delegates to `pack_info[kp].unpack_func.is_some()`; when
+    /// `false`, the field type doesn't round-trip without help from the
+    /// row-side payload (e.g. some lossy collations) and index-only reads
+    /// for queries that touch this part have to fall back to a PK lookup.
+    pub fn can_unpack(&self, kp: u32) -> bool {
+        debug_assert!(
+            (kp as usize) < self.pack_info.len(),
+            "can_unpack: kp {} >= pack_info.len {}",
+            kp,
+            self.pack_info.len()
+        );
+        self.pack_info[kp as usize].unpack_func.is_some()
+    }
+
+    /// True iff key-part `kp` needs unpack_info sidechannel bytes to
+    /// decode. Delegates to `pack_info[kp].uses_unpack_info()`.
+    pub fn has_unpack_info(&self, kp: u32) -> bool {
+        debug_assert!(
+            (kp as usize) < self.pack_info.len(),
+            "has_unpack_info: kp {} >= pack_info.len {}",
+            kp,
+            self.pack_info.len()
+        );
+        self.pack_info[kp as usize].uses_unpack_info()
+    }
+
     /// Write `flag`'s payload bytes at the position
     /// [`calculate_index_flag_offset`] computes within an already-allocated
     /// portion of `buf`. Companion to that lookup.
@@ -1001,6 +1028,90 @@ mod tests {
         let mut chunk = [0u8; RDB_CHECKSUM_CHUNK_SIZE];
         chunk[0] = 0xfe;
         assert!(!KeyDef::unpack_info_has_checksum(&chunk));
+    }
+
+    // ----- can_unpack / has_unpack_info (FieldPacking delegation) -----
+
+    fn dummy_unpack(
+        _fpi: &mut crate::codec::field_pack::FieldPacking,
+        _field: &mut crate::codec::value::FieldView,
+        _field_ptr: &mut [u8],
+        _reader: &mut crate::utils::buff::StringReader,
+        _unpack_reader: Option<&mut crate::utils::buff::StringReader>,
+    ) -> i32 {
+        0
+    }
+
+    fn dummy_make_unpack(
+        _codec: &crate::codec::field_pack::CollationCodec,
+        _field: &crate::codec::value::FieldView,
+        _ctx: &mut crate::codec::field_pack::PackFieldContext<'_>,
+    ) {
+    }
+
+    fn kd_with_pack_info(parts: Vec<crate::codec::field_pack::FieldPacking>) -> KeyDef {
+        let mut kd = forward_pk(1);
+        kd.key_parts = parts.len() as u32;
+        kd.pack_info = parts;
+        kd
+    }
+
+    #[test]
+    fn can_unpack_reports_per_keypart_dispatch_slot() {
+        let mut with_unpack = crate::codec::field_pack::FieldPacking::default();
+        with_unpack.unpack_func = Some(dummy_unpack);
+        let without = crate::codec::field_pack::FieldPacking::default();
+
+        let kd = kd_with_pack_info(vec![with_unpack, without]);
+        assert!(kd.can_unpack(0));
+        assert!(!kd.can_unpack(1));
+    }
+
+    #[test]
+    fn has_unpack_info_reports_per_keypart_make_slot() {
+        let mut with_info = crate::codec::field_pack::FieldPacking::default();
+        with_info.make_unpack_info_func = Some(dummy_make_unpack);
+        let without = crate::codec::field_pack::FieldPacking::default();
+
+        let kd = kd_with_pack_info(vec![with_info, without]);
+        assert!(kd.has_unpack_info(0));
+        assert!(!kd.has_unpack_info(1));
+    }
+
+    #[test]
+    fn can_unpack_and_has_unpack_info_are_independent() {
+        // A field could produce unpack_info but be unable to fully
+        // unpack from the memcmp image (and vice versa) — the two slots
+        // are intentionally separate.
+        let mut both = crate::codec::field_pack::FieldPacking::default();
+        both.unpack_func = Some(dummy_unpack);
+        both.make_unpack_info_func = Some(dummy_make_unpack);
+
+        let mut only_unpack = crate::codec::field_pack::FieldPacking::default();
+        only_unpack.unpack_func = Some(dummy_unpack);
+
+        let mut only_make = crate::codec::field_pack::FieldPacking::default();
+        only_make.make_unpack_info_func = Some(dummy_make_unpack);
+
+        let neither = crate::codec::field_pack::FieldPacking::default();
+
+        let kd = kd_with_pack_info(vec![both, only_unpack, only_make, neither]);
+        assert_eq!(
+            (kd.can_unpack(0), kd.has_unpack_info(0)),
+            (true, true)
+        );
+        assert_eq!(
+            (kd.can_unpack(1), kd.has_unpack_info(1)),
+            (true, false)
+        );
+        assert_eq!(
+            (kd.can_unpack(2), kd.has_unpack_info(2)),
+            (false, true)
+        );
+        assert_eq!(
+            (kd.can_unpack(3), kd.has_unpack_info(3)),
+            (false, false)
+        );
     }
 
     // ----- write_index_flag_field -----
