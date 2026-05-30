@@ -62,6 +62,8 @@ pub const DDL_DROP_INDEX_ONGOING_VERSION: u16 = 1;
 pub const MAX_INDEX_ID_VERSION: u16 = 1;
 pub const DDL_CREATE_INDEX_ONGOING_VERSION: u16 = 1;
 pub const AUTO_INCREMENT_VERSION: u16 = 1;
+pub const INDEX_STATS_VERSION_INITIAL: u16 = 1;
+pub const INDEX_STATS_VERSION_ENTRY_TYPES: u16 = 2;
 
 // --- key construction ---
 
@@ -649,6 +651,268 @@ pub mod index_info {
 
     pub async fn remove(db: &Db, gl: GlIndexId) -> Result<(), Error> {
         delete(db, DataDictType::IndexInfo, &encode_gl_index_suffix(gl)).await
+    }
+}
+
+/// Per-index aggregate statistics.
+///
+/// One row per index at `DataDictType::IndexStatistics`. Suffix is the
+/// `GlIndexId` encoded as `u32_be(cf_id) || u32_be(index_id)` (8 bytes,
+/// same as `IndexInfo`/`AutoInc`). The value is a single-element
+/// `Rdb_index_stats::materialize` payload (`properties_collector.cc:334`):
+///
+/// ```text
+/// u16_be(version)
+/// per record (exactly one in our writer, but the format supports a
+///   homogeneous vector — the decoder accepts any count):
+///   u32_be(cf_id) || u32_be(index_id)        — repeated from the suffix
+///   u64_be(data_size as i64)
+///   u64_be(rows as i64)
+///   u64_be(actual_disk_size as i64)
+///   u64_be(N = distinct_keys_per_prefix.len())
+///   if version >= ENTRY_TYPES (2):
+///     u64_be(entry_deletes as i64)
+///     u64_be(entry_single_deletes as i64)
+///     u64_be(entry_merges as i64)
+///     u64_be(entry_others as i64)
+///   [u64_be; N] distinct_keys_per_prefix
+/// ```
+///
+/// `m_name` is NOT persisted (the C++ comment in
+/// `properties_collector.h:57` says so explicitly — it's a runtime label
+/// only).
+///
+/// Writers stamp `INDEX_STATS_VERSION_ENTRY_TYPES`. Readers accept both
+/// `INITIAL` (v1, no entry counters — synthesised as zero) and
+/// `ENTRY_TYPES` (v2). A future version surfaces as `ErrorKind::Data`.
+///
+/// ## Why the GlIndexId is repeated in key+value
+///
+/// MyRocks groups a `vector<Rdb_index_stats>` into the value via
+/// `materialize`, then `Rdb_dict_manager::add_stats` writes one
+/// single-element vector per `(gl_index_id)` key. The repetition is
+/// historical (the format was designed for batch writes) and we
+/// preserve it byte-for-byte — the decoder validates the embedded
+/// `gl_index_id` against the suffix on read.
+pub mod index_statistics {
+    use super::{delete, encode_gl_index_suffix, get, put, scan, DataDictType};
+    use crate::codec::key::{
+        INDEX_STATS_VERSION_ENTRY_TYPES, INDEX_STATS_VERSION_INITIAL,
+    };
+    use crate::globals::GlIndexId;
+    use slatedb::{Db, Error};
+
+    /// Decoded statistics for one index. Field names match the C++
+    /// `Rdb_index_stats` (`properties_collector.h:47`) for grep-back-to-
+    /// source. The integer types are `i64` to match the C++ (the on-disk
+    /// format writes them as `u64_be`, two's-complement-equivalent).
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct IndexStats {
+        pub gl_index_id: GlIndexId,
+        pub data_size: i64,
+        pub rows: i64,
+        pub actual_disk_size: i64,
+        pub entry_deletes: i64,
+        pub entry_single_deletes: i64,
+        pub entry_merges: i64,
+        pub entry_others: i64,
+        /// One u64 per index-prefix-length cardinality bucket. Empty for
+        /// a freshly-initialised stats row.
+        pub distinct_keys_per_prefix: Vec<u64>,
+    }
+
+    impl IndexStats {
+        /// Zero-initialised stats for the given index (`Rdb_index_stats`
+        /// constructor at `properties_collector.h:64`).
+        pub fn new(gl_index_id: GlIndexId) -> Self {
+            Self {
+                gl_index_id,
+                data_size: 0,
+                rows: 0,
+                actual_disk_size: 0,
+                entry_deletes: 0,
+                entry_single_deletes: 0,
+                entry_merges: 0,
+                entry_others: 0,
+                distinct_keys_per_prefix: Vec::new(),
+            }
+        }
+    }
+
+    const FIXED_PER_RECORD_V1: usize = 4 + 4 + 8 * 4; // 40 bytes (no entry counters)
+    const FIXED_PER_RECORD_V2: usize = FIXED_PER_RECORD_V1 + 8 * 4; // 72 bytes
+
+    /// Encode `stats` as the single-record materialised value. Stamps
+    /// `INDEX_STATS_VERSION_ENTRY_TYPES`.
+    pub fn encode_value(stats: &IndexStats) -> Vec<u8> {
+        let n = stats.distinct_keys_per_prefix.len();
+        let mut out = Vec::with_capacity(2 + FIXED_PER_RECORD_V2 + n * 8);
+        out.extend_from_slice(&INDEX_STATS_VERSION_ENTRY_TYPES.to_be_bytes());
+        out.extend_from_slice(&stats.gl_index_id.cf_id.to_be_bytes());
+        out.extend_from_slice(&stats.gl_index_id.index_id.to_be_bytes());
+        out.extend_from_slice(&(stats.data_size as u64).to_be_bytes());
+        out.extend_from_slice(&(stats.rows as u64).to_be_bytes());
+        out.extend_from_slice(&(stats.actual_disk_size as u64).to_be_bytes());
+        out.extend_from_slice(&(n as u64).to_be_bytes());
+        out.extend_from_slice(&(stats.entry_deletes as u64).to_be_bytes());
+        out.extend_from_slice(&(stats.entry_single_deletes as u64).to_be_bytes());
+        out.extend_from_slice(&(stats.entry_merges as u64).to_be_bytes());
+        out.extend_from_slice(&(stats.entry_others as u64).to_be_bytes());
+        for &c in &stats.distinct_keys_per_prefix {
+            out.extend_from_slice(&c.to_be_bytes());
+        }
+        out
+    }
+
+    /// Decode a single-record materialised value. Accepts both `INITIAL`
+    /// and `ENTRY_TYPES` versions. A multi-record materialised value
+    /// (the format permits it) is rejected as `Data` — our writer never
+    /// emits more than one record per row, and the dict layer only
+    /// indexes by `GlIndexId`, so a packed multi-record value would
+    /// imply a stale/foreign writer.
+    pub fn decode_value(bytes: &[u8]) -> Result<IndexStats, Error> {
+        if bytes.len() < 2 {
+            return Err(Error::data(
+                "index_statistics: value truncated before version field".into(),
+            ));
+        }
+        let version = u16::from_be_bytes([bytes[0], bytes[1]]);
+        let (per_record, has_entry_counters) = match version {
+            INDEX_STATS_VERSION_INITIAL => (FIXED_PER_RECORD_V1, false),
+            INDEX_STATS_VERSION_ENTRY_TYPES => (FIXED_PER_RECORD_V2, true),
+            other => {
+                return Err(Error::data(format!(
+                    "index_statistics: unsupported version {other} \
+                     (latest is {INDEX_STATS_VERSION_ENTRY_TYPES})"
+                )))
+            }
+        };
+
+        let mut p = 2;
+        if p + per_record > bytes.len() {
+            return Err(Error::data(format!(
+                "index_statistics v{version}: value truncated \
+                 (need {} bytes for fixed fields, have {})",
+                per_record,
+                bytes.len() - p,
+            )));
+        }
+
+        // GlIndexId — repeated from the key suffix (see module docs).
+        let cf_id = read_u32(&bytes[p..p + 4]);
+        p += 4;
+        let index_id = read_u32(&bytes[p..p + 4]);
+        p += 4;
+
+        let data_size = read_i64(&bytes[p..p + 8]);
+        p += 8;
+        let rows = read_i64(&bytes[p..p + 8]);
+        p += 8;
+        let actual_disk_size = read_i64(&bytes[p..p + 8]);
+        p += 8;
+        let n = read_u64(&bytes[p..p + 8]) as usize;
+        p += 8;
+
+        let (entry_deletes, entry_single_deletes, entry_merges, entry_others) =
+            if has_entry_counters {
+                let d = read_i64(&bytes[p..p + 8]);
+                let sd = read_i64(&bytes[p + 8..p + 16]);
+                let m = read_i64(&bytes[p + 16..p + 24]);
+                let o = read_i64(&bytes[p + 24..p + 32]);
+                p += 32;
+                (d, sd, m, o)
+            } else {
+                (0, 0, 0, 0)
+            };
+
+        // Distinct-keys vector — N u64s.
+        let dkpp_bytes = n.checked_mul(8).ok_or_else(|| {
+            Error::data("index_statistics: distinct_keys count overflow".into())
+        })?;
+        if p + dkpp_bytes != bytes.len() {
+            return Err(Error::data(format!(
+                "index_statistics: trailing/missing bytes \
+                 (cursor {p} + dkpp {dkpp_bytes} != len {})",
+                bytes.len(),
+            )));
+        }
+        let mut distinct_keys_per_prefix = Vec::with_capacity(n);
+        for i in 0..n {
+            distinct_keys_per_prefix.push(read_u64(&bytes[p + i * 8..p + (i + 1) * 8]));
+        }
+
+        Ok(IndexStats {
+            gl_index_id: GlIndexId { cf_id, index_id },
+            data_size,
+            rows,
+            actual_disk_size,
+            entry_deletes,
+            entry_single_deletes,
+            entry_merges,
+            entry_others,
+            distinct_keys_per_prefix,
+        })
+    }
+
+    fn read_u32(b: &[u8]) -> u32 {
+        let mut buf = [0u8; 4];
+        buf.copy_from_slice(b);
+        u32::from_be_bytes(buf)
+    }
+    fn read_u64(b: &[u8]) -> u64 {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(b);
+        u64::from_be_bytes(buf)
+    }
+    fn read_i64(b: &[u8]) -> i64 {
+        read_u64(b) as i64
+    }
+
+    /// Read one index's stats. Returns `Ok(None)` if no row exists.
+    /// Validates that the embedded `gl_index_id` in the value matches
+    /// the key suffix — a mismatch is `ErrorKind::Data`.
+    pub async fn read(db: &Db, gl: GlIndexId) -> Result<Option<IndexStats>, Error> {
+        let bytes = match get(db, DataDictType::IndexStatistics, &encode_gl_index_suffix(gl)).await? {
+            Some(b) => b,
+            None => return Ok(None),
+        };
+        let stats = decode_value(&bytes)?;
+        if stats.gl_index_id != gl {
+            return Err(Error::data(format!(
+                "index_statistics: value gl_index_id {:?} != key gl {:?}",
+                stats.gl_index_id, gl,
+            )));
+        }
+        Ok(Some(stats))
+    }
+
+    /// Write one index's stats. Overwrites any prior row at the same
+    /// `gl_index_id` (matches `Rdb_dict_manager::add_stats` semantics —
+    /// it `Put`s, not `Merge`s).
+    pub async fn write(db: &Db, stats: &IndexStats) -> Result<(), Error> {
+        put(
+            db,
+            DataDictType::IndexStatistics,
+            &encode_gl_index_suffix(stats.gl_index_id),
+            &encode_value(stats),
+        )
+        .await
+    }
+
+    /// Remove the stats row for an index. Idempotent.
+    pub async fn remove(db: &Db, gl: GlIndexId) -> Result<(), Error> {
+        delete(db, DataDictType::IndexStatistics, &encode_gl_index_suffix(gl)).await
+    }
+
+    /// Snapshot every stats row currently in the dict. Returns rows in
+    /// byte-lexicographic order of `(cf_id, index_id)`.
+    pub async fn list(db: &Db) -> Result<Vec<IndexStats>, Error> {
+        let mut it = scan(db, DataDictType::IndexStatistics).await?;
+        let mut out = Vec::new();
+        while let Some(kv) = it.next().await? {
+            out.push(decode_value(&kv.value)?);
+        }
+        Ok(out)
     }
 }
 
@@ -1621,6 +1885,151 @@ mod tests {
         assert_eq!(b_read.ttl_duration, 120);
         assert!(index_info::read(engine.db(), c).await.expect("read c").is_none());
 
+        engine.close().await.expect("close");
+    }
+
+    // ----- index_statistics -----
+
+    fn sample_stats(gl_index: crate::globals::GlIndexId) -> index_statistics::IndexStats {
+        index_statistics::IndexStats {
+            gl_index_id: gl_index,
+            data_size: 12_345,
+            rows: 678,
+            actual_disk_size: 9_001,
+            entry_deletes: 11,
+            entry_single_deletes: 2,
+            entry_merges: 3,
+            entry_others: 7,
+            distinct_keys_per_prefix: vec![100, 50, 25, 10],
+        }
+    }
+
+    #[test]
+    fn index_statistics_round_trip_v2() {
+        let s = sample_stats(gl(1, 100));
+        let bytes = index_statistics::encode_value(&s);
+        // Length: 2 (version) + 8 (cf+ix) + 8*8 (data_size, rows,
+        // actual_disk_size, N, entry_{deletes,single_deletes,merges,others}) +
+        // 4*8 (dkpp).
+        assert_eq!(bytes.len(), 2 + 8 + 8 * 8 + 4 * 8);
+        // Version stamp.
+        assert_eq!(&bytes[..2], &crate::codec::key::INDEX_STATS_VERSION_ENTRY_TYPES.to_be_bytes());
+        let decoded = index_statistics::decode_value(&bytes).expect("decode");
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn index_statistics_empty_dkpp_round_trip() {
+        let mut s = sample_stats(gl(2, 200));
+        s.distinct_keys_per_prefix.clear();
+        let bytes = index_statistics::encode_value(&s);
+        assert_eq!(bytes.len(), 2 + 8 + 8 * 8);
+        let decoded = index_statistics::decode_value(&bytes).expect("decode");
+        assert_eq!(decoded, s);
+    }
+
+    #[test]
+    fn index_statistics_v1_decodes_with_zero_entry_counters() {
+        // Hand-craft a v1 value (INITIAL: no entry-type counters).
+        let gl_id = gl(3, 300);
+        let mut v = Vec::new();
+        v.extend_from_slice(&crate::codec::key::INDEX_STATS_VERSION_INITIAL.to_be_bytes());
+        v.extend_from_slice(&gl_id.cf_id.to_be_bytes());
+        v.extend_from_slice(&gl_id.index_id.to_be_bytes());
+        v.extend_from_slice(&100_i64.to_be_bytes()); // data_size
+        v.extend_from_slice(&5_i64.to_be_bytes());   // rows
+        v.extend_from_slice(&200_i64.to_be_bytes()); // actual_disk_size
+        v.extend_from_slice(&2_u64.to_be_bytes());   // N = 2
+        v.extend_from_slice(&7_u64.to_be_bytes());
+        v.extend_from_slice(&3_u64.to_be_bytes());
+
+        let decoded = index_statistics::decode_value(&v).expect("decode v1");
+        assert_eq!(decoded.gl_index_id, gl_id);
+        assert_eq!(decoded.data_size, 100);
+        assert_eq!(decoded.rows, 5);
+        assert_eq!(decoded.actual_disk_size, 200);
+        // v1 lacks the entry-type counters — must surface as zero.
+        assert_eq!(decoded.entry_deletes, 0);
+        assert_eq!(decoded.entry_single_deletes, 0);
+        assert_eq!(decoded.entry_merges, 0);
+        assert_eq!(decoded.entry_others, 0);
+        assert_eq!(decoded.distinct_keys_per_prefix, vec![7, 3]);
+    }
+
+    #[test]
+    fn index_statistics_future_version_rejected() {
+        let mut bytes = index_statistics::encode_value(&sample_stats(gl(4, 400)));
+        bytes[0..2].copy_from_slice(&99_u16.to_be_bytes());
+        let err = index_statistics::decode_value(&bytes).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Data);
+    }
+
+    #[test]
+    fn index_statistics_truncated_value_rejected() {
+        let bytes = index_statistics::encode_value(&sample_stats(gl(5, 500)));
+        // Drop one byte from the middle of the dkpp tail.
+        let err = index_statistics::decode_value(&bytes[..bytes.len() - 1]).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Data);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_statistics_write_read_remove() {
+        let engine = EngineDb::open_in_memory("idx_stats_rt").await.expect("open");
+        let gl_id = gl(7, 700);
+
+        assert!(index_statistics::read(engine.db(), gl_id).await.expect("read miss").is_none());
+
+        let s = sample_stats(gl_id);
+        index_statistics::write(engine.db(), &s).await.expect("write");
+
+        let got = index_statistics::read(engine.db(), gl_id)
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(got, s);
+
+        index_statistics::remove(engine.db(), gl_id).await.expect("remove");
+        assert!(index_statistics::read(engine.db(), gl_id).await.expect("post-rm").is_none());
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_statistics_list_returns_all_sorted() {
+        let engine = EngineDb::open_in_memory("idx_stats_list").await.expect("open");
+        let a = gl(1, 9);
+        let b = gl(1, 10);
+        let c = gl(2, 1);
+        // Insert out of order.
+        index_statistics::write(engine.db(), &sample_stats(b)).await.expect("w b");
+        index_statistics::write(engine.db(), &sample_stats(c)).await.expect("w c");
+        index_statistics::write(engine.db(), &sample_stats(a)).await.expect("w a");
+
+        let list = index_statistics::list(engine.db()).await.expect("list");
+        let ids: Vec<_> = list.iter().map(|s| s.gl_index_id).collect();
+        // Byte-lex on (cf_id BE, index_id BE) ⇒ a < b < c.
+        assert_eq!(ids, vec![a, b, c]);
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_statistics_read_rejects_gl_id_mismatch_in_value() {
+        // Write at one suffix but with the value's embedded gl_index_id
+        // set to a different one — read must reject.
+        let engine = EngineDb::open_in_memory("idx_stats_mismatch").await.expect("open");
+        let key_gl = gl(10, 1);
+        let mut s = sample_stats(gl(99, 99));
+        s.gl_index_id = gl(99, 99); // value disagrees with key suffix
+        put(
+            engine.db(),
+            DataDictType::IndexStatistics,
+            &encode_gl_index_suffix(key_gl),
+            &index_statistics::encode_value(&s),
+        )
+        .await
+        .expect("put raw");
+        let err = index_statistics::read(engine.db(), key_gl).await.unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Data);
         engine.close().await.expect("close");
     }
 }

@@ -143,6 +143,13 @@ pub const MAX_INDEX_ID_VERSION: u16 = 1;
 pub const DDL_CREATE_INDEX_ONGOING_VERSION: u16 = 1;
 pub const AUTO_INCREMENT_VERSION: u16 = 1;
 
+// Index-statistics value-format versions (properties_collector.h:49).
+// `Initial` lacks the four entry-type counters; `EntryTypes` (latest) adds
+// deletes/single-deletes/merges/others. Writers stamp `EntryTypes`; readers
+// accept both.
+pub const INDEX_STATS_VERSION_INITIAL: u16 = 1;
+pub const INDEX_STATS_VERSION_ENTRY_TYPES: u16 = 2;
+
 // ---------- index-info schema versions (rdb_datadic.h:529) ----------
 
 #[repr(u16)]
