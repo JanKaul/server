@@ -208,31 +208,45 @@ pub fn start_tx_and_assign_read_view(thd: &OpaqueThd) -> Result<(), Error> {
 }
 
 // -----------------------------------------------------------------------
-// Savepoints (engine-side stack, per _DESIGN.md §5)
+// Savepoints — Stage 0 stubs per _DESIGN.md §5 + Q10 ruling 2026-05-29.
+//
+// SlateDB has no native savepoint API and no write-batch truncate primitive.
+// Per Q10 the three hooks return `HA_ERR_WRONG_COMMAND` for Stage 0; the
+// engine-side savepoint stack on `RdbTransactionImpl` / `RdbWritebatchImpl`
+// stays in place as latent code for the post-Stage-1 re-evaluation.
 // -----------------------------------------------------------------------
 
-/// `SAVEPOINT name` callback. Pushes a marker onto our Rust-side savepoint
-/// stack (write-batch position + read-set snapshot).
+/// `SAVEPOINT name` callback.
+///
+/// Stage 0: returns `Error::invalid("...")` which maps to
+/// `HA_ERR_WRONG_COMMAND` via the standard error translation.
 ///
 /// Original: ha_rocksdb.cc:5025 — `rocksdb_savepoint`.
 pub fn savepoint(thd: &OpaqueThd, savepoint: *mut ()) -> Result<(), Error> {
     let _ = (thd, savepoint);
-    todo!("get_or_create_tx; tx.set_initial_savepoint()")
+    Err(Error::invalid(
+        "SAVEPOINT: not supported by the SlateDB engine in Stage 0 (Q10)".into(),
+    ))
 }
 
-/// `ROLLBACK TO SAVEPOINT name` callback. Discards write-batch entries
-/// above the named savepoint and shrinks the read-set.
+/// `ROLLBACK TO SAVEPOINT name` callback.
+///
+/// Stage 0: returns `Error::invalid("...")` per Q10.
 ///
 /// Original: ha_rocksdb.cc — `rocksdb_rollback_to_savepoint`.
 pub fn rollback_to_savepoint(thd: &OpaqueThd, savepoint: *mut ()) -> Result<(), Error> {
     let _ = (thd, savepoint);
-    todo!("get_tx_from_thd; tx.rollback_to_savepoint() (returns Err if has modifications)")
+    Err(Error::invalid(
+        "ROLLBACK TO SAVEPOINT: not supported by the SlateDB engine in Stage 0 (Q10)".into(),
+    ))
 }
 
 /// MariaDB asks whether MDL locks can be released as part of the
-/// `ROLLBACK TO SAVEPOINT`. Answer is constantly `false` because rolling
-/// back to a savepoint must keep all table-level locks (so the rest of the
-/// transaction can still use them).
+/// `ROLLBACK TO SAVEPOINT`. Constant `false` in MyRocks because rolling
+/// back to a savepoint must keep table-level locks. Since the rollback
+/// hook above is itself stubbed, this is effectively dead code in
+/// Stage 0; we leave the answer at `false` so behaviour is unchanged
+/// if the rollback hook is ever wired up.
 ///
 /// Original: ha_rocksdb.cc — `rocksdb_rollback_to_savepoint_can_release_mdl`.
 pub fn rollback_to_savepoint_can_release_mdl(thd: &OpaqueThd) -> bool {

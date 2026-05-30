@@ -8,7 +8,10 @@
 //! `Rdb_transaction` is the abstract base for an in-flight per-THD transaction.
 //! It wraps **SlateDB's `DbTransaction`** (one per active SQL transaction) and
 //! layers on:
-//!   - statement-level savepoint stack (since SlateDB has no native savepoints — §5)
+//!   - statement-level savepoint stack (latent code per Q10 ruling
+//!     2026-05-29: savepoint handlerton hooks return `HA_ERR_WRONG_COMMAND`
+//!     for Stage 0; the stack methods below are unreachable from SQL but
+//!     kept in the trait for post-Stage-1 re-evaluation)
 //!   - per-table modified-set tracking (for `m_update_time` bookkeeping)
 //!   - auto-increment merge map (drained at commit/prepare)
 //!   - bulk-load SST aggregation (per §1 "SST bulk loader" — degraded WriteBatch path)

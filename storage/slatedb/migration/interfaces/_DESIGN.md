@@ -212,10 +212,12 @@ let commit_handle = txn.commit().await?;  // Some(WriteHandle) or None if empty
 | `SERIALIZABLE` | `SerializableSnapshot` | SSI with read-set tracking + phantom-read detection |
 
 **Savepoints** (MariaDB `SAVEPOINT name` / `ROLLBACK TO SAVEPOINT name`):
-SlateDB has no native savepoint API. We layer them in our engine as a Rust-side
-stack of `(write_batch_position, mark_read_set_snapshot)` checkpoints. Rollback
-to savepoint discards write-batch entries above the position and shrinks the
-read-set back to the snapshot.
+**Not supported in Stage 0** (Q10 ruling 2026-05-29). SlateDB has no native
+savepoint API and no write-batch truncate primitive. The three savepoint
+handlerton hooks (`savepoint_set`, `savepoint_rollback`, `savepoint_release`)
+all return `HA_ERR_WRONG_COMMAND`. MTR tests that use savepoints are excluded
+from the Stage 0 suite via the same skip mechanism as other §1 non-goals.
+Re-evaluated post Stage 1.
 
 **Conflict-detection hooks** (`mark_read`/`unmark_write`): for SQL DML, we
 call `txn.mark_read(...)` on every key returned by a non-`SELECT FOR UPDATE`
@@ -357,15 +359,15 @@ table contention plus the writes still cost the same).
 7. `FOR UPDATE` handler path: `txn.mark_read([key])` only; no lock
    acquisition call. The `get_for_update` method in the
    `RdbTransaction` trait collapses into `get + mark_read`.
-8. Savepoint stack: drop any references to "lock-set checkpoint" — only
-   write-batch position is captured. Read-set in SSI mode is captured
-   per the open Q10 ruling.
+8. Savepoint stack: **N/A.** Per Q10 ruling (also 2026-05-29) savepoints
+   are stubbed as `HA_ERR_WRONG_COMMAND` for Stage 0.
 
 ### Status
 
 **Open Question 9 resolved 2026-05-29 → option (A).** TRANSLATE units
-that touch `FOR UPDATE`, lock I_S, and deadlock I_S are now unblocked on
-this axis. (Savepoints still wait on Q10.)
+that touch `FOR UPDATE`, lock I_S, deadlock I_S, and savepoints are now
+unblocked on this axis. (Savepoints additionally unblocked by Q10 →
+stub as `HA_ERR_WRONG_COMMAND`.)
 
 ## 6. Write-batching layer (per §9 of doc, simpler than v1)
 
@@ -522,14 +524,15 @@ concurrency-model and 2PC-protocol gaps.
    **RESOLVED 2026-05-29 → option (A).** Embrace SSI; deprecate the
    lock sysvars; document the semantic shift in user docs and in the
    affected I_S tables.
-10. **Savepoint truncation primitive.** §5 says "Rollback to savepoint
-    discards write-batch entries above the position". SlateDB's
-    `DbTransactionOps` does NOT expose a write-batch truncate primitive
-    (only `put`, `delete`, `merge`, `mark_read`, `unmark_write`, `commit`,
-    `rollback`). Two fallbacks: replay-on-rollback (Rust-side log of
-    every op below the savepoint; rebuild txn on rollback — O(N)) or
-    abandon-and-restart (`rollback` + replay from start — also O(N) but
-    no extra bookkeeping). Pick one.
+10. **Savepoint support in Stage 0.** SlateDB has no native savepoint
+    API and `DbTransactionOps` exposes no write-batch truncate primitive.
+    **RESOLVED 2026-05-29 → stub as `HA_ERR_WRONG_COMMAND`.** The three
+    handlerton hooks (`savepoint_set`, `savepoint_rollback`,
+    `savepoint_release`) all return `HA_ERR_WRONG_COMMAND` for Stage 0;
+    MTR tests using savepoints are excluded from the Stage 0 suite.
+    Re-evaluate after Stage 1: if savepoints are needed for parity, pick
+    (A) replay-on-rollback (always-on op-log) or (B) abandon-and-restart
+    (op-log only when a savepoint is set).
 
 ## 12. SlateDB version pinning
 
