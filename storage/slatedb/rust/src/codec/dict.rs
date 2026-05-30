@@ -346,6 +346,216 @@ pub mod max_index_id {
     }
 }
 
+/// Per-index metadata.
+///
+/// One row per index at `DataDictType::IndexInfo`. Suffix encodes the
+/// `GlIndexId` as `u32_be(cf_id) || u32_be(index_id)` (8 bytes). Value
+/// is a **schema-stamped record** — the encoder emits the latest format
+/// (`IndexInfoVersion::FieldFlags`, v6) and the decoder handles every
+/// version still in use in the wild.
+///
+/// Latest value format (`rdb_datadic.cc:4905`):
+/// ```text
+/// u16_be(version=6) || u8(index_type) || u16_be(kv_format_version)
+///   || u32_be(index_flags) || u64_be(ttl_duration)
+/// ```
+/// Total: 17 bytes.
+///
+/// Legacy formats accepted on read:
+/// - **Ttl (v5)**: drops `index_flags`; the decoder synthesises
+///   `IndexFlag::TtlFlag` when `kv_format_version == PRIMARY_FORMAT_VERSION_TTL`
+///   and `ttl_duration > 0` (faithful to the C++).
+/// - **VerifyKvFormat (v4)** / **GlobalId (v3)**: drops both
+///   `index_flags` and `ttl_duration`.
+/// - **Initial (v1)** / **KvFormat (v2)**: rejected — the C++ also
+///   treats these as "too old to decode."
+///
+/// Decoded `kv_format_version` is validated against
+/// `PRIMARY_FORMAT_VERSION_LATEST` / `SECONDARY_FORMAT_VERSION_LATEST`
+/// based on `index_type`; future-version values surface as
+/// `ErrorKind::Data`.
+pub mod index_info {
+    use super::{delete, encode_gl_index_suffix, get, put, DataDictType};
+    use crate::codec::key::{
+        IndexFlag, IndexInfoVersion, IndexType, PRIMARY_FORMAT_VERSION_LATEST,
+        PRIMARY_FORMAT_VERSION_TTL, SECONDARY_FORMAT_VERSION_LATEST,
+    };
+    use crate::globals::GlIndexId;
+    use slatedb::{Db, Error};
+
+    /// Decoded per-index metadata row.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct IndexInfo {
+        pub index_dict_version: IndexInfoVersion,
+        pub index_type: IndexType,
+        pub kv_format_version: u16,
+        pub index_flags: u32,
+        pub ttl_duration: u64,
+    }
+
+    const LEN_FIELD_FLAGS: usize = 2 + 1 + 2 + 4 + 8; // 17
+    const LEN_TTL: usize = 2 + 1 + 2 + 8; // 13
+    const LEN_VERIFY_OR_GLOBAL_ID: usize = 2 + 1 + 2; // 5
+
+    fn decode_index_type(b: u8) -> Result<IndexType, Error> {
+        match b {
+            1 => Ok(IndexType::Primary),
+            2 => Ok(IndexType::Secondary),
+            3 => Ok(IndexType::HiddenPrimary),
+            other => Err(Error::data(format!(
+                "index_info: unknown index_type byte 0x{other:02x}"
+            ))),
+        }
+    }
+
+    fn decode_index_info_version(v: u16) -> Result<IndexInfoVersion, Error> {
+        match v {
+            1 => Ok(IndexInfoVersion::Initial),
+            2 => Ok(IndexInfoVersion::KvFormat),
+            3 => Ok(IndexInfoVersion::GlobalId),
+            4 => Ok(IndexInfoVersion::VerifyKvFormat),
+            5 => Ok(IndexInfoVersion::Ttl),
+            6 => Ok(IndexInfoVersion::FieldFlags),
+            other => Err(Error::data(format!(
+                "index_info: unknown version {other}"
+            ))),
+        }
+    }
+
+    fn validate_kv_format_version(
+        index_type: IndexType,
+        kv_format_version: u16,
+    ) -> Result<(), Error> {
+        let max = match index_type {
+            IndexType::Primary | IndexType::HiddenPrimary => PRIMARY_FORMAT_VERSION_LATEST,
+            IndexType::Secondary => SECONDARY_FORMAT_VERSION_LATEST,
+        };
+        if kv_format_version > max {
+            return Err(Error::data(format!(
+                "index_info: kv_format_version {kv_format_version} exceeds max {max} for {index_type:?}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Encode `info` in the latest format (`FieldFlags`).
+    pub fn encode_value(info: &IndexInfo) -> Vec<u8> {
+        let mut out = Vec::with_capacity(LEN_FIELD_FLAGS);
+        out.extend_from_slice(&(IndexInfoVersion::FieldFlags as u16).to_be_bytes());
+        out.push(info.index_type as u8);
+        out.extend_from_slice(&info.kv_format_version.to_be_bytes());
+        out.extend_from_slice(&info.index_flags.to_be_bytes());
+        out.extend_from_slice(&info.ttl_duration.to_be_bytes());
+        out
+    }
+
+    /// Decode any forward-compatible format. Returns `Err(Data)` on
+    /// unknown version, length mismatch, bad index_type, or
+    /// future-version `kv_format_version`.
+    pub fn decode_value(bytes: &[u8]) -> Result<IndexInfo, Error> {
+        if bytes.len() < 2 {
+            return Err(Error::data(
+                "index_info: value truncated before version field".into(),
+            ));
+        }
+        let version_u16 = u16::from_be_bytes([bytes[0], bytes[1]]);
+        let version = decode_index_info_version(version_u16)?;
+
+        let info = match version {
+            IndexInfoVersion::FieldFlags => {
+                if bytes.len() != LEN_FIELD_FLAGS {
+                    return Err(Error::data(format!(
+                        "index_info FieldFlags: expected {LEN_FIELD_FLAGS} bytes, got {}",
+                        bytes.len()
+                    )));
+                }
+                IndexInfo {
+                    index_dict_version: version,
+                    index_type: decode_index_type(bytes[2])?,
+                    kv_format_version: u16::from_be_bytes([bytes[3], bytes[4]]),
+                    index_flags: u32::from_be_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]),
+                    ttl_duration: u64::from_be_bytes([
+                        bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14],
+                        bytes[15], bytes[16],
+                    ]),
+                }
+            }
+            IndexInfoVersion::Ttl => {
+                if bytes.len() != LEN_TTL {
+                    return Err(Error::data(format!(
+                        "index_info Ttl: expected {LEN_TTL} bytes, got {}",
+                        bytes.len()
+                    )));
+                }
+                let index_type = decode_index_type(bytes[2])?;
+                let kv_format_version = u16::from_be_bytes([bytes[3], bytes[4]]);
+                let ttl_duration = u64::from_be_bytes([
+                    bytes[5], bytes[6], bytes[7], bytes[8], bytes[9], bytes[10], bytes[11],
+                    bytes[12],
+                ]);
+                // C++ synthesises TtlFlag for PK with TTL ≥ format version.
+                let index_flags =
+                    if kv_format_version == PRIMARY_FORMAT_VERSION_TTL && ttl_duration > 0 {
+                        IndexFlag::TtlFlag as u32
+                    } else {
+                        0
+                    };
+                IndexInfo {
+                    index_dict_version: version,
+                    index_type,
+                    kv_format_version,
+                    index_flags,
+                    ttl_duration,
+                }
+            }
+            IndexInfoVersion::VerifyKvFormat | IndexInfoVersion::GlobalId => {
+                if bytes.len() != LEN_VERIFY_OR_GLOBAL_ID {
+                    return Err(Error::data(format!(
+                        "index_info {version:?}: expected {LEN_VERIFY_OR_GLOBAL_ID} bytes, got {}",
+                        bytes.len()
+                    )));
+                }
+                IndexInfo {
+                    index_dict_version: version,
+                    index_type: decode_index_type(bytes[2])?,
+                    kv_format_version: u16::from_be_bytes([bytes[3], bytes[4]]),
+                    index_flags: 0,
+                    ttl_duration: 0,
+                }
+            }
+            IndexInfoVersion::Initial | IndexInfoVersion::KvFormat => {
+                return Err(Error::data(format!(
+                    "index_info: version {version:?} too old to decode"
+                )));
+            }
+        };
+
+        validate_kv_format_version(info.index_type, info.kv_format_version)?;
+        Ok(info)
+    }
+
+    pub async fn read(db: &Db, gl: GlIndexId) -> Result<Option<IndexInfo>, Error> {
+        match get(db, DataDictType::IndexInfo, &encode_gl_index_suffix(gl)).await? {
+            Some(bytes) => Ok(Some(decode_value(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn write(db: &Db, gl: GlIndexId, info: &IndexInfo) -> Result<(), Error> {
+        put(
+            db,
+            DataDictType::IndexInfo,
+            &encode_gl_index_suffix(gl),
+            &encode_value(info),
+        )
+        .await
+    }
+
+    pub async fn remove(db: &Db, gl: GlIndexId) -> Result<(), Error> {
+        delete(db, DataDictType::IndexInfo, &encode_gl_index_suffix(gl)).await
+    }
+}
+
 /// Binlog position singleton.
 ///
 /// One row at `DataDictType::BinlogInfoIndexNumber` (empty suffix) whose
@@ -978,6 +1188,211 @@ mod tests {
                 .as_ref(),
             b"two"
         );
+
+        engine.close().await.expect("close");
+    }
+
+    // ----- index_info -----
+
+    fn sample_info(
+        ttl: u64,
+        flags: u32,
+        index_type: crate::codec::key::IndexType,
+    ) -> index_info::IndexInfo {
+        index_info::IndexInfo {
+            index_dict_version: crate::codec::key::IndexInfoVersion::FieldFlags,
+            index_type,
+            kv_format_version: match index_type {
+                crate::codec::key::IndexType::Secondary => {
+                    crate::codec::key::SECONDARY_FORMAT_VERSION_LATEST
+                }
+                _ => crate::codec::key::PRIMARY_FORMAT_VERSION_LATEST,
+            },
+            index_flags: flags,
+            ttl_duration: ttl,
+        }
+    }
+
+    #[test]
+    fn index_info_encode_then_decode_latest_format_round_trips() {
+        let info = sample_info(3600, 1, crate::codec::key::IndexType::Primary);
+        let bytes = index_info::encode_value(&info);
+        assert_eq!(bytes.len(), 17, "FieldFlags encoded length");
+        let back = index_info::decode_value(&bytes).expect("decode");
+        assert_eq!(back, info);
+    }
+
+    #[test]
+    fn index_info_decode_legacy_ttl_synthesises_ttl_flag_for_pk() {
+        // Hand-build a legacy Ttl (v5) value: u16 ver | u8 type | u16 kv | u64 ttl.
+        let mut bytes = Vec::with_capacity(13);
+        bytes.extend_from_slice(
+            &(crate::codec::key::IndexInfoVersion::Ttl as u16).to_be_bytes(),
+        );
+        bytes.push(crate::codec::key::IndexType::Primary as u8);
+        bytes.extend_from_slice(
+            &crate::codec::key::PRIMARY_FORMAT_VERSION_TTL.to_be_bytes(),
+        );
+        bytes.extend_from_slice(&60u64.to_be_bytes());
+
+        let info = index_info::decode_value(&bytes).expect("decode");
+        assert_eq!(info.index_dict_version, crate::codec::key::IndexInfoVersion::Ttl);
+        assert_eq!(info.ttl_duration, 60);
+        assert_eq!(
+            info.index_flags,
+            crate::codec::key::IndexFlag::TtlFlag as u32,
+            "TtlFlag synthesised when PK + TTL format + ttl>0"
+        );
+    }
+
+    #[test]
+    fn index_info_decode_legacy_ttl_no_flag_when_ttl_zero() {
+        let mut bytes = Vec::with_capacity(13);
+        bytes.extend_from_slice(
+            &(crate::codec::key::IndexInfoVersion::Ttl as u16).to_be_bytes(),
+        );
+        bytes.push(crate::codec::key::IndexType::Primary as u8);
+        bytes.extend_from_slice(
+            &crate::codec::key::PRIMARY_FORMAT_VERSION_TTL.to_be_bytes(),
+        );
+        bytes.extend_from_slice(&0u64.to_be_bytes()); // ttl=0 → no synthesis
+
+        let info = index_info::decode_value(&bytes).expect("decode");
+        assert_eq!(info.index_flags, 0);
+    }
+
+    #[test]
+    fn index_info_decode_global_id_format_yields_zero_flags_and_ttl() {
+        let mut bytes = Vec::with_capacity(5);
+        bytes.extend_from_slice(
+            &(crate::codec::key::IndexInfoVersion::GlobalId as u16).to_be_bytes(),
+        );
+        bytes.push(crate::codec::key::IndexType::Secondary as u8);
+        bytes.extend_from_slice(
+            &crate::codec::key::SECONDARY_FORMAT_VERSION_INITIAL.to_be_bytes(),
+        );
+
+        let info = index_info::decode_value(&bytes).expect("decode");
+        assert_eq!(info.index_dict_version, crate::codec::key::IndexInfoVersion::GlobalId);
+        assert_eq!(info.index_flags, 0);
+        assert_eq!(info.ttl_duration, 0);
+    }
+
+    #[test]
+    fn index_info_decode_rejects_unknown_version() {
+        // Version 99 — out of range.
+        let bytes = [0, 99, 0, 0, 0];
+        let err = index_info::decode_value(&bytes).unwrap_err();
+        assert!(matches!(err.kind(), slatedb::ErrorKind::Data));
+    }
+
+    #[test]
+    fn index_info_decode_rejects_initial_or_kvformat_versions() {
+        for v in [1u16, 2] {
+            let bytes = v.to_be_bytes().to_vec();
+            let err = index_info::decode_value(&bytes).unwrap_err();
+            assert!(matches!(err.kind(), slatedb::ErrorKind::Data));
+        }
+    }
+
+    #[test]
+    fn index_info_decode_rejects_size_mismatch() {
+        // FieldFlags version but wrong byte count.
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(
+            &(crate::codec::key::IndexInfoVersion::FieldFlags as u16).to_be_bytes(),
+        );
+        // … and that's it. Far short of 17 bytes.
+        let err = index_info::decode_value(&bytes).unwrap_err();
+        assert!(matches!(err.kind(), slatedb::ErrorKind::Data));
+    }
+
+    #[test]
+    fn index_info_decode_rejects_bad_index_type_byte() {
+        // Latest format with a bogus type byte (0xff).
+        let mut bytes = Vec::with_capacity(17);
+        bytes.extend_from_slice(
+            &(crate::codec::key::IndexInfoVersion::FieldFlags as u16).to_be_bytes(),
+        );
+        bytes.push(0xff); // invalid index_type
+        bytes.extend_from_slice(&[0; 14]);
+        let err = index_info::decode_value(&bytes).unwrap_err();
+        assert!(matches!(err.kind(), slatedb::ErrorKind::Data));
+    }
+
+    #[test]
+    fn index_info_decode_rejects_future_kv_format_version() {
+        // Latest format, valid type, but kv_format_version above the
+        // PRIMARY max → Data error.
+        let mut bytes = Vec::with_capacity(17);
+        bytes.extend_from_slice(
+            &(crate::codec::key::IndexInfoVersion::FieldFlags as u16).to_be_bytes(),
+        );
+        bytes.push(crate::codec::key::IndexType::Primary as u8);
+        bytes.extend_from_slice(
+            &(crate::codec::key::PRIMARY_FORMAT_VERSION_LATEST + 1).to_be_bytes(),
+        );
+        bytes.extend_from_slice(&[0; 12]);
+        let err = index_info::decode_value(&bytes).unwrap_err();
+        assert!(matches!(err.kind(), slatedb::ErrorKind::Data));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_info_round_trip_via_engine() {
+        let engine = EngineDb::open_in_memory("idxinfo_rt")
+            .await
+            .expect("open");
+        let gl = crate::globals::GlIndexId {
+            cf_id: 3,
+            index_id: 42,
+        };
+        assert!(index_info::read(engine.db(), gl).await.expect("read").is_none());
+
+        let info = sample_info(7200, 1, crate::codec::key::IndexType::Secondary);
+        index_info::write(engine.db(), gl, &info)
+            .await
+            .expect("write");
+        let back = index_info::read(engine.db(), gl)
+            .await
+            .expect("read")
+            .expect("present");
+        assert_eq!(back, info);
+
+        index_info::remove(engine.db(), gl).await.expect("remove");
+        assert!(index_info::read(engine.db(), gl).await.expect("read").is_none());
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn index_info_distinct_gl_index_ids_are_isolated() {
+        let engine = EngineDb::open_in_memory("idxinfo_isolated")
+            .await
+            .expect("open");
+        let a = crate::globals::GlIndexId { cf_id: 1, index_id: 10 };
+        let b = crate::globals::GlIndexId { cf_id: 1, index_id: 11 };
+        let c = crate::globals::GlIndexId { cf_id: 2, index_id: 10 };
+
+        index_info::write(
+            engine.db(),
+            a,
+            &sample_info(60, 1, crate::codec::key::IndexType::Primary),
+        )
+        .await
+        .expect("write a");
+        index_info::write(
+            engine.db(),
+            b,
+            &sample_info(120, 0, crate::codec::key::IndexType::Secondary),
+        )
+        .await
+        .expect("write b");
+
+        let a_read = index_info::read(engine.db(), a).await.expect("read a").expect("present");
+        let b_read = index_info::read(engine.db(), b).await.expect("read b").expect("present");
+        assert_eq!(a_read.ttl_duration, 60);
+        assert_eq!(b_read.ttl_duration, 120);
+        assert!(index_info::read(engine.db(), c).await.expect("read c").is_none());
 
         engine.close().await.expect("close");
     }
