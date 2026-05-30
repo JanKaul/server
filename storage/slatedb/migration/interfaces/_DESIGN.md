@@ -224,6 +224,10 @@ read-write conflicts at commit time.
 
 ## 5.2 Concurrency model migration (pessimistic → optimistic)
 
+**Ruling 2026-05-29: option (A) approved.** Embrace SSI; document and
+deprecate the lock-related sysvars. The §5.2 action items list (below) is
+now active work for TRANSLATE.
+
 **This is the single largest behavioural shift in the engine and warrants
 its own section.** Added in response to the interface-phase critique that
 caught the gap in §5 above.
@@ -319,7 +323,7 @@ The "best of both" framing but actually "all the costs of both".
 
 ### Recommendation
 
-**Option (A).** Aligned with §1 of `SlateDB_storage_engine.md`:
+**Option (A).** *Ruled 2026-05-29.* Aligned with §1 of `SlateDB_storage_engine.md`:
 
 > This migration is **not** a drop-in MyRocks replacement; it is a new
 > engine that happens to share MyRocks' SQL semantics where feasible.
@@ -333,7 +337,7 @@ re-introduces machinery SlateDB deliberately avoids, and at scale
 likely performs worse than SSI on the object-store substrate (lock
 table contention plus the writes still cost the same).
 
-### Action items if option (A) is approved
+### Action items (option (A) approved — active TRANSLATE work)
 
 1. Add a `## 5.2 Concurrency` section to user-facing engine docs
    covering the table above.
@@ -350,12 +354,18 @@ table contention plus the writes still cost the same).
 6. The 5 cited sites in `ha_rocksdb_cc____free__error_helpers.rs`
    (mapping `ErrorKind::Transaction` → `HA_ERR_LOCK_DEADLOCK`) get a
    doc-comment note flagging the rotated retry semantics.
+7. `FOR UPDATE` handler path: `txn.mark_read([key])` only; no lock
+   acquisition call. The `get_for_update` method in the
+   `RdbTransaction` trait collapses into `get + mark_read`.
+8. Savepoint stack: drop any references to "lock-set checkpoint" — only
+   write-batch position is captured. Read-set in SSI mode is captured
+   per the open Q10 ruling.
 
-### Decision required before TRANSLATE
+### Status
 
-**Open Question 9 (new):** Which option (A/B/C)? Lean (A). Block
-TRANSLATE on any handler unit that touches `FOR UPDATE`, savepoints,
-locks I_S tables, or the deadlock I_S table until ruled.
+**Open Question 9 resolved 2026-05-29 → option (A).** TRANSLATE units
+that touch `FOR UPDATE`, lock I_S, and deadlock I_S are now unblocked on
+this axis. (Savepoints still wait on Q10.)
 
 ## 6. Write-batching layer (per §9 of doc, simpler than v1)
 
@@ -508,9 +518,10 @@ concurrency-model and 2PC-protocol gaps.
    mid-replay must be safe to redo); replay durability ordering (the marker
    write must be `await_durable=true` before binlog reports prepare
    success).
-9. **Concurrency model migration (NEW, post-critique).** See §5.2. Pick
-   option (A), (B), or (C). Lean (A). Blocks any handler unit touching
-   `FOR UPDATE`, savepoints, lock I_S tables, or deadlock I_S table.
+9. **Concurrency model migration (post-critique).** See §5.2.
+   **RESOLVED 2026-05-29 → option (A).** Embrace SSI; deprecate the
+   lock sysvars; document the semantic shift in user docs and in the
+   affected I_S tables.
 10. **Savepoint truncation primitive.** §5 says "Rollback to savepoint
     discards write-batch entries above the position". SlateDB's
     `DbTransactionOps` does NOT expose a write-batch truncate primitive
