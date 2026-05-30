@@ -48,6 +48,19 @@ pub struct TtlColumn {
     pub field_index: u32,
 }
 
+/// Result of [`KeyDef::read_memcmp_key_part`]. Distinguishes "field was
+/// stored NULL" from "I/O / format error" — both have different
+/// semantics at the caller (NULL is data; Error is a decode bug).
+///
+/// Replaces the C++ tri-valued `int` return: `0` → `Ok`, `-1` → `Null`,
+/// `1` → `Error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadKeyPart {
+    Ok,
+    Null,
+    Error,
+}
+
 // ---------- layout-size constants (rdb_datadic.h:468) ----------
 
 pub const INDEX_NUMBER_SIZE: usize = 4;
@@ -539,6 +552,72 @@ impl KeyDef {
     /// index. Vacuously true for a key with no parts.
     pub fn can_cover_lookup(&self) -> bool {
         self.pack_info.iter().all(|fp| fp.unpack_func.is_some())
+    }
+
+    /// Advance `reader` past key-part `part_num`'s mem-comparable bytes
+    /// without writing them anywhere. Used by upper-bound computations
+    /// and by SK→PK lookups that only need to know "how long is this
+    /// keypart" to find the PK tail.
+    ///
+    /// Port of `rdb_datadic.cc:843`. The C++ took a `TABLE*` and called
+    /// `fpi->get_field_in_table(...)` internally; our port pushes the
+    /// lookup out to the caller via `field: Option<&FieldView>`. Pass
+    /// `None` for the hidden-PK part (the last part of a table with no
+    /// explicit PK); pass `Some(...)` for every other part.
+    ///
+    /// Hidden-PK behaviour: 8 raw bytes (`SIZEOF_HIDDEN_PK_COLUMN`) are
+    /// consumed directly without going through `skip_func` — the C++
+    /// skip routine for the hidden PK ignores its field arg anyway, so
+    /// the special-case is just inlining that fact.
+    pub fn read_memcmp_key_part(
+        &self,
+        reader: &mut crate::utils::buff::StringReader,
+        part_num: u32,
+        field: Option<&crate::codec::value::FieldView>,
+    ) -> ReadKeyPart {
+        let pn = part_num as usize;
+        debug_assert!(
+            pn < self.pack_info.len(),
+            "read_memcmp_key_part: part_num {} >= pack_info.len {}",
+            part_num,
+            self.pack_info.len()
+        );
+        let fpi = &self.pack_info[pn];
+
+        // Null-byte prefix on nullable parts: 0x00 = NULL, 0x01 = value,
+        // anything else (or under-read) is a format error.
+        if fpi.maybe_null {
+            let Some(slice) = reader.read(1) else {
+                return ReadKeyPart::Error;
+            };
+            match slice[0] {
+                0 => return ReadKeyPart::Null,
+                1 => {} // value follows
+                _ => return ReadKeyPart::Error,
+            }
+        }
+
+        // Hidden-PK part: skip 8 raw bytes; the dispatched skip_func
+        // would do the same and ignore its field arg.
+        if field.is_none() {
+            return match reader.read(crate::globals::SIZEOF_HIDDEN_PK_COLUMN) {
+                Some(_) => ReadKeyPart::Ok,
+                None => ReadKeyPart::Error,
+            };
+        }
+
+        // Non-null, non-hidden: dispatch via the skip slot.
+        let Some(skip_func) = fpi.skip_func else {
+            // Missing skip_func is a setup-time bug. Treat as Error so
+            // the caller can decline to decode this row.
+            return ReadKeyPart::Error;
+        };
+        let code = skip_func(fpi, field.expect("checked Some above"), reader);
+        if code == 0 {
+            ReadKeyPart::Ok
+        } else {
+            ReadKeyPart::Error
+        }
     }
 
     /// True iff key-part `kp` needs unpack_info sidechannel bytes to
@@ -1083,6 +1162,147 @@ mod tests {
         let kd = kd_with_pack_info(vec![with_info, without]);
         assert!(kd.has_unpack_info(0));
         assert!(!kd.has_unpack_info(1));
+    }
+
+    // ----- read_memcmp_key_part -----
+
+    fn dummy_skip_consume_4(
+        _fpi: &crate::codec::field_pack::FieldPacking,
+        _field: &crate::codec::value::FieldView,
+        reader: &mut crate::utils::buff::StringReader,
+    ) -> i32 {
+        if reader.read(4).is_some() {
+            0
+        } else {
+            1
+        }
+    }
+
+    fn dummy_field() -> crate::codec::value::FieldView {
+        crate::codec::value::FieldView {
+            name: "x".into(),
+            mysql_type: crate::codec::value::MysqlType::Long,
+            pack_length: 4,
+            output_offset: 0,
+            null_marker: None,
+            length: 4,
+            charset_id: 63,
+            flags: 0,
+            decimals: 0,
+        }
+    }
+
+    #[test]
+    fn read_memcmp_key_part_non_null_dispatches_skip_func() {
+        let mut fp = crate::codec::field_pack::FieldPacking::default();
+        fp.skip_func = Some(dummy_skip_consume_4);
+        let kd = kd_with_pack_info(vec![fp]);
+
+        let bytes = [0u8, 0, 0, 7, 99, 99];
+        let mut reader = crate::utils::buff::StringReader::new(&bytes);
+        let f = dummy_field();
+
+        assert_eq!(
+            kd.read_memcmp_key_part(&mut reader, 0, Some(&f)),
+            ReadKeyPart::Ok
+        );
+        assert_eq!(reader.current_pos(), 4);
+    }
+
+    #[test]
+    fn read_memcmp_key_part_nullable_zero_byte_is_null() {
+        let mut fp = crate::codec::field_pack::FieldPacking::default();
+        fp.maybe_null = true;
+        fp.skip_func = Some(dummy_skip_consume_4);
+        let kd = kd_with_pack_info(vec![fp]);
+
+        let bytes = [0u8, 1, 2, 3, 4]; // leading 0 → NULL; rest untouched
+        let mut reader = crate::utils::buff::StringReader::new(&bytes);
+        let f = dummy_field();
+
+        assert_eq!(
+            kd.read_memcmp_key_part(&mut reader, 0, Some(&f)),
+            ReadKeyPart::Null
+        );
+        // Only the null byte was consumed; skip_func was not called.
+        assert_eq!(reader.current_pos(), 1);
+    }
+
+    #[test]
+    fn read_memcmp_key_part_nullable_one_byte_then_value() {
+        let mut fp = crate::codec::field_pack::FieldPacking::default();
+        fp.maybe_null = true;
+        fp.skip_func = Some(dummy_skip_consume_4);
+        let kd = kd_with_pack_info(vec![fp]);
+
+        let bytes = [1u8, 0xaa, 0xbb, 0xcc, 0xdd, 0xee];
+        let mut reader = crate::utils::buff::StringReader::new(&bytes);
+        let f = dummy_field();
+
+        assert_eq!(
+            kd.read_memcmp_key_part(&mut reader, 0, Some(&f)),
+            ReadKeyPart::Ok
+        );
+        // Null byte + 4 value bytes = 5 consumed.
+        assert_eq!(reader.current_pos(), 5);
+    }
+
+    #[test]
+    fn read_memcmp_key_part_nullable_invalid_marker_is_error() {
+        let mut fp = crate::codec::field_pack::FieldPacking::default();
+        fp.maybe_null = true;
+        fp.skip_func = Some(dummy_skip_consume_4);
+        let kd = kd_with_pack_info(vec![fp]);
+
+        let bytes = [0xffu8, 0, 0, 0, 0];
+        let mut reader = crate::utils::buff::StringReader::new(&bytes);
+        let f = dummy_field();
+        assert_eq!(
+            kd.read_memcmp_key_part(&mut reader, 0, Some(&f)),
+            ReadKeyPart::Error
+        );
+    }
+
+    #[test]
+    fn read_memcmp_key_part_hidden_pk_skips_eight_bytes() {
+        let fp = crate::codec::field_pack::FieldPacking::default();
+        let kd = kd_with_pack_info(vec![fp]);
+
+        let bytes = [0u8; 12];
+        let mut reader = crate::utils::buff::StringReader::new(&bytes);
+        // field = None signals "hidden PK part".
+        assert_eq!(
+            kd.read_memcmp_key_part(&mut reader, 0, None),
+            ReadKeyPart::Ok
+        );
+        assert_eq!(reader.current_pos(), 8);
+    }
+
+    #[test]
+    fn read_memcmp_key_part_hidden_pk_truncated_is_error() {
+        let fp = crate::codec::field_pack::FieldPacking::default();
+        let kd = kd_with_pack_info(vec![fp]);
+
+        let bytes = [0u8; 5]; // < 8
+        let mut reader = crate::utils::buff::StringReader::new(&bytes);
+        assert_eq!(
+            kd.read_memcmp_key_part(&mut reader, 0, None),
+            ReadKeyPart::Error
+        );
+    }
+
+    #[test]
+    fn read_memcmp_key_part_missing_skip_func_is_error() {
+        // pack_info[0] has no skip_func set — setup-time bug; surface as Error.
+        let fp = crate::codec::field_pack::FieldPacking::default();
+        let kd = kd_with_pack_info(vec![fp]);
+        let bytes = [0u8; 4];
+        let mut reader = crate::utils::buff::StringReader::new(&bytes);
+        let f = dummy_field();
+        assert_eq!(
+            kd.read_memcmp_key_part(&mut reader, 0, Some(&f)),
+            ReadKeyPart::Error
+        );
     }
 
     #[test]
