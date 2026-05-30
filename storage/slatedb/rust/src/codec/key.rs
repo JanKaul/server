@@ -519,6 +519,52 @@ impl KeyDef {
         table.hidden_pk_field.is_some()
     }
 
+    /// Write `flag`'s payload bytes at the position
+    /// [`calculate_index_flag_offset`] computes within an already-allocated
+    /// portion of `buf`. Companion to that lookup.
+    ///
+    /// Port of `rdb_datadic.cc:3677`. Contract:
+    /// - Caller has pre-allocated at least `offset + len` bytes in `buf`
+    ///   (typically via `buf.allocate(self.total_index_flags_length, 0)`
+    ///   at header-construction time).
+    /// - `val.len() >= len` for the flag's payload length.
+    ///
+    /// Both contracts are pinned with `debug_assert!`. Violations are
+    /// codec bugs at construction time, not runtime conditions, so
+    /// matching the C++ `DBUG_ASSERT` semantic is appropriate.
+    ///
+    /// Passing [`IndexFlag::MaxFlag`] is a no-op (`len` is 0 — `MaxFlag` is
+    /// a header sentinel with no payload).
+    pub fn write_index_flag_field(
+        &self,
+        buf: &mut crate::utils::buff::StringWriter,
+        val: &[u8],
+        flag: IndexFlag,
+    ) {
+        let mut len: u32 = 0;
+        let offset =
+            Self::calculate_index_flag_offset(self.index_flags_bitmap, flag, Some(&mut len))
+                as usize;
+        let len = len as usize;
+        if len == 0 {
+            return; // MaxFlag / unknown bit beyond the length table
+        }
+        debug_assert!(
+            offset + len <= buf.current_pos(),
+            "write_index_flag_field: buf not pre-allocated (need {}+{}, got {})",
+            offset,
+            len,
+            buf.current_pos()
+        );
+        debug_assert!(
+            val.len() >= len,
+            "write_index_flag_field: val too short ({} < {})",
+            val.len(),
+            len
+        );
+        buf.ptr_mut()[offset..offset + len].copy_from_slice(&val[..len]);
+    }
+
     // ----- qualifier formatters (table-comment helpers) -----
 
     pub fn gen_cf_name_qualifier_for_partition(s: &str) -> String {
@@ -955,6 +1001,56 @@ mod tests {
         let mut chunk = [0u8; RDB_CHECKSUM_CHUNK_SIZE];
         chunk[0] = 0xfe;
         assert!(!KeyDef::unpack_info_has_checksum(&chunk));
+    }
+
+    // ----- write_index_flag_field -----
+
+    fn key_def_with_ttl_flag() -> KeyDef {
+        let mut kd = forward_pk(1);
+        kd.index_flags_bitmap = IndexFlag::TtlFlag as u32;
+        kd.total_index_flags_length = 8;
+        kd
+    }
+
+    #[test]
+    fn write_index_flag_field_writes_ttl_payload_at_zero_offset() {
+        use crate::utils::buff::StringWriter;
+        let kd = key_def_with_ttl_flag();
+        let mut buf = StringWriter::new();
+        buf.allocate(kd.total_index_flags_length as usize, 0);
+
+        let payload = 0x0102_0304_0506_0708u64.to_be_bytes();
+        kd.write_index_flag_field(&mut buf, &payload, IndexFlag::TtlFlag);
+
+        assert_eq!(&buf.ptr()[..8], &payload);
+    }
+
+    #[test]
+    fn write_index_flag_field_overwrites_only_the_named_region() {
+        use crate::utils::buff::StringWriter;
+        let kd = key_def_with_ttl_flag();
+        let mut buf = StringWriter::new();
+        // Pre-fill with a sentinel; padding bytes after the flag region
+        // should remain untouched.
+        buf.allocate(16, 0xff);
+
+        let payload = [0xaa; 8];
+        kd.write_index_flag_field(&mut buf, &payload, IndexFlag::TtlFlag);
+
+        assert_eq!(&buf.ptr()[..8], &payload);
+        assert_eq!(&buf.ptr()[8..], &[0xff; 8], "trailing bytes untouched");
+    }
+
+    #[test]
+    fn write_index_flag_field_max_flag_is_noop() {
+        use crate::utils::buff::StringWriter;
+        let kd = key_def_with_ttl_flag();
+        let mut buf = StringWriter::new();
+        buf.allocate(8, 0xee);
+        // MaxFlag has no payload (len=0) — must not panic on the
+        // pre-allocation check and must not modify any bytes.
+        kd.write_index_flag_field(&mut buf, &[], IndexFlag::MaxFlag);
+        assert_eq!(buf.ptr(), &[0xee; 8]);
     }
 
     #[test]
