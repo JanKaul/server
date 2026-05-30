@@ -534,6 +534,13 @@ impl KeyDef {
         self.pack_info[kp as usize].unpack_func.is_some()
     }
 
+    /// True iff every keypart can be unpacked from its mem-comparable
+    /// image — index-only reads always work for queries that touch this
+    /// index. Vacuously true for a key with no parts.
+    pub fn can_cover_lookup(&self) -> bool {
+        self.pack_info.iter().all(|fp| fp.unpack_func.is_some())
+    }
+
     /// True iff key-part `kp` needs unpack_info sidechannel bytes to
     /// decode. Delegates to `pack_info[kp].uses_unpack_info()`.
     pub fn has_unpack_info(&self, kp: u32) -> bool {
@@ -1076,6 +1083,28 @@ mod tests {
         let kd = kd_with_pack_info(vec![with_info, without]);
         assert!(kd.has_unpack_info(0));
         assert!(!kd.has_unpack_info(1));
+    }
+
+    #[test]
+    fn can_cover_lookup_requires_every_keypart_unpackable() {
+        let mut with_u = crate::codec::field_pack::FieldPacking::default();
+        with_u.unpack_func = Some(dummy_unpack);
+        let without = crate::codec::field_pack::FieldPacking::default();
+
+        let all_unpackable = kd_with_pack_info(vec![
+            { let mut f = crate::codec::field_pack::FieldPacking::default(); f.unpack_func = Some(dummy_unpack); f },
+            { let mut f = crate::codec::field_pack::FieldPacking::default(); f.unpack_func = Some(dummy_unpack); f },
+        ]);
+        assert!(all_unpackable.can_cover_lookup());
+
+        let one_missing = kd_with_pack_info(vec![with_u, without]);
+        assert!(!one_missing.can_cover_lookup());
+    }
+
+    #[test]
+    fn can_cover_lookup_is_vacuously_true_for_empty_pack_info() {
+        let kd = forward_pk(1); // pack_info defaults to empty Vec
+        assert!(kd.can_cover_lookup());
     }
 
     #[test]
