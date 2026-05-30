@@ -17,11 +17,12 @@
 
 use object_store::ObjectStore;
 use slatedb::filter_policy::{BloomFilterPolicy, FilterPolicy};
-use slatedb::{Db, DbBuilder};
+use slatedb::{Db, DbBuilder, MergeOperator};
 use slatedb::Error;
 use std::sync::Arc;
 
 use crate::codec::prefix::MyRocksPrefixExtractor;
+use crate::engine::merge::EngineMergeOperator;
 
 /// Bits-per-key for the bloom filter. Matches SlateDB's
 /// `default_filter_policies()` default so we don't change the false-positive
@@ -50,8 +51,10 @@ impl EngineDb {
         let bloom = BloomFilterPolicy::new(BLOOM_BITS_PER_KEY)
             .with_prefix_extractor(Arc::clone(&extractor) as Arc<dyn slatedb::PrefixExtractor>);
         let policies: Vec<Arc<dyn FilterPolicy>> = vec![Arc::new(bloom)];
+        let merge_op: Arc<dyn MergeOperator + Send + Sync> = Arc::new(EngineMergeOperator);
         let db = DbBuilder::new(path, object_store)
             .with_filter_policies(policies)
+            .with_merge_operator(merge_op)
             .build()
             .await?;
         Ok(Self {

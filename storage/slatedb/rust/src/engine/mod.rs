@@ -9,5 +9,6 @@ pub mod cf;
 pub mod cf_options;
 pub mod comparator;
 pub mod db;
+pub mod merge;
 pub mod snapshot;
 pub mod txn;
