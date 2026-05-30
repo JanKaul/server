@@ -565,6 +565,45 @@ impl KeyDef {
         self.pack_info.iter().all(|fp| fp.unpack_func.is_some())
     }
 
+    /// True iff the query's `lookup_bitmap` is a subset of this row's
+    /// covered-column bitmap — i.e. the index alone has every column
+    /// the query touches, no PK lookup needed.
+    ///
+    /// Port of `rdb_datadic.cc:1173..1200`. Inspects `unpack_info`'s
+    /// covered-bitmap header (which only exists when this index uses
+    /// the covered-bitmap secondary format — see
+    /// `use_covered_bitmap_format`).
+    ///
+    /// Layout of the covered header (`_DESIGN.md §0`):
+    /// ```text
+    /// RDB_UNPACK_COVERED_DATA_TAG (1)
+    /// || u16_be(skip_length)        (2)
+    /// || u16_be(covered_bitmap)     (2)  ← what we read here
+    /// ```
+    ///
+    /// Returns `false` if:
+    /// - this index isn't covered-bitmap format
+    /// - `unpack_info` doesn't start with `RDB_UNPACK_COVERED_DATA_TAG`
+    /// - `unpack_info` is shorter than the header
+    ///
+    /// MyRocks limits the bitmap to `MAX_REF_PARTS` (16) columns; we
+    /// take `lookup_bitmap: u16` to match.
+    pub fn covers_lookup(&self, unpack_info: &[u8], lookup_bitmap: u16) -> bool {
+        if !self.use_covered_bitmap_format() {
+            return false;
+        }
+        if unpack_info.first() != Some(&RDB_UNPACK_COVERED_DATA_TAG) {
+            return false;
+        }
+        if unpack_info.len() < RDB_UNPACK_COVERED_HEADER_SIZE {
+            return false;
+        }
+        // tag(1) + skip_length(2) = 3 bytes precede the covered bitmap.
+        let covered = u16::from_be_bytes([unpack_info[3], unpack_info[4]]);
+        // subset(a, b) ≡ (a & !b) == 0
+        (lookup_bitmap & !covered) == 0
+    }
+
     /// Compare two packed keys part-by-part without unpacking; return
     /// the first index where they differ (or `Equal` if all parts match).
     ///
@@ -1462,6 +1501,79 @@ mod tests {
         let kd = kd_with_pack_info(vec![with_info, without]);
         assert!(kd.has_unpack_info(0));
         assert!(!kd.has_unpack_info(1));
+    }
+
+    // ----- covers_lookup -----
+
+    fn sk_with_covered_format() -> KeyDef {
+        // Secondary index at UPDATE3 format version → covered-bitmap eligible.
+        let mut kd = reverse_sk(7);
+        kd.kv_format_version = SECONDARY_FORMAT_VERSION_UPDATE3;
+        kd
+    }
+
+    fn covered_unpack_info(covered_bitmap: u16) -> Vec<u8> {
+        let mut buf = vec![0u8; RDB_UNPACK_COVERED_HEADER_SIZE];
+        buf[0] = RDB_UNPACK_COVERED_DATA_TAG;
+        // Skip-length field (bytes 1..3) doesn't affect covers_lookup.
+        buf[1..3].copy_from_slice(&(RDB_UNPACK_COVERED_HEADER_SIZE as u16).to_be_bytes());
+        // Covered bitmap (bytes 3..5).
+        buf[3..5].copy_from_slice(&covered_bitmap.to_be_bytes());
+        buf
+    }
+
+    #[test]
+    fn covers_lookup_requires_covered_bitmap_format() {
+        // PK is never covered-bitmap eligible.
+        let pk = forward_pk(1);
+        let header = covered_unpack_info(0xffff);
+        assert!(!pk.covers_lookup(&header, 0x0001));
+    }
+
+    #[test]
+    fn covers_lookup_wrong_tag_is_false() {
+        let sk = sk_with_covered_format();
+        let mut header = covered_unpack_info(0xffff);
+        header[0] = RDB_UNPACK_DATA_TAG; // 0x02 — not covered tag
+        assert!(!sk.covers_lookup(&header, 0x0001));
+    }
+
+    #[test]
+    fn covers_lookup_short_header_is_false() {
+        let sk = sk_with_covered_format();
+        let short = vec![RDB_UNPACK_COVERED_DATA_TAG, 0x00]; // < 5 bytes
+        assert!(!sk.covers_lookup(&short, 0x0001));
+    }
+
+    #[test]
+    fn covers_lookup_subset_succeeds() {
+        let sk = sk_with_covered_format();
+        // Index covers columns 0..4; query touches 0 and 2.
+        let header = covered_unpack_info(0b0000_1111);
+        assert!(sk.covers_lookup(&header, 0b0000_0101));
+    }
+
+    #[test]
+    fn covers_lookup_extra_bit_in_lookup_fails() {
+        let sk = sk_with_covered_format();
+        // Index covers columns 0..4; query touches column 5 → not covered.
+        let header = covered_unpack_info(0b0000_1111);
+        assert!(!sk.covers_lookup(&header, 0b0010_0000));
+    }
+
+    #[test]
+    fn covers_lookup_empty_query_is_vacuously_covered() {
+        let sk = sk_with_covered_format();
+        // covered=0, lookup=0 — every bit in lookup (none) is in covered.
+        let header = covered_unpack_info(0);
+        assert!(sk.covers_lookup(&header, 0));
+    }
+
+    #[test]
+    fn covers_lookup_full_query_against_empty_covered_fails() {
+        let sk = sk_with_covered_format();
+        let header = covered_unpack_info(0);
+        assert!(!sk.covers_lookup(&header, 0x0001));
     }
 
     // ----- compare_keys -----
