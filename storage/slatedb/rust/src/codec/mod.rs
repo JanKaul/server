@@ -4,6 +4,7 @@
 //! `cf_id` + `u32_be index_id`) that everything else in the codec layer
 //! ultimately produces / consumes.
 
+pub mod comment_parser;
 pub mod dict;
 pub mod field_pack;
 pub mod key;
