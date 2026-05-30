@@ -10,6 +10,7 @@ pub mod cf_options;
 pub mod compact_filter;
 pub mod comparator;
 pub mod db;
+pub mod index_merge;
 pub mod merge;
 pub mod snapshot;
 pub mod txn;
