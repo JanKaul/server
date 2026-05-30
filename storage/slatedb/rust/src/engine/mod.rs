@@ -5,5 +5,7 @@
 //! direction handling and CF-options parsing. The `Db` wrapper / CF
 //! manager / transaction stubs follow once their dependencies are in.
 
+pub mod cf;
 pub mod cf_options;
 pub mod comparator;
+pub mod db;
