@@ -7,6 +7,7 @@
 
 pub mod cf;
 pub mod cf_options;
+pub mod compact_filter;
 pub mod comparator;
 pub mod db;
 pub mod merge;
