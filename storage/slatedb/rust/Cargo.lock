@@ -3479,6 +3479,7 @@ dependencies = [
  "object_store",
  "once_cell",
  "parking_lot",
+ "regex",
  "slatedb",
  "testcontainers",
  "testcontainers-modules",
