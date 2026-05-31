@@ -121,6 +121,11 @@ mod ffi {
             tablespace_op: bool,
             requested_lock_type: i32,
         ) -> i32;
+
+        /// Capability/hint toggle. `extra_op` is the raw
+        /// `enum ha_extra_function` value from `include/my_base.h`;
+        /// unknown values become a silent no-op. Always returns 0.
+        fn ha_extra(self: &mut HaSlateDb, extra_op: i32) -> i32;
     }
 }
 
@@ -171,6 +176,15 @@ impl HaSlateDb {
             crate::handler::ThrLockType::from_i32(requested_lock_type),
         );
         chosen as i32
+    }
+
+    /// Cxx wrapper — translates the raw `enum ha_extra_function` `i32`
+    /// to the Rust enum and delegates to [`HaSlateDb::extra`]. Always
+    /// returns OK; `extra` is infallible.
+    fn ha_extra(&mut self, extra_op: i32) -> i32 {
+        crate::handler::open_result_to_status(
+            self.extra(crate::handler::HaExtraFunction::from_i32(extra_op)),
+        )
     }
 }
 

@@ -124,6 +124,58 @@ pub enum RowLockMode {
     Write = 2,
 }
 
+/// Subset of MariaDB's `enum ha_extra_function` from
+/// `include/my_base.h:133`. Only the variants [`HaSlateDb::extra`]
+/// acts on are listed here — the full enum has 50+ entries, most of
+/// which collapse to a silent no-op (matching the C++'s
+/// `default: break;` at `ha_rocksdb.cc:11968`).
+///
+/// Numeric values match MariaDB's `enum ha_extra_function` exactly
+/// (part of the internal handler ABI). The bridge marshals the C++
+/// value as `i32` and we map via [`HaExtraFunction::from_i32`].
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HaExtraFunction {
+    /// `HA_EXTRA_KEYREAD = 7` — next read only needs the keypart
+    /// bytes, no row data. Drives the covered-read fast path.
+    Keyread = 7,
+    /// `HA_EXTRA_NO_KEYREAD = 8` — caller is done with the keyread
+    /// fast path; reset.
+    NoKeyread = 8,
+    /// `HA_EXTRA_FLUSH = 22` — invalidate any per-handler cached row
+    /// buffer. Does NOT trigger a SlateDB-side flush.
+    Flush = 22,
+    /// `HA_EXTRA_NO_IGNORE_DUP_KEY = 26` — end of the `INSERT … ON
+    /// DUPLICATE KEY UPDATE` / `REPLACE` window.
+    NoIgnoreDupKey = 26,
+    /// `HA_EXTRA_INSERT_WITH_UPDATE = 41` — start of `INSERT … ON
+    /// DUPLICATE KEY UPDATE`. Tells the handler to cache row lookups
+    /// for the upcoming update.
+    InsertWithUpdate = 41,
+    /// Anything else (e.g. `HA_EXTRA_PREPARE_FOR_RENAME`,
+    /// `HA_EXTRA_CACHE`, ...) — silent no-op in our handler. The
+    /// `-1` sentinel doesn't collide with any real `ha_extra_function`
+    /// value (the real enum starts at 0).
+    Other = -1,
+}
+
+impl HaExtraFunction {
+    /// Map from the raw C++ `enum ha_extra_function` `i32` to a Rust
+    /// variant. Unknown values (which is most of them) collapse to
+    /// [`HaExtraFunction::Other`], matching the C++ `default: break;`
+    /// behaviour.
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            7 => Self::Keyread,
+            8 => Self::NoKeyread,
+            22 => Self::Flush,
+            26 => Self::NoIgnoreDupKey,
+            41 => Self::InsertWithUpdate,
+            _ => Self::Other,
+        }
+    }
+}
+
 /// Subset of MariaDB `THD` state that [`HaSlateDb::store_lock`] needs.
 /// Filled by the cxx side from a live `THD*` before calling in.
 ///
@@ -168,6 +220,24 @@ pub struct HaSlateDb {
     /// transition — matches the C++ `m_db_lock.type == TL_UNLOCK`
     /// gate at `ha_rocksdb.cc:11327`.
     db_lock_type: ThrLockType,
+
+    /// Set by `HA_EXTRA_KEYREAD`, cleared by `HA_EXTRA_NO_KEYREAD`.
+    /// When true, the next read should only fetch keypart bytes and
+    /// skip the row payload. Drives the covered-read fast path.
+    keyread_only: bool,
+
+    /// Set by `HA_EXTRA_INSERT_WITH_UPDATE`, cleared by
+    /// `HA_EXTRA_NO_IGNORE_DUP_KEY`. When true, the handler caches
+    /// row lookups during `INSERT … ON DUPLICATE KEY UPDATE` to
+    /// avoid the second read on the update step.
+    insert_with_update: bool,
+
+    /// Cached pull-bytes from the most recent point lookup. Cleared
+    /// by `HA_EXTRA_FLUSH` because if the table has BLOB columns the
+    /// caller may have started reading them out of this buffer and
+    /// MariaDB needs to invalidate that handle. C++ counterpart is
+    /// `m_retrieved_record` at `ha_rocksdb.cc:11954`.
+    retrieved_record: bytes::BytesMut,
 }
 
 impl Default for HaSlateDb {
@@ -185,6 +255,9 @@ impl HaSlateDb {
             tbl_def: None,
             lock_rows: RowLockMode::None,
             db_lock_type: ThrLockType::Unlock,
+            keyread_only: false,
+            insert_with_update: false,
+            retrieved_record: bytes::BytesMut::new(),
         }
     }
 
@@ -339,6 +412,70 @@ impl HaSlateDb {
     /// Snapshot of the installed THR_LOCK type. Test/diagnostic accessor.
     pub fn db_lock_type(&self) -> ThrLockType {
         self.db_lock_type
+    }
+
+    /// Handler capability/hint toggle. Translated from
+    /// `ha_rocksdb::extra` at `ha_rocksdb.cc:11939`.
+    ///
+    /// Five variants do real work; everything else falls through to
+    /// a silent no-op (the C++ `default: break;`).
+    ///
+    /// Always returns `Ok(())` — toggles are infallible; the C++
+    /// signature is `int` only because every MariaDB handler method
+    /// returns `int`.
+    pub fn extra(&mut self, op: HaExtraFunction) -> Result<(), Error> {
+        match op {
+            HaExtraFunction::Keyread => {
+                self.keyread_only = true;
+            }
+            HaExtraFunction::NoKeyread => {
+                self.keyread_only = false;
+            }
+            HaExtraFunction::Flush => {
+                // If the table has BLOB columns they're part of the
+                // retrieved-record buffer; flushing it invalidates
+                // the BLOB handles the caller may still hold (C++
+                // m_retrieved_record.Reset()).
+                self.retrieved_record.clear();
+            }
+            HaExtraFunction::InsertWithUpdate => {
+                // C++ gates this on the `rocksdb_enable_insert_with_update_caching`
+                // sysvar (defaults true). We don't have sysvars across
+                // cxx yet — hardcode the on-by-default behaviour;
+                // sysvar override lands when sysvar plumbing does.
+                self.insert_with_update = true;
+            }
+            HaExtraFunction::NoIgnoreDupKey => {
+                self.insert_with_update = false;
+            }
+            HaExtraFunction::Other => {}
+        }
+        Ok(())
+    }
+
+    /// Snapshot of the keyread-only flag. Test/diagnostic accessor.
+    pub fn keyread_only(&self) -> bool {
+        self.keyread_only
+    }
+
+    /// Snapshot of the insert-with-update flag. Test/diagnostic accessor.
+    pub fn insert_with_update(&self) -> bool {
+        self.insert_with_update
+    }
+
+    /// Length of the retrieved-record buffer. Test/diagnostic accessor.
+    pub fn retrieved_record_len(&self) -> usize {
+        self.retrieved_record.len()
+    }
+
+    /// Push test bytes into the retrieved-record buffer. Only used
+    /// by tests to verify `HA_EXTRA_FLUSH` clears it. Will be
+    /// replaced by a real per-handler row-fetch path when DML/read
+    /// lands.
+    #[cfg(test)]
+    pub(crate) fn set_retrieved_record_for_test(&mut self, bytes: &[u8]) {
+        self.retrieved_record.clear();
+        self.retrieved_record.extend_from_slice(bytes);
     }
 }
 
@@ -672,5 +809,88 @@ mod tests {
         // Unknown -> Ignore.
         assert_eq!(ThrLockType::from_i32(99), ThrLockType::Ignore);
         assert_eq!(ThrLockType::from_i32(-2), ThrLockType::Ignore);
+    }
+
+    // ----- extra -----
+
+    #[test]
+    fn extra_keyread_toggles_flag() {
+        let mut h = HaSlateDb::new();
+        assert!(!h.keyread_only());
+        h.extra(HaExtraFunction::Keyread).unwrap();
+        assert!(h.keyread_only());
+        h.extra(HaExtraFunction::NoKeyread).unwrap();
+        assert!(!h.keyread_only());
+    }
+
+    #[test]
+    fn extra_flush_clears_retrieved_record() {
+        let mut h = HaSlateDb::new();
+        h.set_retrieved_record_for_test(b"row-bytes");
+        assert_eq!(h.retrieved_record_len(), 9);
+        h.extra(HaExtraFunction::Flush).unwrap();
+        assert_eq!(h.retrieved_record_len(), 0);
+    }
+
+    #[test]
+    fn extra_insert_with_update_pairs() {
+        let mut h = HaSlateDb::new();
+        assert!(!h.insert_with_update());
+        h.extra(HaExtraFunction::InsertWithUpdate).unwrap();
+        assert!(h.insert_with_update());
+        h.extra(HaExtraFunction::NoIgnoreDupKey).unwrap();
+        assert!(!h.insert_with_update());
+    }
+
+    #[test]
+    fn extra_other_is_a_silent_noop() {
+        let mut h = HaSlateDb::new();
+        // Seed every flag in the "on" state.
+        h.extra(HaExtraFunction::Keyread).unwrap();
+        h.extra(HaExtraFunction::InsertWithUpdate).unwrap();
+        h.set_retrieved_record_for_test(b"data");
+
+        // Other must not touch any of them.
+        h.extra(HaExtraFunction::Other).unwrap();
+        assert!(h.keyread_only(), "keyread unchanged");
+        assert!(h.insert_with_update(), "insert_with_update unchanged");
+        assert_eq!(h.retrieved_record_len(), 4, "retrieved_record unchanged");
+    }
+
+    #[test]
+    fn extra_flush_does_not_touch_other_flags() {
+        let mut h = HaSlateDb::new();
+        h.extra(HaExtraFunction::Keyread).unwrap();
+        h.extra(HaExtraFunction::InsertWithUpdate).unwrap();
+        h.set_retrieved_record_for_test(b"data");
+
+        h.extra(HaExtraFunction::Flush).unwrap();
+        assert_eq!(h.retrieved_record_len(), 0, "flush cleared the buffer");
+        assert!(h.keyread_only(), "flush did not touch keyread");
+        assert!(h.insert_with_update(), "flush did not touch insert_with_update");
+    }
+
+    #[test]
+    fn ha_extra_function_from_i32_matches_mariadb_values() {
+        // Pinned values from include/my_base.h:133.
+        assert_eq!(HaExtraFunction::from_i32(7), HaExtraFunction::Keyread);
+        assert_eq!(HaExtraFunction::from_i32(8), HaExtraFunction::NoKeyread);
+        assert_eq!(HaExtraFunction::from_i32(22), HaExtraFunction::Flush);
+        assert_eq!(
+            HaExtraFunction::from_i32(26),
+            HaExtraFunction::NoIgnoreDupKey,
+        );
+        assert_eq!(
+            HaExtraFunction::from_i32(41),
+            HaExtraFunction::InsertWithUpdate,
+        );
+        // Anything else → Other.
+        for v in [0, 1, 2, 3, 4, 5, 6, 9, 10, 21, 23, 24, 25, 27, 40, 42, 99, -5] {
+            assert_eq!(
+                HaExtraFunction::from_i32(v),
+                HaExtraFunction::Other,
+                "{v} should be Other",
+            );
+        }
     }
 }
