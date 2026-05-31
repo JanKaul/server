@@ -15,3 +15,4 @@ pub mod index_merge;
 pub mod merge;
 pub mod snapshot;
 pub mod txn;
+pub mod txn_registry;

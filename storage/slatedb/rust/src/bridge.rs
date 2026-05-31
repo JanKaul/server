@@ -58,6 +58,7 @@ use parking_lot::RwLock;
 
 use crate::engine::db::EngineDb;
 use crate::engine::ddl_manager::DdlManager;
+use crate::engine::txn_registry::TxnRegistry;
 
 #[cxx::bridge(namespace = "slatedb")]
 mod ffi {
@@ -223,6 +224,9 @@ static ENGINE: RwLock<Option<EngineState>> = RwLock::new(None);
 struct EngineState {
     db: Arc<EngineDb>,
     ddl: Arc<DdlManager>,
+    /// Per-THD transaction registry. Empty at init; populated by
+    /// `external_lock` (and friends) once that lands.
+    txn_registry: Arc<TxnRegistry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -269,7 +273,12 @@ pub(crate) fn slatedb_init_in_memory(name: String) -> i32 {
         // init() is cheap on a fresh in-memory engine — it scans the
         // (empty) dict and seeds the sequence past EndDictIndexId.
         ddl.init(db.db()).await?;
-        Ok(EngineState { db, ddl })
+        let txn_registry = Arc::new(TxnRegistry::new());
+        Ok(EngineState {
+            db,
+            ddl,
+            txn_registry,
+        })
     });
 
     match opened {
@@ -329,6 +338,15 @@ pub(crate) fn current_ddl() -> Option<Arc<DdlManager>> {
 pub(crate) fn current_engine() -> Option<Arc<EngineDb>> {
     let guard = ENGINE.read();
     guard.as_ref().map(|state| state.db.clone())
+}
+
+/// Hand the per-process [`TxnRegistry`] to internal Rust callers.
+/// Consumed by `HaSlateDb::external_lock` and friends once that
+/// lands.
+#[allow(dead_code)]
+pub(crate) fn current_txn_registry() -> Option<Arc<TxnRegistry>> {
+    let guard = ENGINE.read();
+    guard.as_ref().map(|state| state.txn_registry.clone())
 }
 
 #[cfg(test)]
