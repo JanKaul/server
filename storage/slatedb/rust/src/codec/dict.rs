@@ -1073,17 +1073,102 @@ pub mod table_version {
 /// typed encode/decode pair on top of this substrate; today's callers
 /// can shape their own.
 pub mod ddl_entry_index_start_number {
-    use super::{delete, get, put, DataDictType};
+    use super::{delete, get, put, system_key, DataDictType, DDL_ENTRY_INDEX_VERSION};
+    use crate::globals::GlIndexId;
     use bytes::Bytes;
     use slatedb::{Db, Error};
 
-    pub async fn read(db: &Db, table_name: &str) -> Result<Option<Bytes>, Error> {
+    /// On-disk size of the per-index pair in the typed value.
+    const PAIR_SIZE: usize = 4 + 4;
+    const VERSION_BYTES: usize = 2;
+
+    /// Encode the per-table index list as
+    /// `u16_be(DDL_ENTRY_INDEX_VERSION) || (u32_be(cf_id) ||
+    /// u32_be(index_id))*N`. Matches the C++ `Rdb_tbl_def::put_dict`
+    /// at `rdb_datadic.cc:3561..3603`.
+    pub fn encode_value(indexes: &[GlIndexId]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(VERSION_BYTES + indexes.len() * PAIR_SIZE);
+        out.extend_from_slice(&DDL_ENTRY_INDEX_VERSION.to_be_bytes());
+        for gl in indexes {
+            out.extend_from_slice(&gl.cf_id.to_be_bytes());
+            out.extend_from_slice(&gl.index_id.to_be_bytes());
+        }
+        out
+    }
+
+    /// Decode the inverse. Validates the version stamp and the trailer
+    /// length (must be a whole number of pairs).
+    pub fn decode_value(bytes: &[u8]) -> Result<Vec<GlIndexId>, Error> {
+        if bytes.len() < VERSION_BYTES {
+            return Err(Error::data(
+                "ddl_entry: value truncated before version".into(),
+            ));
+        }
+        let version = u16::from_be_bytes([bytes[0], bytes[1]]);
+        if version != DDL_ENTRY_INDEX_VERSION {
+            return Err(Error::data(format!(
+                "ddl_entry: unsupported version {version} (latest is {DDL_ENTRY_INDEX_VERSION})"
+            )));
+        }
+        let tail = &bytes[VERSION_BYTES..];
+        if tail.len() % PAIR_SIZE != 0 {
+            return Err(Error::data(format!(
+                "ddl_entry: trailer length {} not a multiple of {PAIR_SIZE}",
+                tail.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(tail.len() / PAIR_SIZE);
+        for chunk in tail.chunks_exact(PAIR_SIZE) {
+            let mut cf = [0u8; 4];
+            let mut ix = [0u8; 4];
+            cf.copy_from_slice(&chunk[..4]);
+            ix.copy_from_slice(&chunk[4..]);
+            out.push(GlIndexId {
+                cf_id: u32::from_be_bytes(cf),
+                index_id: u32::from_be_bytes(ix),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Full system-area key for a table's DDL entry. Useful for the
+    /// caller that wants to enqueue a batch-write at the same key as
+    /// [`write`] would synchronously produce.
+    pub fn full_key(table_name: &str) -> Bytes {
+        system_key(DataDictType::DdlEntryIndexStartNumber, table_name.as_bytes())
+    }
+
+    /// Typed read — decodes the stored value (if any). For the
+    /// untyped raw-bytes accessor, use [`read_raw`].
+    pub async fn read_typed(
+        db: &Db,
+        table_name: &str,
+    ) -> Result<Option<Vec<GlIndexId>>, Error> {
+        match read_raw(db, table_name).await? {
+            Some(bytes) => Ok(Some(decode_value(&bytes)?)),
+            None => Ok(None),
+        }
+    }
+
+    pub async fn read_raw(db: &Db, table_name: &str) -> Result<Option<Bytes>, Error> {
         get(
             db,
             DataDictType::DdlEntryIndexStartNumber,
             table_name.as_bytes(),
         )
         .await
+    }
+
+    pub async fn write_typed(
+        db: &Db,
+        table_name: &str,
+        indexes: &[GlIndexId],
+    ) -> Result<(), Error> {
+        write(db, table_name, &encode_value(indexes)).await
+    }
+
+    pub async fn read(db: &Db, table_name: &str) -> Result<Option<Bytes>, Error> {
+        read_raw(db, table_name).await
     }
 
     pub async fn write(db: &Db, table_name: &str, value: &[u8]) -> Result<(), Error> {

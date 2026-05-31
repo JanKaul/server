@@ -29,22 +29,25 @@
 //!
 //! ## What's deferred
 //!
-//! - **`put_dict`** — writes the per-table DDL entry plus per-index
-//!   `Rdb_index_info` rows to the dict via the dict manager. Needs
-//!   `cf_flags` get/set on the dict (not yet translated) and a
-//!   WriteBatch surface — wait on the dict_manager landing.
 //! - **`get_create_time`** — reads the table's `.frm` ctime. We don't
 //!   have `.frm` files in SlateDB; this stub returns
 //!   [`CREATE_TIME_NULL`] (matching the C++ "no data available" branch
 //!   when `my_stat` fails). The lazy-load-from-filesystem behaviour
 //!   isn't applicable to an object-store-backed deployment.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
 
-use slatedb::Error;
+use slatedb::{Db, Error, WriteBatch};
 
-use crate::codec::key::{IndexType, KeyDef};
+use crate::codec::dict::{
+    cf_flags, ddl_entry_index_start_number, index_info, system_key, DataDictType,
+};
+use crate::codec::key::{
+    IndexInfoVersion, IndexType, KeyDef, CF_FLAGS_TO_IGNORE, PER_PARTITION_CF_FLAG,
+    REVERSE_CF_FLAG,
+};
 use crate::globals::GlIndexId;
 use crate::utils::names::split_normalized_tablename;
 
@@ -227,6 +230,118 @@ impl TblDef {
     pub fn get_create_time(&self) -> i64 {
         CREATE_TIME_NULL
     }
+
+    /// Persist this descriptor to the data dictionary. Validates
+    /// per-CF flag agreement, registers any new CFs, writes the
+    /// per-index `IndexInfo` row for each KeyDef, then writes the
+    /// typed DDL-entry row. All writes go into a single SlateDB
+    /// `WriteBatch` so commit is atomic.
+    ///
+    /// Translated from `Rdb_tbl_def::put_dict` (`rdb_datadic.cc:3558`).
+    /// The C++ takes a `rocksdb::WriteBatch *` and a pre-built key
+    /// `Slice`; we build the key from `self.full_tablename()` and own
+    /// the batch internally — cleaner Rust API. Caller atomicity
+    /// guarantees that previously came from being passed into a
+    /// larger batch are not provided here; if a caller needs that,
+    /// add a `put_dict_into(batch: &mut WriteBatch)` variant later.
+    ///
+    /// ## Errors
+    ///
+    /// - `Invalid` if any KeyDef references a `cf_id` whose existing
+    ///   `cf_flags` row disagrees with what `self` would write (after
+    ///   masking out [`CF_FLAGS_TO_IGNORE`]). Matches the C++
+    ///   `ER_CF_DIFFERENT` (`rdb_datadic.cc:3592`).
+    /// - `Unavailable` on object-store failure (propagated from
+    ///   SlateDB).
+    pub async fn put_dict(&self, db: &Db) -> Result<(), Error> {
+        // ----- pre-validate cf_flags for every cf_id this table uses -----
+        //
+        // Read-only pass. For CFs that don't yet exist in the dict, we
+        // collect the (cf_id, flags) pair to enqueue into the batch
+        // below. For CFs that DO exist, we just validate matching
+        // flags (after masking the per-partition bit).
+        let mut to_install: Vec<(u32, u32)> = Vec::new();
+        let mut seen_cfs: HashSet<u32> = HashSet::new();
+
+        for kd in &self.key_descrs {
+            if !seen_cfs.insert(kd.cf_id) {
+                continue;
+            }
+            let candidate = kd_to_cf_flags(kd);
+            match cf_flags::read(db, kd.cf_id).await? {
+                Some(existing) => {
+                    let masked_existing = existing & !CF_FLAGS_TO_IGNORE;
+                    let masked_candidate = candidate & !CF_FLAGS_TO_IGNORE;
+                    if masked_existing != masked_candidate {
+                        return Err(Error::invalid(format!(
+                            "cf_flags mismatch: cf_id={} existing={:#06x} \
+                             candidate={:#06x} (after masking ignored bits)",
+                            kd.cf_id, masked_existing, masked_candidate,
+                        )));
+                    }
+                }
+                None => {
+                    to_install.push((kd.cf_id, candidate));
+                }
+            }
+        }
+
+        // ----- build the WriteBatch -----
+        let mut batch = WriteBatch::new();
+
+        for (cf_id, flags) in to_install {
+            batch.put(
+                system_key(DataDictType::CfDefinition, &cf_id.to_be_bytes()),
+                cf_flags::encode_value(flags),
+            );
+        }
+
+        for kd in &self.key_descrs {
+            let info = index_info::IndexInfo {
+                index_dict_version: IndexInfoVersion::FieldFlags,
+                index_type: kd.index_type,
+                kv_format_version: kd.kv_format_version,
+                index_flags: kd.index_flags_bitmap,
+                ttl_duration: kd.ttl_duration,
+            };
+            let suffix = {
+                let gl = kd.get_gl_index_id();
+                let mut s = [0u8; 8];
+                s[..4].copy_from_slice(&gl.cf_id.to_be_bytes());
+                s[4..].copy_from_slice(&gl.index_id.to_be_bytes());
+                s
+            };
+            batch.put(
+                system_key(DataDictType::IndexInfo, &suffix),
+                index_info::encode_value(&info),
+            );
+        }
+
+        let ids: Vec<GlIndexId> = self
+            .key_descrs
+            .iter()
+            .map(|kd| kd.get_gl_index_id())
+            .collect();
+        batch.put(
+            ddl_entry_index_start_number::full_key(&self.dbname_tablename),
+            ddl_entry_index_start_number::encode_value(&ids),
+        );
+
+        // ----- atomic commit -----
+        db.write(batch).await?;
+        Ok(())
+    }
+}
+
+/// Derive the persisted `cf_flags` value from a `KeyDef`. Matches the
+/// C++ computation at `rdb_datadic.cc:3569..3572`.
+fn kd_to_cf_flags(kd: &KeyDef) -> u32 {
+    (if kd.is_reverse_cf { REVERSE_CF_FLAG } else { 0 })
+        | (if kd.is_per_partition_cf {
+            PER_PARTITION_CF_FLAG
+        } else {
+            0
+        })
 }
 
 #[cfg(test)]
@@ -408,5 +523,214 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<TblDef>();
         assert_send_sync::<Arc<TblDef>>();
+    }
+
+    // ----- put_dict integration tests -----
+
+    use crate::codec::dict::{cf_flags, ddl_entry_index_start_number, index_info};
+    use crate::codec::key::REVERSE_CF_FLAG;
+    use crate::engine::db::EngineDb;
+
+    fn make_kd(
+        index_number: u32,
+        cf_id: u32,
+        ix_type: IndexType,
+        is_reverse_cf: bool,
+    ) -> Arc<KeyDef> {
+        let mut kd = KeyDef::new_skeleton(
+            index_number,
+            cf_id,
+            0,
+            INDEX_INFO_VERSION_LATEST as u16,
+            ix_type,
+            PRIMARY_FORMAT_VERSION_LATEST,
+            is_reverse_cf,
+            "k",
+        );
+        kd.maxlength = 12;
+        kd.kv_format_version = PRIMARY_FORMAT_VERSION_LATEST;
+        Arc::new(kd)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_dict_writes_all_three_record_types() {
+        let engine = EngineDb::open_in_memory("put_dict_ok").await.expect("open");
+        let tdef = TblDef::new("db.users")
+            .unwrap()
+            .with_keys(vec![
+                make_kd(100, 1, IndexType::Primary, false),
+                make_kd(101, 1, IndexType::Secondary, false),
+            ]);
+        tdef.put_dict(engine.db()).await.expect("put_dict");
+
+        // cf_flags row exists for cf_id=1.
+        let flags = cf_flags::read(engine.db(), 1)
+            .await
+            .expect("read flags")
+            .expect("present");
+        assert_eq!(flags, 0, "no reverse-cf, no per-partition");
+
+        // index_info rows exist for both keys.
+        let pk_info = index_info::read(
+            engine.db(),
+            GlIndexId { cf_id: 1, index_id: 100 },
+        )
+        .await
+        .expect("read pk info")
+        .expect("present");
+        assert_eq!(pk_info.index_type, IndexType::Primary);
+
+        let sk_info = index_info::read(
+            engine.db(),
+            GlIndexId { cf_id: 1, index_id: 101 },
+        )
+        .await
+        .expect("read sk info")
+        .expect("present");
+        assert_eq!(sk_info.index_type, IndexType::Secondary);
+
+        // typed DDL-entry row decodes back to the same index list.
+        let ddl_entry = ddl_entry_index_start_number::read_typed(engine.db(), "db.users")
+            .await
+            .expect("read ddl entry")
+            .expect("present");
+        assert_eq!(
+            ddl_entry,
+            vec![
+                GlIndexId { cf_id: 1, index_id: 100 },
+                GlIndexId { cf_id: 1, index_id: 101 },
+            ],
+        );
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_dict_reverse_cf_flag_is_persisted() {
+        let engine = EngineDb::open_in_memory("put_dict_rev").await.expect("open");
+        let tdef = TblDef::new("db.t")
+            .unwrap()
+            .with_keys(vec![make_kd(200, 5, IndexType::Primary, true)]);
+        tdef.put_dict(engine.db()).await.expect("put_dict");
+        let flags = cf_flags::read(engine.db(), 5)
+            .await
+            .expect("ok")
+            .expect("present");
+        assert_eq!(flags, REVERSE_CF_FLAG);
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_dict_rejects_cf_flags_mismatch() {
+        // First table on cf=7 establishes flags=0 (no reverse). A
+        // second table on cf=7 that claims REVERSE_CF_FLAG must be
+        // rejected before any of its rows are written.
+        let engine = EngineDb::open_in_memory("put_dict_mismatch")
+            .await
+            .expect("open");
+
+        let t1 = TblDef::new("db.t1")
+            .unwrap()
+            .with_keys(vec![make_kd(100, 7, IndexType::Primary, false)]);
+        t1.put_dict(engine.db()).await.expect("t1 put_dict");
+
+        let t2 = TblDef::new("db.t2")
+            .unwrap()
+            .with_keys(vec![make_kd(200, 7, IndexType::Primary, true)]);
+        let err = t2.put_dict(engine.db()).await.unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("cf_flags mismatch"));
+
+        // Verify t2's rows were NOT written.
+        assert!(index_info::read(
+            engine.db(),
+            GlIndexId { cf_id: 7, index_id: 200 },
+        )
+        .await
+        .expect("read")
+        .is_none());
+        assert!(ddl_entry_index_start_number::read_typed(engine.db(), "db.t2")
+            .await
+            .expect("read")
+            .is_none());
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_dict_ignores_per_partition_bit_in_validation() {
+        // CF_FLAGS_TO_IGNORE = PER_PARTITION_CF_FLAG; a partitioned
+        // table joining a non-partitioned CF (or vice versa) must NOT
+        // be rejected — matches rdb_datadic.cc:3588..3589.
+        let engine = EngineDb::open_in_memory("put_dict_partition_ok")
+            .await
+            .expect("open");
+
+        // First write installs cf_flags=0.
+        let t1 = TblDef::new("db.plain")
+            .unwrap()
+            .with_keys(vec![make_kd(100, 3, IndexType::Primary, false)]);
+        t1.put_dict(engine.db()).await.expect("t1 put_dict");
+
+        // Second table is per-partition (sets PER_PARTITION_CF_FLAG).
+        // After masking it should match cf_flags=0 and succeed.
+        let mut partitioned_kd = KeyDef::new_skeleton(
+            200,
+            3,
+            0,
+            INDEX_INFO_VERSION_LATEST as u16,
+            IndexType::Primary,
+            PRIMARY_FORMAT_VERSION_LATEST,
+            false,
+            "k",
+        );
+        partitioned_kd.is_per_partition_cf = true;
+        partitioned_kd.maxlength = 12;
+        let t2 = TblDef::new("db.partitioned")
+            .unwrap()
+            .with_keys(vec![Arc::new(partitioned_kd)]);
+        t2.put_dict(engine.db())
+            .await
+            .expect("partitioned table should NOT trigger cf_flags mismatch");
+
+        engine.close().await.expect("close");
+    }
+
+    #[test]
+    fn ddl_entry_typed_encode_decode_round_trip() {
+        let ids = vec![
+            GlIndexId { cf_id: 1, index_id: 100 },
+            GlIndexId { cf_id: 2, index_id: 7 },
+            GlIndexId { cf_id: u32::MAX, index_id: u32::MAX },
+        ];
+        let bytes = ddl_entry_index_start_number::encode_value(&ids);
+        // 2 (version) + 3 * 8 (pairs).
+        assert_eq!(bytes.len(), 2 + 3 * 8);
+        let decoded = ddl_entry_index_start_number::decode_value(&bytes).expect("decode");
+        assert_eq!(decoded, ids);
+    }
+
+    #[test]
+    fn ddl_entry_typed_empty_index_list_is_valid() {
+        let bytes = ddl_entry_index_start_number::encode_value(&[]);
+        assert_eq!(bytes.len(), 2);
+        let decoded = ddl_entry_index_start_number::decode_value(&bytes).expect("decode");
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn ddl_entry_typed_rejects_unsupported_version() {
+        let mut bytes = ddl_entry_index_start_number::encode_value(&[]);
+        bytes[0..2].copy_from_slice(&99u16.to_be_bytes());
+        let err = ddl_entry_index_start_number::decode_value(&bytes).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Data);
+    }
+
+    #[test]
+    fn ddl_entry_typed_rejects_misaligned_trailer() {
+        // Version (2) + 7 trailing bytes ⇒ not a whole pair.
+        let bytes = b"\x00\x01\x00\x00\x00\x01\x00\x00\x00";
+        let err = ddl_entry_index_start_number::decode_value(bytes).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Data);
     }
 }
