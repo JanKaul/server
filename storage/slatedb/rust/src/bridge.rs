@@ -100,6 +100,27 @@ mod ffi {
         /// Release the handler's per-table state. Idempotent.
         /// Always returns 0.
         fn ha_close(self: &mut HaSlateDb) -> i32;
+
+        /// Decide the row-lock mode + (possibly downgraded) THR_LOCK
+        /// type for this statement. Returns the chosen
+        /// `thr_lock_type` as `i32` (the cxx side maps back to the
+        /// C++ enum). Side effect: updates `lock_rows` +
+        /// `db_lock_type` on the handler.
+        ///
+        /// `in_lock_tables` is true when the THD is inside an
+        /// explicit `LOCK TABLES`. `tablespace_op` is true for
+        /// `DISCARD/IMPORT TABLESPACE`. Both come from THD reads on
+        /// the cxx side (`thd_in_lock_tables` / `thd_tablespace_op`).
+        ///
+        /// `requested_lock_type` is the raw `enum thr_lock_type`
+        /// value; unknown values collapse to `TL_IGNORE` (which is
+        /// the C++'s "leave the decision alone" sentinel).
+        fn ha_store_lock(
+            self: &mut HaSlateDb,
+            in_lock_tables: bool,
+            tablespace_op: bool,
+            requested_lock_type: i32,
+        ) -> i32;
     }
 }
 
@@ -129,6 +150,27 @@ impl HaSlateDb {
     /// closes that flush per-handler state can surface errors.
     fn ha_close(&mut self) -> i32 {
         crate::handler::open_result_to_status(self.close())
+    }
+
+    /// Cxx wrapper — marshals the flat C++ inputs into the typed
+    /// `StoreLockThd` + `ThrLockType` and returns the chosen lock
+    /// type as `i32`. The handler-side method is infallible so no
+    /// status-code mapping is needed.
+    fn ha_store_lock(
+        &mut self,
+        in_lock_tables: bool,
+        tablespace_op: bool,
+        requested_lock_type: i32,
+    ) -> i32 {
+        let thd = crate::handler::StoreLockThd {
+            in_lock_tables,
+            tablespace_op,
+        };
+        let chosen = self.store_lock(
+            thd,
+            crate::handler::ThrLockType::from_i32(requested_lock_type),
+        );
+        chosen as i32
     }
 }
 

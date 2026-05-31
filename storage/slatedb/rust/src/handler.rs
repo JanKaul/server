@@ -57,6 +57,90 @@ pub mod status {
     pub const NO_SUCH_TABLE: i32 = 12;
 }
 
+/// MariaDB's `enum thr_lock_type` from `include/thr_lock.h`. Numeric
+/// values are stable across versions — they're part of MariaDB's
+/// internal ABI.
+///
+/// We translate this enum so [`HaSlateDb::store_lock`] can pattern-
+/// match on the values the C++ side passes us. The cxx surface
+/// marshals them as `i32` and the bridge maps to/from this enum.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThrLockType {
+    Ignore = -1,
+    Unlock = 0,
+    ReadDefault = 1,
+    Read = 2,
+    ReadHighPriority = 3,
+    ReadNoInsert = 4,
+    ReadWithSharedLocks = 5,
+    WriteAllowWrite = 6,
+    WriteConcurrentInsert = 7,
+    WriteDelayed = 8,
+    WriteDefault = 9,
+    WriteLowPriority = 10,
+    Write = 11,
+    WriteOnly = 12,
+}
+
+impl ThrLockType {
+    /// Map from the raw i32 the cxx bridge passes us. Unknown values
+    /// (out of range for the enum) collapse to [`ThrLockType::Ignore`]
+    /// — matches the C++'s `if (lock_type != TL_IGNORE)` gate, which
+    /// effectively treats anything it doesn't recognise as "leave the
+    /// decision alone".
+    pub fn from_i32(v: i32) -> Self {
+        match v {
+            -1 => Self::Ignore,
+            0 => Self::Unlock,
+            1 => Self::ReadDefault,
+            2 => Self::Read,
+            3 => Self::ReadHighPriority,
+            4 => Self::ReadNoInsert,
+            5 => Self::ReadWithSharedLocks,
+            6 => Self::WriteAllowWrite,
+            7 => Self::WriteConcurrentInsert,
+            8 => Self::WriteDelayed,
+            9 => Self::WriteDefault,
+            10 => Self::WriteLowPriority,
+            11 => Self::Write,
+            12 => Self::WriteOnly,
+            _ => Self::Ignore,
+        }
+    }
+}
+
+/// MyRocks' internal row-lock mode parsed out of `store_lock` and
+/// used by the rest of the handler. Mirrors C++ `enum {
+/// RDB_LOCK_NONE, RDB_LOCK_READ, RDB_LOCK_WRITE }`. Per
+/// `_DESIGN.md §5` this drives the SI vs SSI isolation choice and
+/// whether scans tag the txn via `txn.mark_read(...)`.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RowLockMode {
+    #[default]
+    None = 0,
+    Read = 1,
+    Write = 2,
+}
+
+/// Subset of MariaDB `THD` state that [`HaSlateDb::store_lock`] needs.
+/// Filled by the cxx side from a live `THD*` before calling in.
+///
+/// Currently carries only the two booleans that the simple decision
+/// path consults. The `lock_scanned_rows` upgrade branch in the C++
+/// (`ha_rocksdb.cc:11299..11323`) needs additional THD reads
+/// (`thd_sql_command`, `thd_tx_isolation`, `thd_test_options`, sysvar
+/// `lock_scanned_rows`); that path is deferred until we plumb those
+/// sysvars across the cxx boundary.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct StoreLockThd {
+    /// True when MariaDB is inside an explicit `LOCK TABLES`.
+    pub in_lock_tables: bool,
+    /// True for tablespace DDL (DISCARD/IMPORT TABLESPACE).
+    pub tablespace_op: bool,
+}
+
 /// Per-table-open handler state.
 ///
 /// The C++ `ha_rocksdb` class accretes ~50 fields over its lifetime
@@ -72,6 +156,18 @@ pub struct HaSlateDb {
     /// [`crate::engine::ddl_manager::DdlManager`]'s in-memory
     /// catalogue.
     tbl_def: Option<Arc<TblDef>>,
+
+    /// Per-statement row-lock decision, set by [`Self::store_lock`].
+    /// Drives the SI vs SSI isolation choice elsewhere in the handler
+    /// (per `_DESIGN.md §5`). Defaults to `None` between statements.
+    lock_rows: RowLockMode,
+
+    /// Current MariaDB-level lock type for this handler instance
+    /// (mirrors the C++ `m_db_lock.type`). Tracked so `store_lock`'s
+    /// THR_LOCK downgrade only triggers on the `Unlock → request`
+    /// transition — matches the C++ `m_db_lock.type == TL_UNLOCK`
+    /// gate at `ha_rocksdb.cc:11327`.
+    db_lock_type: ThrLockType,
 }
 
 impl Default for HaSlateDb {
@@ -85,7 +181,11 @@ impl HaSlateDb {
     /// initialises ~30 default-valued fields; we'll add them as the
     /// corresponding methods land.
     pub fn new() -> Self {
-        Self { tbl_def: None }
+        Self {
+            tbl_def: None,
+            lock_rows: RowLockMode::None,
+            db_lock_type: ThrLockType::Unlock,
+        }
     }
 
     /// Bind the handler to the table at `name`. The C++ signature is
@@ -153,6 +253,92 @@ impl HaSlateDb {
     /// isn't currently open.
     pub fn tbl_def(&self) -> Option<&Arc<TblDef>> {
         self.tbl_def.as_ref()
+    }
+
+    /// Decide our internal row-lock mode + the MariaDB THR_LOCK type
+    /// to install on the handler. Pure decision function — no SlateDB
+    /// I/O. Translated from `ha_rocksdb::store_lock` at
+    /// `ha_rocksdb.cc:11283`.
+    ///
+    /// Two decisions, mirroring the C++ structure:
+    ///
+    /// 1. **`lock_rows`** (`m_lock_rows` in C++): the internal
+    ///    READ/WRITE/NONE mode that drives later txn-tagging
+    ///    decisions.
+    /// 2. **THR_LOCK downgrade**: possibly weakens the lock_type the
+    ///    SQL layer should install — `TL_WRITE_CONCURRENT_INSERT..=TL_WRITE`
+    ///    collapses to `TL_WRITE_ALLOW_WRITE` outside `LOCK TABLES`
+    ///    so concurrent writers aren't blocked; `TL_READ_NO_INSERT`
+    ///    becomes `TL_READ` outside `LOCK TABLES` to allow inserts
+    ///    into the read-locked table in INSERT-SELECT patterns.
+    ///
+    /// Returns the (possibly downgraded) `ThrLockType` for the SQL
+    /// layer to install. The C++ also writes the lock into a
+    /// `THR_LOCK_DATA**` cursor — that's a cxx-bridge-side concern.
+    ///
+    /// ## What's deferred
+    ///
+    /// The `lock_scanned_rows` upgrade path (`ha_rocksdb.cc:11299..11323`)
+    /// — when the THD's `lock_scanned_rows` sysvar is on AND the
+    /// isolation level is `>= REPEATABLE_READ` (or `SERIALIZABLE`),
+    /// MyRocks upgrades a NONE-mode read to a READ-mode read so
+    /// scanned rows hold their lock past the scan. We don't model
+    /// sysvars or `thd_tx_isolation` across cxx yet; deferred until
+    /// the sysvar plumbing lands.
+    pub fn store_lock(&mut self, thd: StoreLockThd, requested: ThrLockType) -> ThrLockType {
+        // ----- 1. row-lock-mode decision -----
+        if (requested as i32) >= (ThrLockType::WriteAllowWrite as i32) {
+            self.lock_rows = RowLockMode::Write;
+        } else if requested == ThrLockType::ReadWithSharedLocks {
+            self.lock_rows = RowLockMode::Read;
+        } else if requested != ThrLockType::Ignore {
+            self.lock_rows = RowLockMode::None;
+            // lock_scanned_rows + tx_isolation upgrade is deferred —
+            // see method docs.
+        }
+
+        // ----- 2. THR_LOCK downgrade -----
+        //
+        // The C++ guards this with `m_db_lock.type == TL_UNLOCK` so a
+        // re-entrant store_lock on an already-locked handler doesn't
+        // downgrade the active lock. Match by checking `db_lock_type`.
+        if requested != ThrLockType::Ignore && self.db_lock_type == ThrLockType::Unlock {
+            let mut chosen = requested;
+
+            // Concurrent-writes downgrade: TL_WRITE_CONCURRENT_INSERT..=TL_WRITE
+            // → TL_WRITE_ALLOW_WRITE when outside LOCK TABLES + not a
+            // tablespace op.
+            if (chosen as i32) >= (ThrLockType::WriteConcurrentInsert as i32)
+                && (chosen as i32) <= (ThrLockType::Write as i32)
+                && !thd.in_lock_tables
+                && !thd.tablespace_op
+            {
+                chosen = ThrLockType::WriteAllowWrite;
+            }
+
+            // INSERT…SELECT pattern: TL_READ_NO_INSERT → TL_READ
+            // outside LOCK TABLES so the source table doesn't block
+            // inserts into itself.
+            if chosen == ThrLockType::ReadNoInsert && !thd.in_lock_tables {
+                chosen = ThrLockType::Read;
+            }
+
+            self.db_lock_type = chosen;
+            return chosen;
+        }
+
+        requested
+    }
+
+    /// Snapshot of [`Self::lock_rows`] — useful for tests and for the
+    /// soon-to-land DML/read path that consumes it.
+    pub fn lock_rows(&self) -> RowLockMode {
+        self.lock_rows
+    }
+
+    /// Snapshot of the installed THR_LOCK type. Test/diagnostic accessor.
+    pub fn db_lock_type(&self) -> ThrLockType {
+        self.db_lock_type
     }
 }
 
@@ -342,5 +528,149 @@ mod tests {
         // so the import isn't flagged as unused when the doc-test for
         // DdlManager isn't compiled.
         let _ = DdlManager::new();
+    }
+
+    // ----- store_lock -----
+
+    fn thd_default() -> StoreLockThd {
+        StoreLockThd::default()
+    }
+
+    #[test]
+    fn store_lock_write_set_lock_rows_write() {
+        let mut h = HaSlateDb::new();
+        for write_kind in [
+            ThrLockType::WriteAllowWrite,
+            ThrLockType::WriteConcurrentInsert,
+            ThrLockType::WriteDefault,
+            ThrLockType::WriteLowPriority,
+            ThrLockType::Write,
+            ThrLockType::WriteOnly,
+        ] {
+            let mut h2 = HaSlateDb::new();
+            h2.store_lock(thd_default(), write_kind);
+            assert_eq!(h2.lock_rows(), RowLockMode::Write, "{write_kind:?}");
+        }
+        // Sanity: parameterised over a clean handler each iteration; h
+        // here is just to demonstrate the API also accepts a long-lived
+        // handler.
+        h.store_lock(thd_default(), ThrLockType::WriteDefault);
+        assert_eq!(h.lock_rows(), RowLockMode::Write);
+    }
+
+    #[test]
+    fn store_lock_read_with_shared_locks_sets_lock_rows_read() {
+        let mut h = HaSlateDb::new();
+        h.store_lock(thd_default(), ThrLockType::ReadWithSharedLocks);
+        assert_eq!(h.lock_rows(), RowLockMode::Read);
+    }
+
+    #[test]
+    fn store_lock_plain_read_sets_lock_rows_none() {
+        let mut h = HaSlateDb::new();
+        h.store_lock(thd_default(), ThrLockType::Read);
+        assert_eq!(h.lock_rows(), RowLockMode::None);
+    }
+
+    #[test]
+    fn store_lock_ignore_does_not_change_lock_rows() {
+        let mut h = HaSlateDb::new();
+        // Seed lock_rows = Write via an earlier call.
+        h.store_lock(thd_default(), ThrLockType::Write);
+        assert_eq!(h.lock_rows(), RowLockMode::Write);
+
+        // TL_IGNORE must NOT clear it.
+        h.store_lock(thd_default(), ThrLockType::Ignore);
+        assert_eq!(h.lock_rows(), RowLockMode::Write);
+    }
+
+    #[test]
+    fn store_lock_downgrades_write_range_outside_lock_tables() {
+        for input in [
+            ThrLockType::WriteConcurrentInsert,
+            ThrLockType::WriteDelayed,
+            ThrLockType::WriteDefault,
+            ThrLockType::WriteLowPriority,
+            ThrLockType::Write,
+        ] {
+            let mut h = HaSlateDb::new();
+            let out = h.store_lock(thd_default(), input);
+            assert_eq!(
+                out,
+                ThrLockType::WriteAllowWrite,
+                "downgrade for {input:?}",
+            );
+            assert_eq!(h.db_lock_type(), ThrLockType::WriteAllowWrite);
+        }
+    }
+
+    #[test]
+    fn store_lock_does_not_downgrade_inside_lock_tables() {
+        let thd = StoreLockThd {
+            in_lock_tables: true,
+            tablespace_op: false,
+        };
+        let mut h = HaSlateDb::new();
+        let out = h.store_lock(thd, ThrLockType::WriteDefault);
+        assert_eq!(out, ThrLockType::WriteDefault, "inside LOCK TABLES, no downgrade");
+    }
+
+    #[test]
+    fn store_lock_does_not_downgrade_for_tablespace_op() {
+        let thd = StoreLockThd {
+            in_lock_tables: false,
+            tablespace_op: true,
+        };
+        let mut h = HaSlateDb::new();
+        let out = h.store_lock(thd, ThrLockType::WriteDefault);
+        assert_eq!(out, ThrLockType::WriteDefault, "tablespace op blocks downgrade");
+    }
+
+    #[test]
+    fn store_lock_downgrades_read_no_insert_outside_lock_tables() {
+        let mut h = HaSlateDb::new();
+        let out = h.store_lock(thd_default(), ThrLockType::ReadNoInsert);
+        assert_eq!(out, ThrLockType::Read);
+        // The lock_rows decision for plain reads is still None.
+        assert_eq!(h.lock_rows(), RowLockMode::None);
+    }
+
+    #[test]
+    fn store_lock_does_not_redowngrade_when_lock_already_installed() {
+        // After the first store_lock installs a lock, a second call
+        // must NOT re-downgrade it — matches the C++ `m_db_lock.type
+        // == TL_UNLOCK` gate. Re-entrant call returns the input lock
+        // unchanged.
+        let mut h = HaSlateDb::new();
+        let first = h.store_lock(thd_default(), ThrLockType::Write);
+        assert_eq!(first, ThrLockType::WriteAllowWrite);
+
+        // Now the handler holds WriteAllowWrite. A second call should
+        // see db_lock_type != Unlock and return its input verbatim.
+        let second = h.store_lock(thd_default(), ThrLockType::ReadNoInsert);
+        assert_eq!(
+            second,
+            ThrLockType::ReadNoInsert,
+            "no downgrade once a lock is installed",
+        );
+    }
+
+    #[test]
+    fn store_lock_returns_input_for_lock_types_outside_downgrade_set() {
+        let mut h = HaSlateDb::new();
+        let out = h.store_lock(thd_default(), ThrLockType::ReadHighPriority);
+        // Not in the WriteConcurrentInsert..=Write range and not
+        // ReadNoInsert ⇒ returned unchanged.
+        assert_eq!(out, ThrLockType::ReadHighPriority);
+    }
+
+    #[test]
+    fn thr_lock_type_from_i32_round_trips_known_values() {
+        for v in [-1i32, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
+            assert_eq!(ThrLockType::from_i32(v) as i32, v);
+        }
+        // Unknown -> Ignore.
+        assert_eq!(ThrLockType::from_i32(99), ThrLockType::Ignore);
+        assert_eq!(ThrLockType::from_i32(-2), ThrLockType::Ignore);
     }
 }
