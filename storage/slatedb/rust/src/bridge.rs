@@ -77,6 +77,58 @@ mod ffi {
         /// `true` iff a table with `name` is in the catalogue. Returns
         /// `false` if no engine is installed (uninited / post-shutdown).
         fn slatedb_has_table(name: String) -> bool;
+
+        // ----- per-handler lifecycle -----
+        //
+        // Opaque `HaSlateDb` handle owned on the C++ side as
+        // `unique_ptr<HaSlateDb>`. C++ calls `new_ha_slatedb()` once
+        // per (THD, table) and then drives `ha_open` / `ha_close`.
+
+        type HaSlateDb;
+
+        /// Construct a fresh handler instance. Always succeeds.
+        fn new_ha_slatedb() -> Box<HaSlateDb>;
+
+        /// Bind the handler to the table at `name` (MariaDB on-disk
+        /// path form, e.g. `./db/tbl` or `./db/tbl#P#part`).
+        ///
+        /// Returns 0 on success; see [`super::handler::status`] for
+        /// failure codes (NO_ENGINE / BAD_TABLE_PATH /
+        /// NO_SUCH_TABLE / ENGINE_IO_FAILED).
+        fn ha_open(self: &mut HaSlateDb, name: String) -> i32;
+
+        /// Release the handler's per-table state. Idempotent.
+        /// Always returns 0.
+        fn ha_close(self: &mut HaSlateDb) -> i32;
+    }
+}
+
+pub use crate::handler::HaSlateDb;
+
+/// `cxx::bridge` constructor — produces a `Box<HaSlateDb>` which cxx
+/// translates to `unique_ptr<HaSlateDb>` on the C++ side.
+fn new_ha_slatedb() -> Box<HaSlateDb> {
+    Box::new(HaSlateDb::new())
+}
+
+// Method bodies for the `self: &mut HaSlateDb` cxx-bridge entries.
+// They live here (next to the bridge declaration) rather than in
+// `handler.rs` so the cxx surface is localised to this module —
+// `handler.rs` exposes a Rust-native API; the bridge module owns the
+// status-code translation and the method shape cxx wants.
+impl HaSlateDb {
+    /// Cxx wrapper — delegates to the Rust-native [`HaSlateDb::open`]
+    /// and collapses the error to a stable i32 via
+    /// [`crate::handler::open_result_to_status`].
+    fn ha_open(&mut self, name: String) -> i32 {
+        crate::handler::open_result_to_status(self.open(&name))
+    }
+
+    /// Cxx wrapper — [`HaSlateDb::close`] is infallible today, so this
+    /// always returns OK; preserved as a fallible signature so future
+    /// closes that flush per-handler state can surface errors.
+    fn ha_close(&mut self) -> i32 {
+        crate::handler::open_result_to_status(self.close())
     }
 }
 
@@ -121,11 +173,11 @@ struct EngineState {
 // Bridge bodies
 // ---------------------------------------------------------------------------
 
-fn slatedb_version() -> String {
+pub(crate) fn slatedb_version() -> String {
     format!("slatedb-engine {}", env!("CARGO_PKG_VERSION"))
 }
 
-fn slatedb_init_in_memory(name: String) -> i32 {
+pub(crate) fn slatedb_init_in_memory(name: String) -> i32 {
     // 1. Install the runtime if it isn't already. "Already installed"
     //    is fine — runtime is singleton-by-design.
     if crate::runtime::get().is_none() {
@@ -173,7 +225,7 @@ fn slatedb_init_in_memory(name: String) -> i32 {
     }
 }
 
-fn slatedb_shutdown() -> i32 {
+pub(crate) fn slatedb_shutdown() -> i32 {
     // Drop the catalogue + take the EngineDb out under the lock.
     let db_to_close = {
         let mut guard = ENGINE.write();
@@ -194,12 +246,33 @@ fn slatedb_shutdown() -> i32 {
     }
 }
 
-fn slatedb_has_table(name: String) -> bool {
+pub(crate) fn slatedb_has_table(name: String) -> bool {
     let guard = ENGINE.read();
     match guard.as_ref() {
         Some(state) => state.ddl.find(&name).is_some(),
         None => false,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Internal accessors (not exposed via cxx)
+// ---------------------------------------------------------------------------
+
+/// Hand the current `DdlManager` to internal Rust callers. Returns
+/// `None` if no engine is installed. Each caller gets an `Arc` clone
+/// so the read-lock guard doesn't outlive the call.
+pub(crate) fn current_ddl() -> Option<Arc<DdlManager>> {
+    let guard = ENGINE.read();
+    guard.as_ref().map(|state| state.ddl.clone())
+}
+
+/// Hand the current `EngineDb` to internal Rust callers. Same shape as
+/// [`current_ddl`]. Currently only used by handler test fixtures; will
+/// be needed by handler buckets that issue direct dict reads.
+#[allow(dead_code)]
+pub(crate) fn current_engine() -> Option<Arc<EngineDb>> {
+    let guard = ENGINE.read();
+    guard.as_ref().map(|state| state.db.clone())
 }
 
 #[cfg(test)]
