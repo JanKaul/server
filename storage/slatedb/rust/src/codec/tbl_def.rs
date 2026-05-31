@@ -195,6 +195,14 @@ impl TblDef {
         self.hidden_pk_val.fetch_max(v, Ordering::Relaxed)
     }
 
+    /// Atomically add `delta` to the hidden-PK counter and return
+    /// the *previous* value (i.e. the rowid to use for the new row).
+    /// Matches C++ `m_tbl_def->m_hidden_pk_val++` at
+    /// `ha_rocksdb.cc:6272` (post-increment returns the old value).
+    pub fn fetch_add_hidden_pk_val(&self, delta: i64) -> i64 {
+        self.hidden_pk_val.fetch_add(delta, Ordering::Relaxed)
+    }
+
     pub fn auto_incr_val(&self) -> u64 {
         self.auto_incr_val.load(Ordering::Relaxed)
     }
@@ -203,6 +211,14 @@ impl TblDef {
     }
     pub fn fetch_max_auto_incr_val(&self, v: u64) -> u64 {
         self.auto_incr_val.fetch_max(v, Ordering::Relaxed)
+    }
+    /// Borrow the raw atomic — needed by `HaSlateDb::get_auto_increment`'s
+    /// CAS loop, which can't be expressed through the high-level
+    /// store/fetch_max helpers because the value it stores depends on
+    /// the value it loaded (capped at `max_val`, replication sequence
+    /// math, etc.).
+    pub fn auto_incr_atomic(&self) -> &AtomicU64 {
+        &self.auto_incr_val
     }
 
     pub fn is_read_free_rpl_table(&self) -> bool {

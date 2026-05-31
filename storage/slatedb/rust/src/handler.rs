@@ -507,6 +507,233 @@ impl HaSlateDb {
         self.retrieved_record.extend_from_slice(bytes);
     }
 
+    // ----- auto_incr + hidden_pk -----
+
+    /// True iff this handler's table uses a hidden primary key (no
+    /// declared PRIMARY KEY). Delegates to
+    /// [`crate::codec::key::KeyDef::table_has_hidden_pk`] — but
+    /// today we don't have a TableShareView for the bound table; we
+    /// derive equivalently from `tbl_def.key_descrs` by checking the
+    /// last index's type. Returns `false` if the handler isn't open
+    /// (defensive — the C++ asserts).
+    ///
+    /// Translated from `ha_rocksdb::has_hidden_pk` at
+    /// `ha_rocksdb.cc:9487`.
+    pub fn has_hidden_pk(&self) -> bool {
+        let Some(tdef) = &self.tbl_def else { return false };
+        tdef.key_descrs()
+            .last()
+            .map(|kd| kd.index_type == crate::codec::key::IndexType::HiddenPrimary)
+            .unwrap_or(false)
+    }
+
+    /// True iff `index` is the position of the hidden PK. Hidden PK
+    /// is always the last entry in `tbl_def.key_descrs` (matches the
+    /// C++ `m_key_count - 1`). Returns `false` if the table doesn't
+    /// have a hidden PK or the handler isn't open.
+    ///
+    /// Translated from `ha_rocksdb::is_hidden_pk` at
+    /// `ha_rocksdb.cc:9495`.
+    pub fn is_hidden_pk(&self, index: u32) -> bool {
+        let Some(tdef) = &self.tbl_def else { return false };
+        if !self.has_hidden_pk() {
+            return false;
+        }
+        (index as usize) + 1 == tdef.key_count()
+    }
+
+    /// Index-position of the PK (declared or hidden). Returns `None`
+    /// if the handler isn't open or the catalogue's table has no
+    /// keys at all (shouldn't happen — every table has at least a
+    /// PK).
+    ///
+    /// Translated from `ha_rocksdb::pk_index` at
+    /// `ha_rocksdb.cc:9504`. The C++ takes `table->s->primary_key`
+    /// as input; we don't have that surfaced yet, so we walk
+    /// `key_descrs` for a Primary or HiddenPrimary.
+    pub fn pk_index(&self) -> Option<u32> {
+        let Some(tdef) = &self.tbl_def else { return None };
+        for (i, kd) in tdef.key_descrs().iter().enumerate() {
+            if matches!(
+                kd.index_type,
+                crate::codec::key::IndexType::Primary
+                    | crate::codec::key::IndexType::HiddenPrimary,
+            ) {
+                return Some(i as u32);
+            }
+        }
+        None
+    }
+
+    /// True iff `index` is the PK (declared or hidden) position.
+    /// Translated from `ha_rocksdb::is_pk` at `ha_rocksdb.cc:9513`.
+    pub fn is_pk(&self, index: u32) -> bool {
+        self.pk_index() == Some(index) || self.is_hidden_pk(index)
+    }
+
+    /// CAS-bump the in-memory auto-incr value to `val` if `val` is
+    /// greater than the current. No-op on smaller values. Pure
+    /// memory operation; no I/O. Returns `Err(Invalid)` if the
+    /// handler isn't open.
+    ///
+    /// Translated from `ha_rocksdb::update_auto_incr_val` at
+    /// `ha_rocksdb.cc:6191`. Implemented via
+    /// [`crate::codec::tbl_def::TblDef::fetch_max_auto_incr_val`]
+    /// (`AtomicU64::fetch_max`) — semantically identical to the
+    /// C++'s `compare_exchange_weak` loop, fewer round trips.
+    pub fn update_auto_incr_val(&self, val: u64) -> Result<(), Error> {
+        let tdef = self.tbl_def.as_ref().ok_or_else(|| {
+            Error::invalid("update_auto_incr_val: handler not open".into())
+        })?;
+        tdef.fetch_max_auto_incr_val(val);
+        Ok(())
+    }
+
+    /// Allocate the next hidden-PK rowid: `fetch_add(1)` on the
+    /// in-memory counter. Returns the **previous** value — that's
+    /// the rowid to use for the new row, matching C++
+    /// `m_hidden_pk_val++` (post-increment) at `ha_rocksdb.cc:6272`.
+    ///
+    /// Returns `Err(Invalid)` if the handler isn't open or the
+    /// table doesn't have a hidden PK (the C++ asserts in the
+    /// latter case).
+    pub fn update_hidden_pk_val(&self) -> Result<i64, Error> {
+        let tdef = self.tbl_def.as_ref().ok_or_else(|| {
+            Error::invalid("update_hidden_pk_val: handler not open".into())
+        })?;
+        if !self.has_hidden_pk() {
+            return Err(Error::invalid(
+                "update_hidden_pk_val: table has no hidden PK".into(),
+            ));
+        }
+        Ok(tdef.fetch_add_hidden_pk_val(1))
+    }
+
+    /// Decode the 8-byte hidden-PK rowid from a row-key. The key
+    /// layout is `u32_be(index_id) || u64_be(hidden_pk)` — we skip
+    /// the 4-byte index header and read the next 8 bytes as a u64.
+    ///
+    /// Translated from `ha_rocksdb::read_hidden_pk_id_from_rowkey`
+    /// at `ha_rocksdb.cc:6277`. Returns the rowid as `i64` because
+    /// the C++ stores hidden-PK values as `longlong` even though
+    /// they're written as `u64_be` on the wire (sign matters for
+    /// the wraparound semantic elsewhere in MyRocks).
+    ///
+    /// Errors with `Data` on a short rowkey (matches the C++
+    /// `HA_ERR_ROCKSDB_CORRUPT_DATA`).
+    pub fn read_hidden_pk_id_from_rowkey(rowkey: &[u8]) -> Result<i64, Error> {
+        use crate::codec::key::INDEX_NUMBER_SIZE;
+        const HIDDEN_PK_BYTES: usize = 8;
+        if rowkey.len() < INDEX_NUMBER_SIZE + HIDDEN_PK_BYTES {
+            return Err(Error::data(format!(
+                "read_hidden_pk_id_from_rowkey: short rowkey \
+                 (got {} bytes, need {})",
+                rowkey.len(),
+                INDEX_NUMBER_SIZE + HIDDEN_PK_BYTES,
+            )));
+        }
+        let mut buf = [0u8; HIDDEN_PK_BYTES];
+        buf.copy_from_slice(
+            &rowkey[INDEX_NUMBER_SIZE..INDEX_NUMBER_SIZE + HIDDEN_PK_BYTES],
+        );
+        Ok(u64::from_be_bytes(buf) as i64)
+    }
+
+    /// Auto-increment reservation. Returns `(first_value,
+    /// nb_reserved_values)` — `nb_reserved_values` is always 1
+    /// (matches MyRocks: "we will always tell MySQL that we only
+    /// reserved 1 value" at `ha_rocksdb.cc:12297`).
+    ///
+    /// `max_val` is the largest legal value for the auto-incr
+    /// column's type (the C++ derives it from `Field`; we accept it
+    /// as a parameter so the handler doesn't need Field access).
+    ///
+    /// `inc == 1` is the fast path — a straight CAS bump capped at
+    /// `max_val`. `inc != 1` follows the replication-multi-master
+    /// arithmetic from `ha_rocksdb.cc:12339..12413`.
+    ///
+    /// If the in-memory counter is at `u64::MAX`, returns
+    /// `(u64::MAX, 1)` — the SQL layer maps that to
+    /// `ER_AUTOINC_READ_FAILED` for UNSIGNED BIGINT or to
+    /// `ER_DUP_ENTRY` for other types.
+    ///
+    /// Translated from `ha_rocksdb::get_auto_increment` at
+    /// `ha_rocksdb.cc:12282`. Returns `Err(Invalid)` if the handler
+    /// isn't open.
+    pub fn get_auto_increment(
+        &self,
+        mut off: u64,
+        inc: u64,
+        max_val: u64,
+    ) -> Result<(u64, u64), Error> {
+        let tdef = self.tbl_def.as_ref().ok_or_else(|| {
+            Error::invalid("get_auto_increment: handler not open".into())
+        })?;
+        if off > inc {
+            off = 1;
+        }
+        let atomic = tdef.auto_incr_atomic();
+
+        let new_val = if inc == 1 {
+            // Fast path: CAS bump capped at max_val. Matches the C++
+            // inc==1 branch at ha_rocksdb.cc:12316..12338.
+            let mut current = atomic.load(std::sync::atomic::Ordering::Relaxed);
+            loop {
+                if current == u64::MAX {
+                    break u64::MAX;
+                }
+                let stored = std::cmp::min(current.saturating_add(1), max_val);
+                match atomic.compare_exchange_weak(
+                    current,
+                    stored,
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                ) {
+                    Ok(_) => break current,
+                    Err(actual) => current = actual,
+                }
+            }
+        } else {
+            // Replication-style sequence: off + N * inc.
+            //
+            // Same arithmetic as the C++ — see the long comment at
+            // ha_rocksdb.cc:12339..12413 for the derivation.
+            let mut last_val = atomic.load(std::sync::atomic::Ordering::Relaxed);
+            if last_val > max_val {
+                last_val = u64::MAX;
+                atomic.store(last_val, std::sync::atomic::Ordering::Relaxed);
+                last_val
+            } else {
+                loop {
+                    debug_assert!(last_val > 0);
+                    let last_minus_1 = last_val - 1;
+                    let n = last_minus_1 / inc
+                        + (last_minus_1 % inc + inc - off) / inc;
+                    // Overflow check: if n * inc + off would overflow,
+                    // bail with u64::MAX (C++ ha_rocksdb.cc:12376..12399).
+                    if n > (u64::MAX - off) / inc {
+                        debug_assert_eq!(max_val, u64::MAX);
+                        atomic.store(u64::MAX, std::sync::atomic::Ordering::Relaxed);
+                        break u64::MAX;
+                    }
+                    let candidate = n * inc + off;
+                    let stored = std::cmp::min(candidate.saturating_add(1), max_val);
+                    match atomic.compare_exchange_weak(
+                        last_val,
+                        stored,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break candidate,
+                        Err(actual) => last_val = actual,
+                    }
+                }
+            }
+        };
+
+        Ok((new_val, 1))
+    }
+
     /// Statement-boundary hook. Translated (with significant scope
     /// reduction) from `ha_rocksdb::external_lock` at
     /// `ha_rocksdb.cc:11409`.
@@ -965,6 +1192,259 @@ mod tests {
     }
 
     // ----- external_lock -----
+
+    // ----- auto_incr + hidden_pk -----
+
+    fn hidden_pk_kd(index_number: u32, cf_id: u32) -> Arc<KeyDef> {
+        let mut kd = KeyDef::new_skeleton(
+            index_number,
+            cf_id,
+            0,
+            INDEX_INFO_VERSION_LATEST as u16,
+            IndexType::HiddenPrimary,
+            PRIMARY_FORMAT_VERSION_LATEST,
+            false,
+            "HIDDEN_PK",
+        );
+        kd.maxlength = 12;
+        Arc::new(kd)
+    }
+
+    fn install_table_with_keys_for_test(name: &str, keys: Vec<Arc<KeyDef>>) {
+        let _ = crate::bridge::slatedb_shutdown();
+        assert_eq!(
+            crate::bridge::slatedb_init_in_memory(format!("handler_aic_{name}")),
+            status::OK,
+        );
+        let db = crate::bridge::current_engine().expect("engine");
+        let ddl = crate::bridge::current_ddl().expect("ddl");
+        let tdef = Arc::new(TblDef::new(name).unwrap().with_keys(keys));
+        crate::runtime::block_on(async move {
+            ddl.put_and_write(tdef, db.db()).await.expect("put_and_write");
+        });
+    }
+
+    #[test]
+    fn has_hidden_pk_true_when_last_index_is_hidden() {
+        let _g = SERIALISE.lock();
+        install_table_with_keys_for_test("appdb.hpk", vec![hidden_pk_kd(100, 1)]);
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/hpk").expect("open");
+        assert!(h.has_hidden_pk());
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn has_hidden_pk_false_when_only_declared_pk() {
+        let _g = SERIALISE.lock();
+        install_table_with_keys_for_test("appdb.pk_only", vec![pk(100, 1)]);
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/pk_only").expect("open");
+        assert!(!h.has_hidden_pk());
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn has_hidden_pk_false_when_handler_not_open() {
+        let h = HaSlateDb::new();
+        assert!(!h.has_hidden_pk());
+    }
+
+    #[test]
+    fn is_hidden_pk_only_for_last_slot_of_hidden_pk_table() {
+        let _g = SERIALISE.lock();
+        install_table_with_keys_for_test(
+            "appdb.hpk2",
+            vec![
+                Arc::new(KeyDef::new_skeleton(
+                    50,
+                    1,
+                    0,
+                    INDEX_INFO_VERSION_LATEST as u16,
+                    IndexType::Secondary,
+                    PRIMARY_FORMAT_VERSION_LATEST,
+                    false,
+                    "sk",
+                )),
+                hidden_pk_kd(51, 1),
+            ],
+        );
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/hpk2").expect("open");
+        assert!(!h.is_hidden_pk(0)); // SK slot
+        assert!(h.is_hidden_pk(1));  // hidden PK at last slot
+        assert!(!h.is_hidden_pk(99)); // out of range
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn pk_index_finds_declared_or_hidden() {
+        let _g = SERIALISE.lock();
+        install_table_with_keys_for_test(
+            "appdb.pkfind",
+            vec![pk(100, 1)],
+        );
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/pkfind").expect("open");
+        assert_eq!(h.pk_index(), Some(0));
+        assert!(h.is_pk(0));
+        assert!(!h.is_pk(1));
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn update_auto_incr_val_cas_bumps_only_upward() {
+        let _g = SERIALISE.lock();
+        install_table_with_keys_for_test("appdb.aic", vec![pk(100, 1)]);
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/aic").expect("open");
+
+        let tdef = h.tbl_def().unwrap().clone();
+        tdef.store_auto_incr_val(10);
+
+        // Lower value is a no-op.
+        h.update_auto_incr_val(5).unwrap();
+        assert_eq!(tdef.auto_incr_val(), 10);
+
+        // Higher value bumps.
+        h.update_auto_incr_val(20).unwrap();
+        assert_eq!(tdef.auto_incr_val(), 20);
+
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn update_auto_incr_val_errors_when_handler_not_open() {
+        let h = HaSlateDb::new();
+        let err = h.update_auto_incr_val(1).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+    }
+
+    #[test]
+    fn update_hidden_pk_val_fetch_adds_returning_old() {
+        let _g = SERIALISE.lock();
+        install_table_with_keys_for_test("appdb.hpkadd", vec![hidden_pk_kd(99, 1)]);
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/hpkadd").expect("open");
+        let tdef = h.tbl_def().unwrap().clone();
+        tdef.store_hidden_pk_val(42);
+
+        let first = h.update_hidden_pk_val().unwrap();
+        assert_eq!(first, 42, "returns the old value");
+        assert_eq!(tdef.hidden_pk_val(), 43);
+
+        let second = h.update_hidden_pk_val().unwrap();
+        assert_eq!(second, 43);
+        assert_eq!(tdef.hidden_pk_val(), 44);
+
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn update_hidden_pk_val_errors_when_no_hidden_pk() {
+        let _g = SERIALISE.lock();
+        install_table_with_keys_for_test("appdb.nohpk", vec![pk(100, 1)]);
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/nohpk").expect("open");
+        let err = h.update_hidden_pk_val().unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("no hidden PK"));
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn read_hidden_pk_id_from_rowkey_decodes_u64_after_index_header() {
+        // Rowkey: u32_be(index_id=0x1234) || u64_be(hidden_pk=0xDEADBEEF).
+        let mut rowkey = Vec::new();
+        rowkey.extend_from_slice(&0x1234_u32.to_be_bytes());
+        rowkey.extend_from_slice(&0xDEAD_BEEF_u64.to_be_bytes());
+        let id = HaSlateDb::read_hidden_pk_id_from_rowkey(&rowkey).unwrap();
+        assert_eq!(id, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn read_hidden_pk_id_from_rowkey_short_input_is_data_error() {
+        let err = HaSlateDb::read_hidden_pk_id_from_rowkey(&[1, 2, 3]).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Data);
+    }
+
+    #[test]
+    fn get_auto_increment_inc_eq_1_fast_path() {
+        let _g = SERIALISE.lock();
+        install_table_with_keys_for_test("appdb.gai1", vec![pk(100, 1)]);
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/gai1").expect("open");
+        let tdef = h.tbl_def().unwrap().clone();
+        tdef.store_auto_incr_val(1);
+
+        let (first, n) = h.get_auto_increment(1, 1, 1000).unwrap();
+        assert_eq!(first, 1);
+        assert_eq!(n, 1);
+        assert_eq!(tdef.auto_incr_val(), 2);
+
+        // Next call.
+        let (first, _) = h.get_auto_increment(1, 1, 1000).unwrap();
+        assert_eq!(first, 2);
+        assert_eq!(tdef.auto_incr_val(), 3);
+
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn get_auto_increment_caps_at_max_val() {
+        let _g = SERIALISE.lock();
+        install_table_with_keys_for_test("appdb.gai_cap", vec![pk(100, 1)]);
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/gai_cap").expect("open");
+        let tdef = h.tbl_def().unwrap().clone();
+        tdef.store_auto_incr_val(100);
+
+        // max_val = 100; the C++ stores std::min(new_val + 1, max_val)
+        // so successive calls past max all see auto_incr stuck at 100
+        // and the caller returns 100 repeatedly (which causes
+        // ER_DUP_ENTRY in the SQL layer for unique-PK columns).
+        let (first, _) = h.get_auto_increment(1, 1, 100).unwrap();
+        assert_eq!(first, 100);
+        assert_eq!(tdef.auto_incr_val(), 100);
+
+        let (first2, _) = h.get_auto_increment(1, 1, 100).unwrap();
+        assert_eq!(first2, 100, "stuck at max");
+
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn get_auto_increment_u64_max_returns_max() {
+        let _g = SERIALISE.lock();
+        install_table_with_keys_for_test("appdb.gai_max", vec![pk(100, 1)]);
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/gai_max").expect("open");
+        let tdef = h.tbl_def().unwrap().clone();
+        tdef.store_auto_incr_val(u64::MAX);
+
+        let (first, _) = h.get_auto_increment(1, 1, u64::MAX).unwrap();
+        assert_eq!(first, u64::MAX);
+
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn get_auto_increment_inc_3_off_1_replication_sequence() {
+        // off=1, inc=3 produces sequence 1, 4, 7, 10, ...
+        let _g = SERIALISE.lock();
+        install_table_with_keys_for_test("appdb.gai_rep", vec![pk(100, 1)]);
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/gai_rep").expect("open");
+        let tdef = h.tbl_def().unwrap().clone();
+        tdef.store_auto_incr_val(1);
+
+        let (a, _) = h.get_auto_increment(1, 3, 1000).unwrap();
+        let (b, _) = h.get_auto_increment(1, 3, 1000).unwrap();
+        let (c, _) = h.get_auto_increment(1, 3, 1000).unwrap();
+        assert_eq!((a, b, c), (1, 4, 7));
+
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
 
     #[test]
     fn external_lock_type_from_i32_matches_sys_file_h() {
