@@ -127,6 +127,23 @@ mod ffi {
         /// `enum ha_extra_function` value from `include/my_base.h`;
         /// unknown values become a silent no-op. Always returns 0.
         fn ha_extra(self: &mut HaSlateDb, extra_op: i32) -> i32;
+
+        /// Statement-boundary hook. `lock_type` is the raw
+        /// `F_RDLCK=1 / F_WRLCK=2 / F_UNLCK=8` from `<sys/file.h>`.
+        /// `autocommit_boundary` is true when an F_UNLCK should
+        /// commit the txn (caller computed from
+        /// thd->variables.option_bits & (OPTION_NOT_AUTOCOMMIT |
+        /// OPTION_BEGIN) + n_mysql_tables_in_use).
+        ///
+        /// Returns status::OK on success; failure codes are
+        /// status::NO_ENGINE / status::BAD_TABLE_PATH (used here as
+        /// "unknown lock_type") / status::ENGINE_IO_FAILED.
+        fn ha_external_lock(
+            self: &mut HaSlateDb,
+            thd_id: u64,
+            lock_type: i32,
+            autocommit_boundary: bool,
+        ) -> i32;
     }
 }
 
@@ -186,6 +203,30 @@ impl HaSlateDb {
         crate::handler::open_result_to_status(
             self.extra(crate::handler::HaExtraFunction::from_i32(extra_op)),
         )
+    }
+
+    /// Cxx wrapper — drives [`HaSlateDb::external_lock`] under the
+    /// global tokio runtime via `runtime::block_on`. Unknown
+    /// `lock_type` ints collapse to `status::BAD_TABLE_PATH`
+    /// (re-purposed here as "bad input"); a missing engine returns
+    /// `status::NO_ENGINE`; SlateDB I/O failure (incl. SSI conflict)
+    /// returns `status::ENGINE_IO_FAILED`.
+    fn ha_external_lock(
+        &mut self,
+        thd_id: u64,
+        lock_type: i32,
+        autocommit_boundary: bool,
+    ) -> i32 {
+        let typed = match crate::handler::ExternalLockType::from_i32(lock_type) {
+            Some(t) => t,
+            None => return crate::handler::status::BAD_TABLE_PATH,
+        };
+        let runtime = match crate::runtime::get() {
+            Some(rt) => rt,
+            None => return status::RUNTIME_INIT_FAILED,
+        };
+        let result = runtime.block_on(self.external_lock(thd_id, typed, autocommit_boundary));
+        crate::handler::open_result_to_status(result)
     }
 }
 

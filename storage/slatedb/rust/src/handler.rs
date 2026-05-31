@@ -176,6 +176,35 @@ impl HaExtraFunction {
     }
 }
 
+/// MariaDB's `int lock_type` parameter to `external_lock`. Values
+/// from `<sys/file.h>` (`F_RDLCK = 1`, `F_WRLCK = 2`, `F_UNLCK = 8`).
+/// Pinned here so the bridge can pass the raw int and we map to
+/// the typed enum.
+#[repr(i32)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalLockType {
+    /// `F_RDLCK = 1` — table is being read.
+    Read = 1,
+    /// `F_WRLCK = 2` — table is being written.
+    Write = 2,
+    /// `F_UNLCK = 8` — table is being released. Maybe-commit point.
+    Unlock = 8,
+}
+
+impl ExternalLockType {
+    /// Map from the raw `lock_type` int. Unknown values return
+    /// `None`; the caller treats that as an internal error (the
+    /// SQL layer shouldn't be passing values outside the F_* set).
+    pub fn from_i32(v: i32) -> Option<Self> {
+        match v {
+            1 => Some(Self::Read),
+            2 => Some(Self::Write),
+            8 => Some(Self::Unlock),
+            _ => None,
+        }
+    }
+}
+
 /// Subset of MariaDB `THD` state that [`HaSlateDb::store_lock`] needs.
 /// Filled by the cxx side from a live `THD*` before calling in.
 ///
@@ -476,6 +505,71 @@ impl HaSlateDb {
     pub(crate) fn set_retrieved_record_for_test(&mut self, bytes: &[u8]) {
         self.retrieved_record.clear();
         self.retrieved_record.extend_from_slice(bytes);
+    }
+
+    /// Statement-boundary hook. Translated (with significant scope
+    /// reduction) from `ha_rocksdb::external_lock` at
+    /// `ha_rocksdb.cc:11409`.
+    ///
+    /// - On `F_RDLCK` / `F_WRLCK` (lock acquire): get-or-create the
+    ///   per-THD transaction in the global
+    ///   [`crate::engine::txn_registry::TxnRegistry`]. For `F_WRLCK`
+    ///   we additionally set `lock_rows = Write` (matches the C++).
+    /// - On `F_UNLCK`: if `autocommit_boundary` is true (caller is
+    ///   outside `BEGIN` and has autocommit on), commit the
+    ///   transaction. Otherwise leave it open — the SQL layer will
+    ///   either issue more statements in the same txn or `COMMIT` /
+    ///   `ROLLBACK` later.
+    ///
+    /// `autocommit_boundary` is the cxx side's pre-computed answer
+    /// to "should this F_UNLCK commit the txn?" — derived from
+    /// `thd->variables.option_bits & (OPTION_NOT_AUTOCOMMIT |
+    /// OPTION_BEGIN)` plus the `n_mysql_tables_in_use` counter the
+    /// SQL layer maintains. We don't model those on the Rust side.
+    ///
+    /// ## What's deferred
+    ///
+    /// - Isolation-level selection — txn always begins at
+    ///   SerializableSnapshot today; sysvar-driven Snapshot vs
+    ///   SerializableSnapshot lands when sysvars do.
+    /// - Isolation-level validation (reject SERIALIZABLE outside the
+    ///   READ_COMMITTED..=REPEATABLE_READ band per the C++).
+    /// - DDL tagging (mark txn as CREATE_INDEX/DROP_INDEX/ALTER
+    ///   so commit can apply DDL-specific logic).
+    /// - `register_tx(thd)` cxx callback to tell MariaDB to call our
+    ///   commit/rollback at end-of-statement.
+    pub async fn external_lock(
+        &mut self,
+        thd_id: u64,
+        lock_type: ExternalLockType,
+        autocommit_boundary: bool,
+    ) -> Result<(), Error> {
+        let registry = crate::bridge::current_txn_registry().ok_or_else(|| {
+            Error::invalid(
+                "HaSlateDb::external_lock: no engine installed — call slatedb_init_* first"
+                    .into(),
+            )
+        })?;
+        let db = crate::bridge::current_engine().ok_or_else(|| {
+            Error::invalid("HaSlateDb::external_lock: no engine installed".into())
+        })?;
+
+        match lock_type {
+            ExternalLockType::Write => {
+                self.lock_rows = RowLockMode::Write;
+                registry.get_or_create(thd_id, &db).await?;
+            }
+            ExternalLockType::Read => {
+                registry.get_or_create(thd_id, &db).await?;
+            }
+            ExternalLockType::Unlock => {
+                if autocommit_boundary {
+                    registry.commit(thd_id).await?;
+                }
+                // else: txn stays open for the next statement.
+            }
+        }
+        Ok(())
     }
 }
 
@@ -868,6 +962,165 @@ mod tests {
         assert_eq!(h.retrieved_record_len(), 0, "flush cleared the buffer");
         assert!(h.keyread_only(), "flush did not touch keyread");
         assert!(h.insert_with_update(), "flush did not touch insert_with_update");
+    }
+
+    // ----- external_lock -----
+
+    #[test]
+    fn external_lock_type_from_i32_matches_sys_file_h() {
+        assert_eq!(ExternalLockType::from_i32(1), Some(ExternalLockType::Read));
+        assert_eq!(
+            ExternalLockType::from_i32(2),
+            Some(ExternalLockType::Write),
+        );
+        assert_eq!(
+            ExternalLockType::from_i32(8),
+            Some(ExternalLockType::Unlock),
+        );
+        // Unknown ints return None.
+        assert_eq!(ExternalLockType::from_i32(0), None);
+        assert_eq!(ExternalLockType::from_i32(99), None);
+        assert_eq!(ExternalLockType::from_i32(-1), None);
+    }
+
+    #[test]
+    fn external_lock_wrlck_sets_lock_rows_and_creates_txn() {
+        let _g = SERIALISE.lock();
+        install_engine_with_fixture("appdb.elt1");
+
+        let mut h = HaSlateDb::new();
+        crate::runtime::block_on(async {
+            h.external_lock(1001, ExternalLockType::Write, false)
+                .await
+                .expect("write lock");
+        });
+
+        assert_eq!(h.lock_rows(), RowLockMode::Write);
+        let reg = crate::bridge::current_txn_registry().expect("registry");
+        assert!(reg.has(1001), "txn registered for thd_id=1001");
+
+        // Clean up.
+        reg.rollback(1001);
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn external_lock_rdlck_creates_txn_does_not_change_lock_rows() {
+        let _g = SERIALISE.lock();
+        install_engine_with_fixture("appdb.elt2");
+
+        let mut h = HaSlateDb::new();
+        // Pre-seed lock_rows to verify Read doesn't touch it.
+        h.lock_rows = RowLockMode::None;
+        crate::runtime::block_on(async {
+            h.external_lock(2002, ExternalLockType::Read, false)
+                .await
+                .expect("read lock");
+        });
+
+        assert_eq!(h.lock_rows(), RowLockMode::None);
+        let reg = crate::bridge::current_txn_registry().expect("registry");
+        assert!(reg.has(2002));
+
+        reg.rollback(2002);
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn external_lock_unlock_with_autocommit_commits_txn() {
+        let _g = SERIALISE.lock();
+        install_engine_with_fixture("appdb.elt3");
+
+        let reg = crate::bridge::current_txn_registry().expect("registry");
+        let mut h = HaSlateDb::new();
+        crate::runtime::block_on(async {
+            h.external_lock(3003, ExternalLockType::Read, false)
+                .await
+                .expect("acquire");
+            assert!(reg.has(3003));
+
+            h.external_lock(3003, ExternalLockType::Unlock, true)
+                .await
+                .expect("commit-on-unlock");
+        });
+
+        assert!(!reg.has(3003), "autocommit-boundary unlock dropped the txn");
+
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn external_lock_unlock_without_autocommit_keeps_txn() {
+        let _g = SERIALISE.lock();
+        install_engine_with_fixture("appdb.elt4");
+
+        let reg = crate::bridge::current_txn_registry().expect("registry");
+        let mut h = HaSlateDb::new();
+        crate::runtime::block_on(async {
+            h.external_lock(4004, ExternalLockType::Read, false)
+                .await
+                .expect("acquire");
+
+            // F_UNLCK inside an open BEGIN block — must NOT commit.
+            h.external_lock(4004, ExternalLockType::Unlock, false)
+                .await
+                .expect("unlock-no-commit");
+        });
+
+        assert!(
+            reg.has(4004),
+            "txn stays open for the next statement in the BEGIN block",
+        );
+
+        reg.rollback(4004);
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn external_lock_distinct_thd_ids_get_distinct_txns() {
+        let _g = SERIALISE.lock();
+        install_engine_with_fixture("appdb.elt5");
+
+        let reg = crate::bridge::current_txn_registry().expect("registry");
+        let mut h1 = HaSlateDb::new();
+        let mut h2 = HaSlateDb::new();
+        crate::runtime::block_on(async {
+            h1.external_lock(5001, ExternalLockType::Write, false)
+                .await
+                .expect("h1");
+            h2.external_lock(5002, ExternalLockType::Write, false)
+                .await
+                .expect("h2");
+        });
+
+        assert!(reg.has(5001));
+        assert!(reg.has(5002));
+        assert_eq!(reg.len(), 2);
+
+        reg.rollback(5001);
+        reg.rollback(5002);
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn external_lock_without_engine_returns_invalid() {
+        let _g = SERIALISE.lock();
+        let _ = crate::bridge::slatedb_shutdown();
+
+        let mut h = HaSlateDb::new();
+        // Even though there's no engine, we still need a runtime to call
+        // .await on. Boot it.
+        if crate::runtime::get().is_none() {
+            crate::runtime::init(2, 8).expect("rt");
+        }
+        let err = crate::runtime::block_on(h.external_lock(
+            6006,
+            ExternalLockType::Read,
+            false,
+        ))
+        .unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("no engine installed"));
     }
 
     #[test]
