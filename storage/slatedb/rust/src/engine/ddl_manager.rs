@@ -359,6 +359,26 @@ impl DdlManager {
         st.index_num_to_keydef.remove(&gl_index_id);
     }
 
+    // ----- dict-integrated installation -----
+
+    /// Persist a `TblDef` to the dict and install it in the in-memory
+    /// catalogue. Composition of [`TblDef::put_dict`] + [`Self::put`].
+    /// Matches C++ `Rdb_ddl_manager::put_and_write` at
+    /// `rdb_datadic.cc:4368`.
+    ///
+    /// If the dict write fails (e.g. `cf_flags` mismatch), the
+    /// in-memory catalogue is NOT touched — same ordering as the C++
+    /// (which writes first, then calls `put`).
+    pub async fn put_and_write(
+        &self,
+        tbl: Arc<TblDef>,
+        db: &slatedb::Db,
+    ) -> Result<(), slatedb::Error> {
+        tbl.put_dict(db).await?;
+        self.put(tbl);
+        Ok(())
+    }
+
     // ----- sequence generator passthrough -----
 
     /// Allocate a fresh `index_number`. The on-disk `max_index_id`
@@ -667,5 +687,89 @@ mod tests {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<DdlManager>();
         assert_send_sync::<Arc<DdlManager>>();
+    }
+
+    // ----- put_and_write integration -----
+
+    use crate::codec::dict::ddl_entry_index_start_number;
+    use crate::engine::db::EngineDb;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_and_write_installs_catalogue_and_persists_to_dict() {
+        let engine = EngineDb::open_in_memory("paw_ok").await.expect("open");
+        let m = DdlManager::new();
+
+        let tdef = Arc::new(
+            TblDef::new("db.users")
+                .unwrap()
+                .with_keys(vec![pk(100, 1), sk(101, 1, "by_email")]),
+        );
+
+        m.put_and_write(tdef.clone(), engine.db())
+            .await
+            .expect("put_and_write");
+
+        // In-memory catalogue carries the table.
+        let found = m.find("db.users").expect("present");
+        assert!(Arc::ptr_eq(&found, &tdef));
+
+        // Dict was written: typed DDL-entry decodes to the same id list.
+        let ddl_entry =
+            ddl_entry_index_start_number::read_typed(engine.db(), "db.users")
+                .await
+                .expect("read ddl entry")
+                .expect("present");
+        assert_eq!(
+            ddl_entry,
+            vec![
+                GlIndexId { cf_id: 1, index_id: 100 },
+                GlIndexId { cf_id: 1, index_id: 101 },
+            ],
+        );
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn put_and_write_aborts_on_dict_failure_leaves_catalogue_clean() {
+        let engine = EngineDb::open_in_memory("paw_fail").await.expect("open");
+        let m = DdlManager::new();
+
+        // Establish cf=7 with flags=0 (no reverse).
+        let plain = Arc::new(
+            TblDef::new("db.t1")
+                .unwrap()
+                .with_keys(vec![pk(100, 7)]),
+        );
+        m.put_and_write(plain, engine.db()).await.expect("t1");
+
+        // Build a t2 KeyDef that flips REVERSE_CF_FLAG on the same cf=7.
+        // put_dict must reject it; catalogue must stay clean.
+        let mut reverse_kd = KeyDef::new_skeleton(
+            200,
+            7,
+            0,
+            INDEX_INFO_VERSION_LATEST as u16,
+            IndexType::Primary,
+            PRIMARY_FORMAT_VERSION_LATEST,
+            true, // is_reverse_cf
+            "pk",
+        );
+        reverse_kd.maxlength = 12;
+        let t2 = Arc::new(
+            TblDef::new("db.t2")
+                .unwrap()
+                .with_keys(vec![Arc::new(reverse_kd)]),
+        );
+        let err = m
+            .put_and_write(t2, engine.db())
+            .await
+            .expect_err("should fail");
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+
+        // No db.t2 entry in the catalogue.
+        assert!(m.find("db.t2").is_none());
+
+        engine.close().await.expect("close");
     }
 }
