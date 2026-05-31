@@ -129,6 +129,12 @@ impl SeqGenerator {
     pub fn peek(&self) -> u32 {
         self.next_number
     }
+
+    /// Reset the sequence to start at `value`. Used by `init` after
+    /// reading the persisted `max_index_id` watermark.
+    pub fn reset_to(&mut self, value: u32) {
+        self.next_number = value;
+    }
 }
 
 pub struct DdlManager {
@@ -377,6 +383,144 @@ impl DdlManager {
         tbl.put_dict(db).await?;
         self.put(tbl);
         Ok(())
+    }
+
+    /// Load the catalogue from on-disk dict state. Scans every
+    /// `DdlEntryIndexStartNumber` row, reads the per-index
+    /// `IndexInfo` + `cf_flags` for each id, builds a skeleton
+    /// `KeyDef` per index (full setup runs later when a handler opens
+    /// the table and has the TableShareView), assembles each
+    /// `TblDef`, and installs it via [`Self::put`].
+    ///
+    /// Translated from `Rdb_ddl_manager::init` (`rdb_datadic.cc:4044`).
+    /// Returns the number of tables loaded.
+    ///
+    /// Seeds the sequence to `max(persisted max_index_id,
+    /// EndDictIndexId) + 1` so future allocations skip the dict's
+    /// reserved range.
+    ///
+    /// ## What's deferred
+    ///
+    /// - **`validate_schemas` / `validate_auto_incr`** — startup
+    ///   integrity passes. The C++ runs them when `validate_tables >
+    ///   0`; we always skip today.
+    /// - The KeyDef's `name` is left empty at load (the C++ same),
+    ///   filled in by `setup` when a handler opens the table with a
+    ///   live KEY_INFO array.
+    /// - `ttl_rec_offset` is computed if the TTL flag is set;
+    ///   otherwise left at `0`.
+    pub async fn init(&self, db: &slatedb::Db) -> Result<usize, slatedb::Error> {
+        use crate::codec::dict::{
+            self, cf_flags, ddl_entry_index_start_number, index_info, max_index_id,
+            system_record_prefix, DataDictType,
+        };
+        use crate::codec::key::{IndexFlag, KeyDef, AUTO_CF_FLAG};
+
+        let max_id_in_dict = max_index_id::read(db).await?.unwrap_or(0);
+        let prefix = system_record_prefix(DataDictType::DdlEntryIndexStartNumber);
+
+        let mut it = dict::scan(db, DataDictType::DdlEntryIndexStartNumber).await?;
+        let mut count = 0usize;
+
+        while let Some(kv) = it.next().await? {
+            // Suffix after the system-record prefix is the table name.
+            if kv.key.len() < prefix.len() {
+                return Err(slatedb::Error::data(format!(
+                    "DdlManager::init: short DDL-entry key (len={}, prefix={})",
+                    kv.key.len(),
+                    prefix.len(),
+                )));
+            }
+            let table_name = std::str::from_utf8(&kv.key[prefix.len()..])
+                .map_err(|e| {
+                    slatedb::Error::data(format!(
+                        "DdlManager::init: non-UTF8 table name: {e}"
+                    ))
+                })?
+                .to_owned();
+
+            let index_list = ddl_entry_index_start_number::decode_value(&kv.value)?;
+
+            let mut key_descrs: Vec<Arc<KeyDef>> = Vec::with_capacity(index_list.len());
+            for (keyno, gl) in index_list.iter().enumerate() {
+                if gl.index_id > max_id_in_dict {
+                    return Err(slatedb::Error::data(format!(
+                        "DdlManager::init: table {table_name:?} references \
+                         index_id {} but persisted max_index_id is {} \
+                         (corruption or out-of-order writes)",
+                        gl.index_id, max_id_in_dict,
+                    )));
+                }
+                let info = index_info::read(db, *gl).await?.ok_or_else(|| {
+                    slatedb::Error::data(format!(
+                        "DdlManager::init: missing index_info row for \
+                         {gl:?} (referenced from table {table_name:?})"
+                    ))
+                })?;
+                let flags = cf_flags::read(db, gl.cf_id).await?.ok_or_else(|| {
+                    slatedb::Error::data(format!(
+                        "DdlManager::init: missing cf_flags row for \
+                         cf_id={} (referenced from table {table_name:?})",
+                        gl.cf_id,
+                    ))
+                })?;
+
+                if (flags & AUTO_CF_FLAG) != 0 {
+                    tracing::warn!(
+                        cf_id = gl.cf_id,
+                        table = %table_name,
+                        "AUTO_CF_FLAG is set — deprecated upstream, ignored",
+                    );
+                }
+
+                let is_reverse = (flags & crate::codec::key::REVERSE_CF_FLAG) != 0;
+                let is_per_partition =
+                    (flags & crate::codec::key::PER_PARTITION_CF_FLAG) != 0;
+
+                // Skeleton KeyDef: full setup runs later when a
+                // handler opens the table with a live TableShareView.
+                let mut kd = KeyDef::new_skeleton(
+                    gl.index_id,
+                    gl.cf_id,
+                    keyno as u32,
+                    info.index_dict_version as u16,
+                    info.index_type,
+                    info.kv_format_version,
+                    is_reverse,
+                    "",
+                );
+                kd.is_per_partition_cf = is_per_partition;
+                kd.index_flags_bitmap = info.index_flags;
+                kd.ttl_duration = info.ttl_duration;
+                if KeyDef::has_index_flag(info.index_flags, IndexFlag::TtlFlag) {
+                    kd.ttl_rec_offset = KeyDef::calculate_index_flag_offset(
+                        info.index_flags,
+                        IndexFlag::TtlFlag,
+                        None,
+                    );
+                }
+                key_descrs.push(Arc::new(kd));
+            }
+
+            let tdef = Arc::new(
+                TblDef::new(&table_name)?
+                    .with_keys(key_descrs),
+            );
+            self.put(tdef);
+            count += 1;
+        }
+
+        // Application index ids must skip the dict-reserved range
+        // (`DataDictType::EndDictIndexId = 255`). The C++ uses the
+        // same +1 ceiling at rdb_datadic.cc:4200..4204.
+        let seed = std::cmp::max(
+            max_id_in_dict,
+            DataDictType::EndDictIndexId as u32,
+        )
+        .saturating_add(1);
+        self.sequence.lock().reset_to(seed);
+
+        Ok(count)
     }
 
     // ----- sequence generator passthrough -----
@@ -727,6 +871,126 @@ mod tests {
             ],
         );
 
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn init_round_trips_a_persisted_catalogue() {
+        // Write 3 tables via put_and_write, then create a fresh
+        // DdlManager and have it reload from the dict. State should
+        // match.
+        let engine = EngineDb::open_in_memory("init_rt").await.expect("open");
+
+        // Seed the max_index_id watermark before put_and_write so the
+        // init-time bounds check sees a consistent picture.
+        crate::codec::dict::max_index_id::write(engine.db(), 999)
+            .await
+            .expect("seed max_index_id");
+
+        let writer = DdlManager::new();
+        writer
+            .put_and_write(
+                Arc::new(
+                    TblDef::new("appdb.users")
+                        .unwrap()
+                        .with_keys(vec![pk(100, 1), sk(101, 1, "by_email")]),
+                ),
+                engine.db(),
+            )
+            .await
+            .expect("write users");
+        writer
+            .put_and_write(
+                Arc::new(
+                    TblDef::new("appdb.orders")
+                        .unwrap()
+                        .with_keys(vec![pk(200, 1)]),
+                ),
+                engine.db(),
+            )
+            .await
+            .expect("write orders");
+        writer
+            .put_and_write(
+                Arc::new(
+                    TblDef::new("appdb.events#P#p2024")
+                        .unwrap()
+                        .with_keys(vec![pk(300, 5)]),
+                ),
+                engine.db(),
+            )
+            .await
+            .expect("write events");
+
+        // Fresh manager, load from dict.
+        let reader = DdlManager::new();
+        let n = reader.init(engine.db()).await.expect("init");
+        assert_eq!(n, 3);
+
+        // All three tables present with the right index counts.
+        let users = reader.find("appdb.users").expect("users");
+        assert_eq!(users.key_count(), 2);
+        assert_eq!(users.base_partition(), None);
+        let orders = reader.find("appdb.orders").expect("orders");
+        assert_eq!(orders.key_count(), 1);
+        let events = reader.find("appdb.events#P#p2024").expect("events");
+        assert_eq!(events.base_partition(), Some("p2024"));
+
+        // Reloaded KeyDef carries through index_type + kv_format_version.
+        let users_pk = users.key(0).unwrap();
+        assert_eq!(users_pk.index_type, IndexType::Primary);
+        assert_eq!(users_pk.get_index_number(), 100);
+        let users_sk = users.key(1).unwrap();
+        assert_eq!(users_sk.index_type, IndexType::Secondary);
+
+        // Sequence is seeded past max(max_index_id, END_DICT_INDEX_ID).
+        // max_index_id=999 > 255, so the next allocation is 1000.
+        assert_eq!(reader.next_number_peek(), 1000);
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn init_seeds_sequence_past_end_dict_index_id_when_dict_is_fresh() {
+        // Fresh dict (no tables, no max_index_id). The sequence must
+        // still start past END_DICT_INDEX_ID (= 255) so app indexes
+        // don't collide with dict-reserved ids.
+        let engine = EngineDb::open_in_memory("init_fresh").await.expect("open");
+        let m = DdlManager::new();
+        let n = m.init(engine.db()).await.expect("init empty");
+        assert_eq!(n, 0);
+        assert_eq!(m.next_number_peek(), 256);
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn init_rejects_missing_index_info_row() {
+        let engine = EngineDb::open_in_memory("init_corrupt_info")
+            .await
+            .expect("open");
+
+        // Write a typed DDL entry pointing at index_id=100, but DON'T
+        // write the matching index_info row.
+        crate::codec::dict::max_index_id::write(engine.db(), 100)
+            .await
+            .unwrap();
+        // cf_flags has to be present (we check it after index_info, so
+        // it'd otherwise be the failure surface).
+        crate::codec::dict::cf_flags::write(engine.db(), 1, 0)
+            .await
+            .unwrap();
+        ddl_entry_index_start_number::write_typed(
+            engine.db(),
+            "db.broken",
+            &[GlIndexId { cf_id: 1, index_id: 100 }],
+        )
+        .await
+        .unwrap();
+
+        let m = DdlManager::new();
+        let err = m.init(engine.db()).await.expect_err("should fail");
+        assert_eq!(err.kind(), slatedb::ErrorKind::Data);
+        assert!(err.to_string().contains("missing index_info"));
         engine.close().await.expect("close");
     }
 
