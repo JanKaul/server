@@ -92,6 +92,16 @@ struct DdlManagerState {
     /// (`ha_rocksdb.cc:12637`); consumed by
     /// `commit_inplace_alter_table` / rollback.
     index_num_to_uncommitted_keydef: BTreeMap<GlIndexId, Arc<KeyDef>>,
+    /// In-memory stats cache. The C++ stores these on `KeyDef` as a
+    /// `mutable` field; we pull them out to the catalogue level since
+    /// our `Arc<KeyDef>` can't be mutated post-share without interior
+    /// mutability — and stats are a catalogue-level concern anyway.
+    stats: BTreeMap<GlIndexId, crate::codec::dict::index_statistics::IndexStats>,
+    /// Pending-persist queue. Matches the C++ `m_stats2store` at
+    /// `rdb_datadic.h:1210` — populated by `set_stats` / `adjust_stats`,
+    /// drained by `persist_stats`.
+    stats_to_persist:
+        BTreeMap<GlIndexId, crate::codec::dict::index_statistics::IndexStats>,
 }
 
 impl DdlManagerState {
@@ -100,6 +110,8 @@ impl DdlManagerState {
             ddl_map: HashMap::new(),
             index_num_to_keydef: BTreeMap::new(),
             index_num_to_uncommitted_keydef: BTreeMap::new(),
+            stats: BTreeMap::new(),
+            stats_to_persist: BTreeMap::new(),
         }
     }
 }
@@ -363,6 +375,140 @@ impl DdlManager {
     pub fn erase_index_num(&self, gl_index_id: GlIndexId) {
         let mut st = self.state.write();
         st.index_num_to_keydef.remove(&gl_index_id);
+    }
+
+    // ----- per-index stats -----
+
+    /// Snapshot the current cached stats for `gl_index_id`. Returns
+    /// `None` if the catalogue doesn't know about that index or no
+    /// stats have been recorded for it.
+    ///
+    /// Roughly the C++ `Rdb_dict_manager::get_stats` consumer pattern,
+    /// but reads from the in-memory cache (the C++ stores stats on
+    /// the KeyDef itself; we keep them here — see `DdlManagerState`).
+    pub fn get_stats(
+        &self,
+        gl_index_id: GlIndexId,
+    ) -> Option<crate::codec::dict::index_statistics::IndexStats> {
+        self.state.read().stats.get(&gl_index_id).cloned()
+    }
+
+    /// Replace the cached stats for every index in `stats`. Each row's
+    /// own `gl_index_id` is the lookup key. Rows whose index isn't in
+    /// the committed catalogue are silently dropped (matches the C++
+    /// `find(...)` gate at `rdb_datadic.cc:4311..4316`).
+    ///
+    /// After this call every accepted row is also queued for
+    /// persistence — drained by [`Self::persist_stats`].
+    ///
+    /// Translated from `Rdb_ddl_manager::set_stats` (`rdb_datadic.cc:4307`).
+    pub fn set_stats<I>(&self, stats: I)
+    where
+        I: IntoIterator<Item = crate::codec::dict::index_statistics::IndexStats>,
+    {
+        let mut st = self.state.write();
+        for s in stats {
+            let gl = s.gl_index_id;
+            // Gate on "index is in committed catalogue" — same as C++.
+            if !st.index_num_to_keydef.contains_key(&gl) {
+                continue;
+            }
+            st.stats.insert(gl, s.clone());
+            st.stats_to_persist.insert(gl, s);
+        }
+    }
+
+    /// Merge `new_data` into the cached stats (additive), then
+    /// `deleted_data` (subtractive). Indexes not in the committed
+    /// catalogue are silently skipped per the C++ gate.
+    ///
+    /// `estimated_data_len` is passed through to `IndexStats::merge`
+    /// for its `actual_disk_size == 0` fallback — set to `0` when you
+    /// have no good estimate.
+    ///
+    /// Translated from `Rdb_ddl_manager::adjust_stats` (`rdb_datadic.cc:4320`).
+    /// Returns `true` if the persist queue is non-empty after the
+    /// call (the C++ uses this to decide whether to wake the
+    /// background persister; we surface it for the same).
+    pub fn adjust_stats(
+        &self,
+        new_data: &[crate::codec::dict::index_statistics::IndexStats],
+        deleted_data: &[crate::codec::dict::index_statistics::IndexStats],
+        estimated_data_len: i64,
+    ) -> bool {
+        let mut st = self.state.write();
+        for (data, increment) in [(new_data, true), (deleted_data, false)] {
+            for src in data {
+                if !st.index_num_to_keydef.contains_key(&src.gl_index_id) {
+                    continue;
+                }
+                let entry = st
+                    .stats
+                    .entry(src.gl_index_id)
+                    .or_insert_with(|| {
+                        crate::codec::dict::index_statistics::IndexStats::new(
+                            src.gl_index_id,
+                        )
+                    });
+                entry.merge(src, increment, estimated_data_len);
+                let snapshot = entry.clone();
+                st.stats_to_persist.insert(src.gl_index_id, snapshot);
+            }
+        }
+        !st.stats_to_persist.is_empty()
+    }
+
+    /// Drain the pending-persist queue and write every row to the
+    /// dict in a single atomic `WriteBatch`. Translated from
+    /// `Rdb_ddl_manager::persist_stats` (`rdb_datadic.cc:4345`).
+    ///
+    /// `await_durable = false` mirrors the C++ `sync = false` path
+    /// (the default for background-triggered persistence): the write
+    /// returns once SlateDB has buffered the rows, without waiting
+    /// for object-store durability.
+    pub async fn persist_stats(
+        &self,
+        db: &slatedb::Db,
+        await_durable: bool,
+    ) -> Result<(), slatedb::Error> {
+        use crate::codec::dict::{
+            encode_gl_index_suffix, index_statistics, system_key, DataDictType,
+        };
+        use slatedb::{config::WriteOptions, WriteBatch};
+
+        // Snapshot and clear the queue under the lock — drain pattern
+        // matches the C++ `std::move(m_stats2store)`.
+        let to_persist = {
+            let mut st = self.state.write();
+            std::mem::take(&mut st.stats_to_persist)
+        };
+
+        if to_persist.is_empty() {
+            return Ok(());
+        }
+
+        let mut batch = WriteBatch::new();
+        for (gl, stats) in &to_persist {
+            batch.put(
+                system_key(DataDictType::IndexStatistics, &encode_gl_index_suffix(*gl)),
+                index_statistics::encode_value(stats),
+            );
+        }
+
+        db.write_with_options(
+            batch,
+            &WriteOptions {
+                await_durable,
+                ..Default::default()
+            },
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn stats_queue_len(&self) -> usize {
+        self.state.read().stats_to_persist.len()
     }
 
     // ----- dict-integrated installation -----
@@ -992,6 +1138,155 @@ mod tests {
         assert_eq!(err.kind(), slatedb::ErrorKind::Data);
         assert!(err.to_string().contains("missing index_info"));
         engine.close().await.expect("close");
+    }
+
+    // ----- stats -----
+
+    use crate::codec::dict::index_statistics;
+
+    fn sample_stats(gl: GlIndexId, rows: i64) -> index_statistics::IndexStats {
+        index_statistics::IndexStats {
+            gl_index_id: gl,
+            data_size: rows * 100,
+            rows,
+            actual_disk_size: rows * 80,
+            entry_deletes: 0,
+            entry_single_deletes: 0,
+            entry_merges: 0,
+            entry_others: 0,
+            distinct_keys_per_prefix: vec![rows, rows / 2],
+        }
+    }
+
+    #[test]
+    fn set_stats_replaces_cache_and_queues_for_persist() {
+        let m = DdlManager::new();
+        m.put(tdef("db.t", vec![pk(100, 1)]));
+
+        let gl = GlIndexId { cf_id: 1, index_id: 100 };
+        m.set_stats(vec![sample_stats(gl, 50)]);
+
+        let got = m.get_stats(gl).expect("present");
+        assert_eq!(got.rows, 50);
+        assert_eq!(m.stats_queue_len(), 1);
+
+        // Overwrite — newer rows.
+        m.set_stats(vec![sample_stats(gl, 75)]);
+        assert_eq!(m.get_stats(gl).unwrap().rows, 75);
+        assert_eq!(m.stats_queue_len(), 1, "same id stays one queue entry");
+    }
+
+    #[test]
+    fn set_stats_drops_rows_for_unknown_indexes() {
+        let m = DdlManager::new();
+        // No table installed; stats for an unknown index are dropped.
+        m.set_stats(vec![sample_stats(
+            GlIndexId { cf_id: 9, index_id: 99 },
+            10,
+        )]);
+        assert!(m.get_stats(GlIndexId { cf_id: 9, index_id: 99 }).is_none());
+        assert_eq!(m.stats_queue_len(), 0);
+    }
+
+    #[test]
+    fn adjust_stats_adds_then_subtracts() {
+        let m = DdlManager::new();
+        m.put(tdef("db.t", vec![pk(100, 1)]));
+        let gl = GlIndexId { cf_id: 1, index_id: 100 };
+
+        // Two new SSTs land — 30 rows each.
+        let new_data = vec![sample_stats(gl, 30), sample_stats(gl, 30)];
+        let queue_dirty = m.adjust_stats(&new_data, &[], 0);
+        assert!(queue_dirty);
+        assert_eq!(m.get_stats(gl).unwrap().rows, 60);
+
+        // One of those SSTs goes away.
+        let deleted = vec![sample_stats(gl, 30)];
+        m.adjust_stats(&[], &deleted, 0);
+        assert_eq!(m.get_stats(gl).unwrap().rows, 30);
+    }
+
+    #[test]
+    fn adjust_stats_resizes_distinct_keys_per_prefix() {
+        let m = DdlManager::new();
+        m.put(tdef("db.t", vec![pk(100, 1)]));
+        let gl = GlIndexId { cf_id: 1, index_id: 100 };
+
+        // Source has 3 prefix-length buckets; target starts at 0.
+        let mut src = sample_stats(gl, 10);
+        src.distinct_keys_per_prefix = vec![10, 7, 3];
+        m.adjust_stats(&[src], &[], 0);
+
+        let got = m.get_stats(gl).unwrap();
+        assert_eq!(got.distinct_keys_per_prefix, vec![10, 7, 3]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persist_stats_drains_queue_to_dict() {
+        let engine = EngineDb::open_in_memory("persist_stats").await.expect("open");
+        let m = DdlManager::new();
+        m.put(tdef("db.t", vec![pk(100, 1), sk(101, 1, "by_email")]));
+
+        let gl_pk = GlIndexId { cf_id: 1, index_id: 100 };
+        let gl_sk = GlIndexId { cf_id: 1, index_id: 101 };
+        m.set_stats(vec![sample_stats(gl_pk, 1000), sample_stats(gl_sk, 1500)]);
+        assert_eq!(m.stats_queue_len(), 2);
+
+        m.persist_stats(engine.db(), true).await.expect("persist");
+        assert_eq!(m.stats_queue_len(), 0, "queue drains");
+
+        // Verify the dict has the rows.
+        let pk_row =
+            index_statistics::read(engine.db(), gl_pk).await.expect("ok").expect("present");
+        assert_eq!(pk_row.rows, 1000);
+        let sk_row =
+            index_statistics::read(engine.db(), gl_sk).await.expect("ok").expect("present");
+        assert_eq!(sk_row.rows, 1500);
+
+        // A second persist with an empty queue is a no-op.
+        m.persist_stats(engine.db(), true).await.expect("noop");
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn persist_stats_atomicity_drain_under_lock() {
+        // Regression check: the queue must be drained under the
+        // write lock so a concurrent set_stats during persist doesn't
+        // accidentally clear new entries. We can't easily race two
+        // tasks deterministically, but we CAN verify the drain order:
+        // after persist starts (snapshots queue), any new set_stats
+        // call must observe the queue cleared and re-queue afresh.
+        let engine = EngineDb::open_in_memory("persist_atomic").await.expect("open");
+        let m = DdlManager::new();
+        m.put(tdef("db.t", vec![pk(100, 1)]));
+
+        let gl = GlIndexId { cf_id: 1, index_id: 100 };
+        m.set_stats(vec![sample_stats(gl, 10)]);
+        m.persist_stats(engine.db(), true).await.expect("persist");
+        assert_eq!(m.stats_queue_len(), 0);
+
+        // New stats arrive after persist — queue should reflect them.
+        m.set_stats(vec![sample_stats(gl, 20)]);
+        assert_eq!(m.stats_queue_len(), 1);
+
+        engine.close().await.expect("close");
+    }
+
+    #[test]
+    fn index_stats_merge_resizes_target_and_falls_back_on_zero_disk_size() {
+        // Standalone test of IndexStats::merge — independent of
+        // DdlManager.
+        let gl = GlIndexId { cf_id: 1, index_id: 1 };
+        let mut tgt = index_statistics::IndexStats::new(gl);
+        let mut src = index_statistics::IndexStats::new(gl);
+        src.rows = 10;
+        src.distinct_keys_per_prefix = vec![10, 5];
+        // actual_disk_size == 0 ⇒ fallback to rows * estimated_len.
+        src.actual_disk_size = 0;
+        tgt.merge(&src, true, 64);
+        assert_eq!(tgt.rows, 10);
+        assert_eq!(tgt.actual_disk_size, 10 * 64);
+        assert_eq!(tgt.distinct_keys_per_prefix, vec![10, 5]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

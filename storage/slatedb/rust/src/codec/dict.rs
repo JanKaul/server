@@ -246,7 +246,9 @@ pub mod autoinc {
 
 const GL_INDEX_SUFFIX_LEN: usize = 8;
 
-fn encode_gl_index_suffix(gl: crate::globals::GlIndexId) -> [u8; GL_INDEX_SUFFIX_LEN] {
+pub(crate) fn encode_gl_index_suffix(
+    gl: crate::globals::GlIndexId,
+) -> [u8; GL_INDEX_SUFFIX_LEN] {
     let mut out = [0u8; GL_INDEX_SUFFIX_LEN];
     out[..4].copy_from_slice(&gl.cf_id.to_be_bytes());
     out[4..].copy_from_slice(&gl.index_id.to_be_bytes());
@@ -793,12 +795,79 @@ pub mod index_statistics {
         pub entry_single_deletes: i64,
         pub entry_merges: i64,
         pub entry_others: i64,
-        /// One u64 per index-prefix-length cardinality bucket. Empty for
-        /// a freshly-initialised stats row.
-        pub distinct_keys_per_prefix: Vec<u64>,
+        /// One i64 per index-prefix-length cardinality bucket. Empty
+        /// for a freshly-initialised stats row. Signed to match the
+        /// C++ (`std::vector<int64_t>` at `properties_collector.h:56`)
+        /// so subtractive merges during `adjust_stats` don't underflow
+        /// the bookkeeping.
+        pub distinct_keys_per_prefix: Vec<i64>,
     }
 
     impl IndexStats {
+        /// Element-wise merge of `s` into `self`. `increment = true`
+        /// adds the counters; `false` subtracts (used by
+        /// `DdlManager::adjust_stats` when an SST goes away).
+        /// `estimated_data_len` is the fallback row width used when
+        /// `s.actual_disk_size == 0` — same special-case as the C++
+        /// (`properties_collector.cc:445..452`): when RocksDB hasn't
+        /// stamped the trailing actual_disk_size yet for the current
+        /// SST, fall back to `rows * estimated`.
+        ///
+        /// Translated from `Rdb_index_stats::merge`
+        /// (`properties_collector.cc:430`).
+        pub fn merge(&mut self, s: &IndexStats, increment: bool, estimated_data_len: i64) {
+            debug_assert!(
+                estimated_data_len >= 0,
+                "estimated_data_len must be non-negative"
+            );
+
+            // The C++ stamps the source's gl_index_id onto self before
+            // doing the math — preserve that quirk so iterative merges
+            // from a zero-initialised accumulator end up labelled.
+            self.gl_index_id = s.gl_index_id;
+
+            if self.distinct_keys_per_prefix.len() < s.distinct_keys_per_prefix.len() {
+                self.distinct_keys_per_prefix
+                    .resize(s.distinct_keys_per_prefix.len(), 0);
+            }
+
+            let disk_delta = if s.actual_disk_size != 0 {
+                s.actual_disk_size
+            } else {
+                estimated_data_len.saturating_mul(s.rows)
+            };
+
+            if increment {
+                self.rows = self.rows.saturating_add(s.rows);
+                self.data_size = self.data_size.saturating_add(s.data_size);
+                self.actual_disk_size = self.actual_disk_size.saturating_add(disk_delta);
+                self.entry_deletes = self.entry_deletes.saturating_add(s.entry_deletes);
+                self.entry_single_deletes = self
+                    .entry_single_deletes
+                    .saturating_add(s.entry_single_deletes);
+                self.entry_merges = self.entry_merges.saturating_add(s.entry_merges);
+                self.entry_others = self.entry_others.saturating_add(s.entry_others);
+                for (i, &v) in s.distinct_keys_per_prefix.iter().enumerate() {
+                    self.distinct_keys_per_prefix[i] =
+                        self.distinct_keys_per_prefix[i].saturating_add(v);
+                }
+            } else {
+                self.rows = self.rows.saturating_sub(s.rows);
+                self.data_size = self.data_size.saturating_sub(s.data_size);
+                self.actual_disk_size = self.actual_disk_size.saturating_sub(disk_delta);
+                self.entry_deletes = self.entry_deletes.saturating_sub(s.entry_deletes);
+                self.entry_single_deletes = self
+                    .entry_single_deletes
+                    .saturating_sub(s.entry_single_deletes);
+                self.entry_merges = self.entry_merges.saturating_sub(s.entry_merges);
+                self.entry_others = self.entry_others.saturating_sub(s.entry_others);
+                for (i, &v) in s.distinct_keys_per_prefix.iter().enumerate() {
+                    self.distinct_keys_per_prefix[i] =
+                        self.distinct_keys_per_prefix[i].saturating_sub(v);
+                }
+            }
+        }
+
         /// Zero-initialised stats for the given index (`Rdb_index_stats`
         /// constructor at `properties_collector.h:64`).
         pub fn new(gl_index_id: GlIndexId) -> Self {
@@ -836,7 +905,7 @@ pub mod index_statistics {
         out.extend_from_slice(&(stats.entry_merges as u64).to_be_bytes());
         out.extend_from_slice(&(stats.entry_others as u64).to_be_bytes());
         for &c in &stats.distinct_keys_per_prefix {
-            out.extend_from_slice(&c.to_be_bytes());
+            out.extend_from_slice(&(c as u64).to_be_bytes());
         }
         out
     }
@@ -915,7 +984,8 @@ pub mod index_statistics {
         }
         let mut distinct_keys_per_prefix = Vec::with_capacity(n);
         for i in 0..n {
-            distinct_keys_per_prefix.push(read_u64(&bytes[p + i * 8..p + (i + 1) * 8]));
+            distinct_keys_per_prefix
+                .push(read_u64(&bytes[p + i * 8..p + (i + 1) * 8]) as i64);
         }
 
         Ok(IndexStats {
