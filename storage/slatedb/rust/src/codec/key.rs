@@ -387,6 +387,133 @@ impl KeyDef {
         Ok(crate::globals::SIZEOF_HIDDEN_PK_COLUMN)
     }
 
+    /// Build the memcomparable image of a row's keypart-tuple for
+    /// this index. Counterpart of MyRocks'
+    /// `Rdb_key_def::pack_record` at `rdb_datadic.cc:1272`.
+    ///
+    /// Writes `u32_be(index_number)` followed by each keypart's
+    /// encoded bytes into the front of `dst`. The per-keypart
+    /// encoding is delegated to the caller-supplied `pack_keypart`
+    /// closure — this method is the orchestrator (write the index
+    /// prefix, iterate keyparts, handle the hidden-PK extension
+    /// at the SK tail), not the actual encoder. The cxx-using
+    /// wrapper that plugs `field->sort_string` callbacks into the
+    /// closure lands in a follow-up slice (needs the
+    /// `FieldPacking::field_index` plumbing).
+    ///
+    /// `hidden_pk_id`:
+    /// - `None` for explicit-PK rows and for SKs on tables that
+    ///   have a declared PRIMARY KEY.
+    /// - `Some(rowid)` for SKs on hidden-PK tables — the rowid is
+    ///   appended as the last keypart (8 bytes big-endian) instead
+    ///   of being dispatched through the packer. Matches the C++
+    ///   `if (hidden_pk_exists && hidden_pk_id && i + 1 ==
+    ///   n_key_parts)` branch at `rdb_datadic.cc:1368`.
+    ///
+    /// `pack_keypart` is invoked once per non-hidden-PK keypart
+    /// with `(keypart_index, &FieldPacking, &mut [u8] remaining_dst)`
+    /// and must return the byte count it wrote into the front of
+    /// the slice. Errors propagate.
+    ///
+    /// Returns the total bytes written (always `INDEX_NUMBER_SIZE`
+    /// at minimum, plus each keypart's contribution).
+    ///
+    /// ## Stage 0 limitations (each documented at the deferral
+    /// site in MyRocks)
+    ///
+    /// - **NULL handling deferred**: every keypart is treated as
+    ///   non-null. MyRocks emits a 1-byte NULL flag per maybe-null
+    ///   keypart before the encoded image (`rdb_datadic.cc:1378`).
+    ///   For Stage 0, the packer closure handles whatever the
+    ///   field provides; if NULL is encountered, dispatch is
+    ///   undefined.
+    /// - **unpack_info writer deferred**: this method has no
+    ///   `unpack_info` output parameter. The C++ version writes
+    ///   the per-row sidechannel (covered-bitmap, TTL bytes,
+    ///   per-field unpack data) in parallel. Lands when the
+    ///   covered-read fast path is built.
+    /// - **Debug checksum suffix deferred**: same.
+    ///
+    /// ## Errors
+    ///
+    /// - `Invalid` if this `KeyDef` is a `HiddenPrimary` — callers
+    ///   should use [`Self::build_hidden_pk_id_buf`] (composed
+    ///   with [`Self::get_infimum_key`] for the full row key)
+    ///   for that path.
+    /// - `Invalid` if `dst` is shorter than `INDEX_NUMBER_SIZE`,
+    ///   or if it runs short mid-keypart.
+    /// - Whatever the `pack_keypart` closure returns.
+    pub fn pack_record(
+        &self,
+        pack_keypart: &mut dyn FnMut(
+            usize,
+            &FieldPacking,
+            &mut [u8],
+        ) -> Result<usize, slatedb::Error>,
+        hidden_pk_id: Option<i64>,
+        dst: &mut [u8],
+    ) -> Result<usize, slatedb::Error> {
+        if self.index_type == IndexType::HiddenPrimary {
+            return Err(slatedb::Error::invalid(
+                "pack_record: hidden PK uses build_hidden_pk_id_buf — \
+                 callers must dispatch on index_type before calling \
+                 pack_record"
+                    .into(),
+            ));
+        }
+        if dst.len() < INDEX_NUMBER_SIZE {
+            return Err(slatedb::Error::invalid(format!(
+                "pack_record: dst too short for index prefix — have {} bytes, \
+                 need at least {}",
+                dst.len(),
+                INDEX_NUMBER_SIZE,
+            )));
+        }
+
+        let mut written = 0usize;
+        // 4-byte big-endian index_number prefix.
+        self.get_infimum_key(dst, &mut written);
+
+        // Walk keyparts. The hidden-PK extension (if any) is the
+        // last slot of a Secondary index when `hidden_pk_id` was
+        // supplied — write u64_be(rowid) there directly instead
+        // of dispatching the packer.
+        let n = self.key_parts as usize;
+        let is_sk = self.index_type == IndexType::Secondary;
+        let has_hidden_pk_extension =
+            is_sk && hidden_pk_id.is_some() && n > 0;
+
+        for i in 0..n {
+            let is_hidden_pk_slot = has_hidden_pk_extension && i + 1 == n;
+            if is_hidden_pk_slot {
+                // SAFETY: has_hidden_pk_extension implies Some.
+                let rowid = hidden_pk_id
+                    .expect("has_hidden_pk_extension implies Some");
+                if dst.len() - written < crate::globals::SIZEOF_HIDDEN_PK_COLUMN {
+                    return Err(slatedb::Error::invalid(format!(
+                        "pack_record: dst too short for hidden-PK extension — \
+                         have {} bytes remaining, need {}",
+                        dst.len() - written,
+                        crate::globals::SIZEOF_HIDDEN_PK_COLUMN,
+                    )));
+                }
+                let bytes = (rowid as u64).to_be_bytes();
+                dst[written..written + crate::globals::SIZEOF_HIDDEN_PK_COLUMN]
+                    .copy_from_slice(&bytes);
+                written += crate::globals::SIZEOF_HIDDEN_PK_COLUMN;
+                // C++ breaks here — no further keyparts after the
+                // hidden-PK extension. (rdb_datadic.cc:1370)
+                break;
+            }
+
+            let fpi = &self.pack_info[i];
+            let added = pack_keypart(i, fpi, &mut dst[written..])?;
+            written += added;
+        }
+
+        Ok(written)
+    }
+
     /// First key for "begin iterating from start of index". For
     /// reverse-CF indexes iteration starts at the physical supremum.
     /// Returns the count of leading bytes usable for bloom-filter prefix
@@ -1653,6 +1780,192 @@ mod tests {
         let err = kd.build_hidden_pk_id_buf(1, &mut buf).unwrap_err();
         assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
         assert!(err.to_string().contains("dst too short"));
+    }
+
+    // ----- pack_record -----
+
+    /// Build a KeyDef with `n_parts` synthetic keyparts of the
+    /// given image length. Used by the pack_record tests so they
+    /// can drive arbitrary keypart counts.
+    fn kd_with_parts(
+        index_number: u32,
+        index_type: IndexType,
+        n_parts: u32,
+        per_kp_len: i32,
+    ) -> KeyDef {
+        let format_version = match index_type {
+            IndexType::Primary | IndexType::HiddenPrimary => {
+                PRIMARY_FORMAT_VERSION_LATEST
+            }
+            IndexType::Secondary => SECONDARY_FORMAT_VERSION_LATEST,
+        };
+        let mut kd = KeyDef::new_skeleton(
+            index_number,
+            7,
+            0,
+            INDEX_INFO_VERSION_LATEST as u16,
+            index_type,
+            format_version,
+            false,
+            "test",
+        );
+        kd.key_parts = n_parts;
+        kd.pack_info = (0..n_parts)
+            .map(|_| {
+                let mut fpi = FieldPacking::default();
+                fpi.max_image_len = per_kp_len;
+                fpi
+            })
+            .collect();
+        kd
+    }
+
+    #[test]
+    fn pack_record_rejects_hidden_pk_index() {
+        let kd = hidden_pk(7);
+        let mut buf = [0u8; 64];
+        let mut packer =
+            |_: usize, _: &FieldPacking, _: &mut [u8]| -> Result<usize, slatedb::Error> {
+                panic!("packer must not be called for hidden-PK reject path");
+            };
+        let err = kd.pack_record(&mut packer, None, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("build_hidden_pk_id_buf"));
+    }
+
+    #[test]
+    fn pack_record_rejects_short_dst_for_prefix() {
+        let kd = kd_with_parts(0xCAFE, IndexType::Primary, 1, 4);
+        let mut buf = [0u8; 2]; // less than INDEX_NUMBER_SIZE
+        let mut packer =
+            |_: usize, _: &FieldPacking, _: &mut [u8]| -> Result<usize, slatedb::Error> {
+                Ok(0)
+            };
+        let err = kd.pack_record(&mut packer, None, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("dst too short"));
+    }
+
+    #[test]
+    fn pack_record_writes_index_prefix_then_each_keypart() {
+        // Explicit PK with 3 keyparts, each 4 bytes.
+        let kd = kd_with_parts(0x0102_0304, IndexType::Primary, 3, 4);
+
+        // Packer writes `keypart_index` repeated 4 times into its slice.
+        let mut calls: Vec<usize> = Vec::new();
+        let mut packer =
+            |i: usize, fpi: &FieldPacking, dst: &mut [u8]| -> Result<usize, slatedb::Error> {
+                calls.push(i);
+                let n = fpi.max_image_len as usize;
+                for b in dst[..n].iter_mut() {
+                    *b = i as u8;
+                }
+                Ok(n)
+            };
+
+        let mut buf = [0u8; 32];
+        let n = kd.pack_record(&mut packer, None, &mut buf).expect("pack");
+        assert_eq!(n, INDEX_NUMBER_SIZE + 3 * 4);
+        assert_eq!(calls, vec![0, 1, 2]);
+        assert_eq!(&buf[..4], &[0x01, 0x02, 0x03, 0x04]);
+        assert_eq!(&buf[4..8], &[0, 0, 0, 0]);
+        assert_eq!(&buf[8..12], &[1, 1, 1, 1]);
+        assert_eq!(&buf[12..16], &[2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn pack_record_sk_without_hidden_pk_uses_packer_for_all_parts() {
+        let kd = kd_with_parts(100, IndexType::Secondary, 2, 4);
+        let mut calls: Vec<usize> = Vec::new();
+        let mut packer =
+            |i: usize, _: &FieldPacking, dst: &mut [u8]| -> Result<usize, slatedb::Error> {
+                calls.push(i);
+                dst[..4].fill(0xAA);
+                Ok(4)
+            };
+        let mut buf = [0u8; 32];
+        let n = kd.pack_record(&mut packer, None, &mut buf).expect("pack");
+        assert_eq!(n, INDEX_NUMBER_SIZE + 2 * 4);
+        assert_eq!(calls, vec![0, 1]);
+    }
+
+    #[test]
+    fn pack_record_sk_with_hidden_pk_id_writes_rowid_at_last_keypart() {
+        // SK with 2 keyparts; the second is the synthetic hidden-PK
+        // extension and gets the rowid bytes instead of the packer.
+        let kd = kd_with_parts(200, IndexType::Secondary, 2, 4);
+        let mut calls: Vec<usize> = Vec::new();
+        let mut packer =
+            |i: usize, _: &FieldPacking, dst: &mut [u8]| -> Result<usize, slatedb::Error> {
+                calls.push(i);
+                dst[..4].fill(0xBB);
+                Ok(4)
+            };
+        let mut buf = [0u8; 32];
+        let n = kd.pack_record(&mut packer, Some(0x0001_0203_0405_0607), &mut buf)
+            .expect("pack");
+        // 4 (prefix) + 4 (first keypart via packer) + 8 (rowid)
+        assert_eq!(n, INDEX_NUMBER_SIZE + 4 + 8);
+        // Packer called for keypart 0 only; keypart 1 is the
+        // hidden-PK slot and breaks out of the loop.
+        assert_eq!(calls, vec![0]);
+        // Last 8 bytes are the rowid in big-endian.
+        assert_eq!(
+            &buf[8..16],
+            &[0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07],
+        );
+    }
+
+    #[test]
+    fn pack_record_explicit_pk_ignores_hidden_pk_id() {
+        // Even if hidden_pk_id is supplied, an explicit PK doesn't
+        // have a hidden-PK extension — all keyparts go through the
+        // packer.
+        let kd = kd_with_parts(300, IndexType::Primary, 2, 4);
+        let mut calls: Vec<usize> = Vec::new();
+        let mut packer =
+            |i: usize, _: &FieldPacking, dst: &mut [u8]| -> Result<usize, slatedb::Error> {
+                calls.push(i);
+                dst[..4].fill(0xCC);
+                Ok(4)
+            };
+        let mut buf = [0u8; 32];
+        let n = kd.pack_record(&mut packer, Some(42), &mut buf).expect("pack");
+        assert_eq!(n, INDEX_NUMBER_SIZE + 2 * 4);
+        assert_eq!(calls, vec![0, 1]);
+    }
+
+    #[test]
+    fn pack_record_propagates_packer_error() {
+        let kd = kd_with_parts(7, IndexType::Primary, 2, 4);
+        let mut packer =
+            |i: usize, _: &FieldPacking, _: &mut [u8]| -> Result<usize, slatedb::Error> {
+                if i == 1 {
+                    return Err(slatedb::Error::invalid("packer failure".into()));
+                }
+                Ok(4)
+            };
+        let mut buf = [0u8; 32];
+        let err = kd.pack_record(&mut packer, None, &mut buf).unwrap_err();
+        assert!(err.to_string().contains("packer failure"));
+    }
+
+    #[test]
+    fn pack_record_rejects_short_dst_for_hidden_pk_extension() {
+        // SK with 1 keypart that IS the hidden-PK extension;
+        // dst is large enough for the index prefix but not the
+        // 8-byte rowid.
+        let kd = kd_with_parts(7, IndexType::Secondary, 1, 8);
+        let mut packer =
+            |_: usize, _: &FieldPacking, _: &mut [u8]| -> Result<usize, slatedb::Error> {
+                Ok(0)
+            };
+        let mut buf = [0u8; 6]; // 4 prefix + 2 — not enough for the 8-byte rowid
+        let err = kd
+            .pack_record(&mut packer, Some(1), &mut buf)
+            .unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("hidden-PK extension"));
     }
 
     #[test]
