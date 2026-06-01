@@ -323,12 +323,33 @@ impl HaSlateDb {
                 "HaSlateDb::open: no engine installed — call slatedb_init_* first".into(),
             )
         })?;
+        let engine = crate::bridge::current_engine().ok_or_else(|| {
+            Error::invalid("HaSlateDb::open: no engine installed".into())
+        })?;
         let tbl_def = ddl.find(&normalized).ok_or_else(|| {
             Error::data(format!(
                 "HaSlateDb::open: no catalogue entry for table {normalized:?}"
             ))
         })?;
         self.tbl_def = Some(tbl_def);
+
+        // Prime the auto-incr / hidden-pk counter from persisted dict
+        // state. Mirrors the C++ `ha_rocksdb::open` calls to
+        // `load_auto_incr_value` / `load_hidden_pk_value` (the C++
+        // gates the auto-incr call on `table->found_next_number_field`
+        // and the hidden-pk call on `has_hidden_pk()`; we don't have a
+        // TableShareView yet, so we always attempt the relevant load
+        // — a missing dict entry is a no-op).
+        let db_ref = engine.db().clone();
+        crate::runtime::block_on(async {
+            if self.has_hidden_pk() {
+                self.load_hidden_pk_value(&db_ref).await?;
+            } else {
+                self.load_auto_incr_value(&db_ref).await?;
+            }
+            Ok::<_, Error>(())
+        })?;
+
         Ok(())
     }
 
@@ -639,6 +660,59 @@ impl HaSlateDb {
         Ok(u64::from_be_bytes(buf) as i64)
     }
 
+    /// Prime the in-memory `auto_incr_val` from the persisted dict
+    /// entry. No-op if the dict has no row for this table's PK
+    /// (`gl_index_id` for the PK comes from
+    /// [`TblDef::get_autoincr_gl_index_id`]). Returns `Err(Invalid)`
+    /// if the handler isn't open.
+    ///
+    /// Translated from `ha_rocksdb::load_auto_incr_value` at
+    /// `ha_rocksdb.cc:6099`. The C++ also falls back to a descending
+    /// PK-index scan when the dict has no entry — that fallback is
+    /// deferred until the read path (cxx-driven `Field` decode +
+    /// descending iterator) lands. For a freshly-`CREATE TABLE`d
+    /// table the dict entry is absent and the in-memory counter
+    /// stays at the default (0); the first `get_auto_increment` call
+    /// bumps it.
+    pub async fn load_auto_incr_value(&self, db: &slatedb::Db) -> Result<(), Error> {
+        let tdef = self.tbl_def.as_ref().ok_or_else(|| {
+            Error::invalid("load_auto_incr_value: handler not open".into())
+        })?;
+        let gl = tdef.get_autoincr_gl_index_id();
+        if let Some(val) = crate::codec::dict::autoinc::read(db, gl).await? {
+            tdef.fetch_max_auto_incr_val(val);
+        }
+        Ok(())
+    }
+
+    /// Prime the in-memory `hidden_pk_val` from the persisted dict
+    /// entry. Same dict slot as auto-incr (keyed by the PK's
+    /// `gl_index_id`); the value is interpreted as the next-rowid
+    /// high-water-mark. No-op if the table doesn't have a hidden PK
+    /// or if the dict has no row. Returns `Err(Invalid)` if the
+    /// handler isn't open.
+    ///
+    /// Translated from `ha_rocksdb::load_hidden_pk_value` at
+    /// `ha_rocksdb.cc:6227`. The C++ fallback PK-desc scan is
+    /// deferred along with [`load_auto_incr_value`]'s.
+    pub async fn load_hidden_pk_value(&self, db: &slatedb::Db) -> Result<(), Error> {
+        if !self.has_hidden_pk() {
+            return Ok(());
+        }
+        let tdef = self.tbl_def.as_ref().ok_or_else(|| {
+            Error::invalid("load_hidden_pk_value: handler not open".into())
+        })?;
+        let gl = tdef.get_autoincr_gl_index_id();
+        if let Some(val) = crate::codec::dict::autoinc::read(db, gl).await? {
+            // C++ stores hidden_pk as longlong; the on-disk value is
+            // u64_be but the in-memory counter is i64. The cast is
+            // intentional and matches the C++ `m_hidden_pk_val.store
+            // (auto_incr)` at ha_rocksdb.cc:6240.
+            tdef.fetch_max_hidden_pk_val(val as i64);
+        }
+        Ok(())
+    }
+
     /// Auto-increment reservation. Returns `(first_value,
     /// nb_reserved_values)` — `nb_reserved_values` is always 1
     /// (matches MyRocks: "we will always tell MySQL that we only
@@ -864,6 +938,21 @@ mod tests {
         Arc::new(kd)
     }
 
+    fn hidden_pk(index_number: u32, cf_id: u32) -> Arc<KeyDef> {
+        let mut kd = KeyDef::new_skeleton(
+            index_number,
+            cf_id,
+            0,
+            INDEX_INFO_VERSION_LATEST as u16,
+            IndexType::HiddenPrimary,
+            PRIMARY_FORMAT_VERSION_LATEST,
+            false,
+            "HIDDEN_PK_NAME",
+        );
+        kd.maxlength = 12;
+        Arc::new(kd)
+    }
+
     /// Install an engine and put a fixture table in its catalogue.
     /// Tests that need a bound handler use this.
     ///
@@ -871,19 +960,22 @@ mod tests {
     /// runtime; nesting a `#[tokio::test]` runtime inside would
     /// panic with "cannot start a runtime from within a runtime".
     fn install_engine_with_fixture(name_in_dot: &str) {
-        // Clean slate.
+        install_engine_with_keys(name_in_dot, vec![pk(100, 1)]);
+    }
+
+    /// Like [`install_engine_with_fixture`] but accepts a custom key
+    /// layout — for tests that need a hidden-PK fixture or want to
+    /// pin the PK's `(cf_id, index_id)` for dict writes.
+    fn install_engine_with_keys(name_in_dot: &str, keys: Vec<Arc<KeyDef>>) {
         let _ = crate::bridge::slatedb_shutdown();
         assert_eq!(
             crate::bridge::slatedb_init_in_memory(format!("handler_test_{name_in_dot}")),
             status::OK,
             "init",
         );
-        // Install via the live engine reference, blocking on the
-        // bridge's runtime for the async put_and_write call.
         let db = crate::bridge::current_engine().expect("engine just installed");
         let ddl = crate::bridge::current_ddl().expect("ddl just installed");
-        let tdef =
-            Arc::new(TblDef::new(name_in_dot).unwrap().with_keys(vec![pk(100, 1)]));
+        let tdef = Arc::new(TblDef::new(name_in_dot).unwrap().with_keys(keys));
         crate::runtime::block_on(async move {
             ddl.put_and_write(tdef, db.db()).await.expect("put_and_write");
         });
@@ -1625,5 +1717,162 @@ mod tests {
                 "{v} should be Other",
             );
         }
+    }
+
+    // ----- load_auto_incr_value / load_hidden_pk_value -----
+
+    #[test]
+    fn load_auto_incr_value_picks_up_persisted_dict_entry() {
+        let _g = SERIALISE.lock();
+        install_engine_with_fixture("appdb.t_ai");
+
+        // Persist a counter to the autoinc dict slot. The PK is
+        // pk(100, 1) per `install_engine_with_fixture`, so the gl is
+        // `{cf_id:1, index_id:100}`.
+        let db = crate::bridge::current_engine().expect("engine").db().clone();
+        let gl = crate::globals::GlIndexId {
+            cf_id: 1,
+            index_id: 100,
+        };
+        crate::runtime::block_on(async {
+            crate::codec::dict::autoinc::write(&db, gl, 5_000)
+                .await
+                .expect("write autoinc");
+        });
+
+        // Open primes the counter from the dict.
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/t_ai").expect("open");
+        assert_eq!(h.tbl_def().unwrap().auto_incr_val(), 5_000);
+        // Hidden-PK counter stays untouched (explicit-PK table).
+        assert_eq!(h.tbl_def().unwrap().hidden_pk_val(), 0);
+
+        h.close().unwrap();
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn load_auto_incr_value_is_noop_when_dict_has_no_entry() {
+        let _g = SERIALISE.lock();
+        install_engine_with_fixture("appdb.t_empty");
+
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/t_empty").expect("open");
+        // Fresh table — no dict entry — counter stays at default 0.
+        assert_eq!(h.tbl_def().unwrap().auto_incr_val(), 0);
+        assert_eq!(h.tbl_def().unwrap().hidden_pk_val(), 0);
+
+        h.close().unwrap();
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn load_hidden_pk_value_picks_up_persisted_dict_entry() {
+        let _g = SERIALISE.lock();
+        install_engine_with_keys("appdb.t_hpk", vec![hidden_pk(200, 2)]);
+
+        let db = crate::bridge::current_engine().expect("engine").db().clone();
+        let gl = crate::globals::GlIndexId {
+            cf_id: 2,
+            index_id: 200,
+        };
+        crate::runtime::block_on(async {
+            crate::codec::dict::autoinc::write(&db, gl, 42_000)
+                .await
+                .expect("write autoinc");
+        });
+
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/t_hpk").expect("open");
+        // Hidden-PK counter primed from the same autoinc slot.
+        assert_eq!(h.tbl_def().unwrap().hidden_pk_val(), 42_000);
+        // Auto-incr counter stays at 0 — open routes to the hidden-pk
+        // loader for hidden-PK tables.
+        assert_eq!(h.tbl_def().unwrap().auto_incr_val(), 0);
+
+        h.close().unwrap();
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn load_hidden_pk_value_is_noop_on_explicit_pk_table() {
+        let _g = SERIALISE.lock();
+        install_engine_with_fixture("appdb.t_explicit");
+
+        // Even if the dict slot has a value, an explicit-PK table's
+        // `load_hidden_pk_value` skips the load entirely (early
+        // return on `!has_hidden_pk()`).
+        let db = crate::bridge::current_engine().expect("engine").db().clone();
+        let gl = crate::globals::GlIndexId {
+            cf_id: 1,
+            index_id: 100,
+        };
+        crate::runtime::block_on(async {
+            crate::codec::dict::autoinc::write(&db, gl, 9_999)
+                .await
+                .expect("write autoinc");
+        });
+
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/t_explicit").expect("open");
+        // open() routed to load_auto_incr_value (explicit-PK).
+        assert_eq!(h.tbl_def().unwrap().auto_incr_val(), 9_999);
+        assert_eq!(h.tbl_def().unwrap().hidden_pk_val(), 0);
+
+        // Direct call to load_hidden_pk_value is also a no-op.
+        crate::runtime::block_on(async {
+            h.load_hidden_pk_value(&db).await.expect("noop");
+        });
+        assert_eq!(h.tbl_def().unwrap().hidden_pk_val(), 0);
+
+        h.close().unwrap();
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn load_auto_incr_value_errors_when_handler_not_open() {
+        let _g = SERIALISE.lock();
+        // Need an engine for the &Db; the function bails before
+        // touching it on the not-open check.
+        install_engine_with_fixture("appdb.t_closed");
+        let db = crate::bridge::current_engine().expect("engine").db().clone();
+
+        let h = HaSlateDb::new();
+        let err = crate::runtime::block_on(async {
+            h.load_auto_incr_value(&db).await
+        })
+        .unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("handler not open"));
+
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn load_auto_incr_value_only_bumps_upward() {
+        let _g = SERIALISE.lock();
+        install_engine_with_fixture("appdb.t_ratchet");
+
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/t_ratchet").expect("open");
+        // Force the in-memory counter higher than what we'll persist.
+        h.tbl_def().unwrap().store_auto_incr_val(10_000);
+
+        let db = crate::bridge::current_engine().expect("engine").db().clone();
+        let gl = crate::globals::GlIndexId {
+            cf_id: 1,
+            index_id: 100,
+        };
+        crate::runtime::block_on(async {
+            crate::codec::dict::autoinc::write(&db, gl, 500)
+                .await
+                .expect("write");
+            h.load_auto_incr_value(&db).await.expect("load");
+        });
+        // fetch_max: smaller dict value does NOT lower the counter.
+        assert_eq!(h.tbl_def().unwrap().auto_incr_val(), 10_000);
+
+        h.close().unwrap();
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
     }
 }
