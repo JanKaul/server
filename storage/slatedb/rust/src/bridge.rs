@@ -144,6 +144,50 @@ mod ffi {
             lock_type: i32,
             autocommit_boundary: bool,
         ) -> i32;
+
+        // ----- handlerton txn callbacks -----
+        //
+        // Free functions invoked by MariaDB on transaction boundaries
+        // (commit, rollback, connection close, savepoint). The C++
+        // handlerton plugin registration wires these into the
+        // `handlerton->{commit, rollback, ...}` slots.
+        //
+        // All take `thd_id` — the same opaque per-THD identifier
+        // `ha_external_lock` uses. Status codes are
+        // [`super::status`]: OK / NOT_SUPPORTED / ENGINE_IO_FAILED
+        // / NO_ENGINE / RUNTIME_INIT_FAILED.
+
+        /// MariaDB `commit` callback. `commit_tx=true` → full
+        /// commit; `false` → statement boundary (no-op in Stage 0,
+        /// no savepoint support per Q10).
+        fn slatedb_handlerton_commit(thd_id: u64, commit_tx: bool) -> i32;
+
+        /// MariaDB `rollback` callback. `rollback_tx=true` → full
+        /// rollback; `false` → statement rollback (no-op in Stage 0).
+        fn slatedb_handlerton_rollback(thd_id: u64, rollback_tx: bool) -> i32;
+
+        /// MariaDB `close_connection` callback. Silently rolls back
+        /// any in-flight txn.
+        fn slatedb_handlerton_close_connection(thd_id: u64) -> i32;
+
+        /// MariaDB `savepoint` callback. Stage 0 stub per Q10 —
+        /// returns [`super::status::NOT_SUPPORTED`].
+        fn slatedb_handlerton_savepoint(thd_id: u64) -> i32;
+
+        /// MariaDB `rollback_to_savepoint` callback. Stage 0 stub.
+        fn slatedb_handlerton_rollback_to_savepoint(thd_id: u64) -> i32;
+
+        /// MariaDB `rollback_to_savepoint_can_release_mdl` query.
+        /// Constant `false`.
+        fn slatedb_handlerton_rollback_to_savepoint_can_release_mdl(
+            thd_id: u64,
+        ) -> bool;
+
+        /// MariaDB `commit_ordered` hook. No-op.
+        fn slatedb_handlerton_commit_ordered(thd_id: u64, all: bool);
+
+        /// MariaDB `checkpoint_request` hook. No-op.
+        fn slatedb_handlerton_checkpoint_request();
     }
 }
 
@@ -247,6 +291,10 @@ pub mod status {
     /// sequence. Coarse-grained at this stage; richer info will
     /// surface through the handler-bucket error channel.
     pub const ENGINE_IO_FAILED: i32 = 3;
+    /// Caller asked for a feature the SlateDB engine doesn't yet
+    /// support (Stage 0 savepoint stubs etc.). The C++ side maps
+    /// this to `HA_ERR_WRONG_COMMAND`.
+    pub const NOT_SUPPORTED: i32 = 4;
 }
 
 // ---------------------------------------------------------------------------
@@ -390,6 +438,81 @@ pub(crate) fn current_txn_registry() -> Option<Arc<TxnRegistry>> {
     guard.as_ref().map(|state| state.txn_registry.clone())
 }
 
+// ---------------------------------------------------------------------------
+// Handlerton txn callback wrappers
+// ---------------------------------------------------------------------------
+//
+// Free functions matching the cxx bridge declarations. Each resolves
+// the global [`TxnRegistry`] and delegates to
+// [`crate::engine::handlerton`].
+
+fn handlerton_result_to_status(r: Result<(), slatedb::Error>) -> i32 {
+    match r {
+        Ok(()) => status::OK,
+        Err(e) => match e.kind() {
+            slatedb::ErrorKind::Invalid => status::NOT_SUPPORTED,
+            _ => status::ENGINE_IO_FAILED,
+        },
+    }
+}
+
+pub(crate) fn slatedb_handlerton_commit(thd_id: u64, commit_tx: bool) -> i32 {
+    let Some(registry) = current_txn_registry() else {
+        return crate::handler::status::NO_ENGINE;
+    };
+    let Some(runtime) = crate::runtime::get() else {
+        return status::RUNTIME_INIT_FAILED;
+    };
+    let r = runtime.block_on(crate::engine::handlerton::commit(
+        &registry, thd_id, commit_tx,
+    ));
+    handlerton_result_to_status(r)
+}
+
+pub(crate) fn slatedb_handlerton_rollback(thd_id: u64, rollback_tx: bool) -> i32 {
+    let Some(registry) = current_txn_registry() else {
+        return crate::handler::status::NO_ENGINE;
+    };
+    handlerton_result_to_status(crate::engine::handlerton::rollback(
+        &registry,
+        thd_id,
+        rollback_tx,
+    ))
+}
+
+pub(crate) fn slatedb_handlerton_close_connection(thd_id: u64) -> i32 {
+    let Some(registry) = current_txn_registry() else {
+        return crate::handler::status::NO_ENGINE;
+    };
+    handlerton_result_to_status(crate::engine::handlerton::close_connection(
+        &registry, thd_id,
+    ))
+}
+
+pub(crate) fn slatedb_handlerton_savepoint(thd_id: u64) -> i32 {
+    handlerton_result_to_status(crate::engine::handlerton::savepoint(thd_id))
+}
+
+pub(crate) fn slatedb_handlerton_rollback_to_savepoint(thd_id: u64) -> i32 {
+    handlerton_result_to_status(crate::engine::handlerton::rollback_to_savepoint(
+        thd_id,
+    ))
+}
+
+pub(crate) fn slatedb_handlerton_rollback_to_savepoint_can_release_mdl(
+    thd_id: u64,
+) -> bool {
+    crate::engine::handlerton::rollback_to_savepoint_can_release_mdl(thd_id)
+}
+
+pub(crate) fn slatedb_handlerton_commit_ordered(thd_id: u64, all: bool) {
+    crate::engine::handlerton::commit_ordered(thd_id, all);
+}
+
+pub(crate) fn slatedb_handlerton_checkpoint_request() {
+    crate::engine::handlerton::checkpoint_request();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -475,10 +598,71 @@ mod tests {
             status::RUNTIME_INIT_FAILED,
             status::ALREADY_INITIALISED,
             status::ENGINE_IO_FAILED,
+            status::NOT_SUPPORTED,
         ];
         let mut set: std::collections::HashSet<i32> = std::collections::HashSet::new();
         for c in codes {
             assert!(set.insert(c), "duplicate status code {c}");
         }
+    }
+
+    // ----- handlerton txn callbacks -----
+
+    #[test]
+    fn handlerton_commit_without_engine_returns_no_engine() {
+        let _g = SERIALISE.lock();
+        let _ = slatedb_shutdown();
+        assert_eq!(
+            slatedb_handlerton_commit(1, true),
+            crate::handler::status::NO_ENGINE,
+        );
+    }
+
+    #[test]
+    fn handlerton_commit_full_drains_registered_txn() {
+        let _g = SERIALISE.lock();
+        let _ = slatedb_shutdown();
+        assert_eq!(
+            slatedb_init_in_memory("handlerton_commit_bridge".into()),
+            status::OK,
+        );
+        // Register a txn under thd_id=7 via the registry (skipping
+        // the cxx external_lock path — we already test that
+        // elsewhere).
+        let reg = current_txn_registry().expect("registry");
+        let db = current_engine().expect("engine");
+        crate::runtime::block_on(async {
+            reg.get_or_create(7, &db).await.expect("create");
+        });
+        assert!(reg.has(7));
+
+        assert_eq!(slatedb_handlerton_commit(7, true), status::OK);
+        assert!(!reg.has(7));
+
+        assert_eq!(slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn handlerton_savepoint_returns_not_supported() {
+        // No engine state needed — savepoint is unconditionally
+        // Stage-0-stubbed.
+        let _g = SERIALISE.lock();
+        let _ = slatedb_shutdown();
+        assert_eq!(slatedb_handlerton_savepoint(1), status::NOT_SUPPORTED);
+        assert_eq!(
+            slatedb_handlerton_rollback_to_savepoint(1),
+            status::NOT_SUPPORTED,
+        );
+    }
+
+    #[test]
+    fn handlerton_rollback_to_savepoint_can_release_mdl_is_false() {
+        assert!(!slatedb_handlerton_rollback_to_savepoint_can_release_mdl(0));
+    }
+
+    #[test]
+    fn handlerton_noop_hooks_do_not_panic() {
+        slatedb_handlerton_commit_ordered(0, true);
+        slatedb_handlerton_checkpoint_request();
     }
 }

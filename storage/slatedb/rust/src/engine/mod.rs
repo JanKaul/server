@@ -11,6 +11,7 @@ pub mod compact_filter;
 pub mod comparator;
 pub mod db;
 pub mod ddl_manager;
+pub mod handlerton;
 pub mod index_merge;
 pub mod merge;
 pub mod snapshot;
