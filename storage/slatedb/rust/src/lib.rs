@@ -4,7 +4,6 @@
 
 pub mod alter;
 pub mod bridge;
-pub mod bridge_field;
 pub mod codec;
 pub mod engine;
 pub mod error;
