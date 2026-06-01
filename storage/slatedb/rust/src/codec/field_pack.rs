@@ -211,6 +211,28 @@ pub struct FieldPacking {
     pub(crate) keynr: u32,
     /// Position of this field within the key (0-based).
     pub(crate) key_part: u32,
+
+    /// MariaDB column index (the slot in `TABLE_SHARE::field[]`)
+    /// that this keypart packs. Populated by [`Self::setup`] from
+    /// the `IndexKeyPartView::field_index` carried in the schema
+    /// POD. The future cxx pack wrapper uses this to call
+    /// `table_field_at(table, field_index)` per keypart.
+    ///
+    /// Meaningful only for keyparts that map to a real MariaDB
+    /// `Field` (i.e. non-synthetic keyparts whose `pack_func`
+    /// will be invoked). For the synthetic hidden-PK keypart the
+    /// `pack_record` orchestrator writes the 8-byte rowid
+    /// directly and never reads this field, so its value there
+    /// is "don't care" (set to `0` by `Default`).
+    pub(crate) field_index: u32,
+}
+
+impl FieldPacking {
+    /// MariaDB column index this keypart packs — see the field
+    /// doc for when it's meaningful.
+    pub fn field_index(&self) -> u32 {
+        self.field_index
+    }
 }
 
 impl FieldPacking {

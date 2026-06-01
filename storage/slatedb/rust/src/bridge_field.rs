@@ -260,6 +260,48 @@ pub fn pack_with_sort_string(
     Ok(max_len)
 }
 
+/// Cxx wrapper around [`crate::codec::key::KeyDef::pack_record`].
+/// Supplies a packer closure that, for each keypart, fetches a
+/// live `&FieldRef` from `table` via `table_field_at(field_index)`
+/// and routes through [`pack_with_sort_string`].
+///
+/// This is the missing link between the pure-Rust pack_record
+/// orchestrator and the C++ Field methods — once the C++ shim's
+/// `ha_slatedb::write_row` builds a `TableRef` and calls this,
+/// PK and SK row-key construction works end-to-end.
+///
+/// Today only the `pack_with_sort_string` family is implemented
+/// (the universal fixed-width pack — integers, dates, floats,
+/// NEWDECIMAL when its image fits in `max_image_len`). Other
+/// per-type pack helpers (VARCHAR / BLOB / collation-aware
+/// strings) land in follow-up slices and would extend this
+/// dispatcher.
+///
+/// `hidden_pk_id` is plumbed straight through to the
+/// orchestrator: `None` for explicit PK or SK on a table with a
+/// declared PRIMARY KEY; `Some(rowid)` for SK on a hidden-PK
+/// table — the rowid lands at the SK's tail keypart.
+#[cfg(feature = "field_callbacks")]
+pub fn pack_record_via_table(
+    key_def: &crate::codec::key::KeyDef,
+    table: &ffi::TableRef,
+    hidden_pk_id: Option<i64>,
+    dst: &mut [u8],
+) -> Result<usize, slatedb::Error> {
+    let mut packer = |_kp_idx: usize,
+                       fpi: &crate::codec::field_pack::FieldPacking,
+                       kp_dst: &mut [u8]|
+     -> Result<usize, slatedb::Error> {
+        // Per-keypart dispatch. Stage 0 has only the sort_string
+        // variant; once more pack helpers exist (VARCHAR length-
+        // prefix, BLOB prefix, etc.), this branches on
+        // `fpi.max_image_len`/charset metadata.
+        let field = ffi::table_field_at(table, fpi.field_index());
+        pack_with_sort_string(fpi, field, kp_dst)
+    };
+    key_def.pack_record(&mut packer, hidden_pk_id, dst)
+}
+
 /// Build a [`crate::codec::tbl_def::TblDef`] from primitive
 /// schema inputs the C++ shim extracted from `TABLE *form` at
 /// CREATE TABLE time.

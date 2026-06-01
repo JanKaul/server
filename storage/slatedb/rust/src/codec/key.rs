@@ -1574,6 +1574,10 @@ impl KeyDef {
                     kp.key_part_length,
                 );
                 pack_info[dst_i as usize].unpack_data_offset = unpack_len as i32;
+                // Remember the TABLE_SHARE::field[] slot this keypart
+                // packs — the cxx pack wrapper uses it to fetch a
+                // live `&FieldRef` via `table_field_at`.
+                pack_info[dst_i as usize].field_index = kp.field_idx;
 
                 // Populate pk_part_no for SKs.
                 if let Some(pk) = pk_info {
@@ -3325,6 +3329,28 @@ mod tests {
         assert_eq!(pk.pk_part_no.len(), 0); // PKs don't populate pk_part_no
         // maxlength = INDEX_NUMBER_SIZE (4) + int max_image_len (4) = 8.
         assert_eq!(pk.maxlength, 8);
+    }
+
+    #[test]
+    fn setup_populates_field_index_per_keypart() {
+        // Three-column table; PK on (col[2], col[0]). After setup,
+        // pack_info[0].field_index == 2 and pack_info[1].field_index == 0.
+        let table = TableShareView {
+            fields: vec![long_field("a"), long_field("b"), long_field("c")],
+            null_bytes: 0,
+            row_length: 12,
+            hidden_pk_field: None,
+            indexes: vec![idx(vec![kp(2), kp(0)])],
+            primary_key_index: Some(0),
+        };
+        let tdef = tbl_def(vec![Arc::new(pk_skel(100, 0))]);
+
+        let mut pk = pk_skel(100, 0);
+        pk.setup(&table, &tdef).expect("setup");
+
+        assert_eq!(pk.key_parts, 2);
+        assert_eq!(pk.pack_info[0].field_index(), 2);
+        assert_eq!(pk.pack_info[1].field_index(), 0);
     }
 
     #[test]
