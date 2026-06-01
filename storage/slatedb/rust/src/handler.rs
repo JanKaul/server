@@ -660,6 +660,59 @@ impl HaSlateDb {
         Ok(u64::from_be_bytes(buf) as i64)
     }
 
+    /// Build the row key for a hidden-PK row write. Writes
+    /// `u32_be(index_number) || u64_be(hidden_pk_id)` (12 bytes
+    /// total) into the front of `dst` and returns the byte count.
+    ///
+    /// Composes [`crate::codec::key::KeyDef::get_infimum_key`] +
+    /// [`crate::codec::key::KeyDef::build_hidden_pk_id_buf`]. The
+    /// future `write_row` path calls this once per insert on a
+    /// hidden-PK table.
+    ///
+    /// Errors:
+    /// - `Invalid` if the handler isn't open
+    /// - `Invalid` if the bound table doesn't have a hidden PK
+    ///   (`has_hidden_pk()` returned `false`)
+    /// - `Invalid` if `dst` is shorter than 12 bytes
+    pub fn pack_hidden_pk_row_key(
+        &self,
+        hidden_pk_id: i64,
+        dst: &mut [u8],
+    ) -> Result<usize, Error> {
+        use crate::codec::key::INDEX_NUMBER_SIZE;
+        use crate::globals::SIZEOF_HIDDEN_PK_COLUMN;
+        const ROW_KEY_BYTES: usize = INDEX_NUMBER_SIZE + SIZEOF_HIDDEN_PK_COLUMN;
+
+        if !self.has_hidden_pk() {
+            return Err(Error::invalid(
+                "pack_hidden_pk_row_key: handler not open or table \
+                 has no hidden PK"
+                    .into(),
+            ));
+        }
+        if dst.len() < ROW_KEY_BYTES {
+            return Err(Error::invalid(format!(
+                "pack_hidden_pk_row_key: dst too short — have {} bytes, \
+                 need {}",
+                dst.len(),
+                ROW_KEY_BYTES,
+            )));
+        }
+
+        // `has_hidden_pk()` returned true above, so tbl_def + a PK
+        // slot are present.
+        let tdef = self.tbl_def.as_ref().expect("has_hidden_pk implies open");
+        let pk_idx = self.pk_index().expect("has_hidden_pk implies PK present");
+        let pk_kd = tdef
+            .key(pk_idx as usize)
+            .expect("pk_index returns valid slot");
+
+        let mut written = 0usize;
+        pk_kd.get_infimum_key(dst, &mut written);
+        let added = pk_kd.build_hidden_pk_id_buf(hidden_pk_id, &mut dst[written..])?;
+        Ok(written + added)
+    }
+
     /// Prime the in-memory `auto_incr_val` from the persisted dict
     /// entry. No-op if the dict has no row for this table's PK
     /// (`gl_index_id` for the PK comes from
@@ -1871,6 +1924,92 @@ mod tests {
         });
         // fetch_max: smaller dict value does NOT lower the counter.
         assert_eq!(h.tbl_def().unwrap().auto_incr_val(), 10_000);
+
+        h.close().unwrap();
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    // ----- pack_hidden_pk_row_key -----
+
+    #[test]
+    fn pack_hidden_pk_row_key_writes_prefix_plus_rowid() {
+        let _g = SERIALISE.lock();
+        install_engine_with_keys("appdb.t_hpk_pack", vec![hidden_pk(200, 2)]);
+
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/t_hpk_pack").expect("open");
+
+        let mut buf = [0u8; 16];
+        let n = h.pack_hidden_pk_row_key(0x0102_0304_0506_0708, &mut buf).expect("pack");
+        assert_eq!(n, 12);
+        // index_number=200 → u32_be(0x000000c8)
+        assert_eq!(&buf[..4], &[0x00, 0x00, 0x00, 0xc8]);
+        assert_eq!(
+            &buf[4..12],
+            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+        );
+        // Trailing bytes untouched.
+        assert_eq!(&buf[12..], &[0u8; 4]);
+
+        h.close().unwrap();
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn pack_hidden_pk_row_key_round_trips_with_decoder() {
+        let _g = SERIALISE.lock();
+        install_engine_with_keys("appdb.t_hpk_round", vec![hidden_pk(0xCAFE, 2)]);
+
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/t_hpk_round").expect("open");
+
+        let mut buf = [0u8; 12];
+        h.pack_hidden_pk_row_key(-7, &mut buf).expect("pack");
+        // Negative rowid round-trips via i64 → u64 → i64 cast pair.
+        let decoded = HaSlateDb::read_hidden_pk_id_from_rowkey(&buf).expect("decode");
+        assert_eq!(decoded, -7);
+
+        h.close().unwrap();
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn pack_hidden_pk_row_key_rejects_closed_handler() {
+        let h = HaSlateDb::new();
+        let mut buf = [0u8; 12];
+        let err = h.pack_hidden_pk_row_key(1, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+    }
+
+    #[test]
+    fn pack_hidden_pk_row_key_rejects_explicit_pk_table() {
+        let _g = SERIALISE.lock();
+        install_engine_with_fixture("appdb.t_explicit_pack");
+
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/t_explicit_pack").expect("open");
+
+        let mut buf = [0u8; 12];
+        let err = h.pack_hidden_pk_row_key(1, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("no hidden PK"));
+
+        h.close().unwrap();
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn pack_hidden_pk_row_key_rejects_short_dst() {
+        let _g = SERIALISE.lock();
+        install_engine_with_keys("appdb.t_hpk_short", vec![hidden_pk(7, 2)]);
+
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/t_hpk_short").expect("open");
+
+        let mut buf = [0u8; 8]; // less than 12 required
+        let err = h.pack_hidden_pk_row_key(1, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("dst too short"));
 
         h.close().unwrap();
         assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
