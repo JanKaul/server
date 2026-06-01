@@ -271,8 +271,8 @@ impl DdlManager {
     /// Drop a `TblDef` from the catalogue (in-memory only). The C++
     /// version also writes a tombstone to the DDL entry via
     /// `m_dict->delete_key` and frees the Rdb_tbl_def*; the dict
-    /// write is deferred along with `put_and_write`, and Arc handles
-    /// the free.
+    /// write is the responsibility of [`Self::drop_table_with_dict`],
+    /// and Arc handles the free.
     pub fn remove(&self, table_name: &str) -> Option<Arc<TblDef>> {
         let mut st = self.state.write();
         let removed = st.ddl_map.remove(table_name)?;
@@ -280,6 +280,73 @@ impl DdlManager {
             st.index_num_to_keydef.remove(&kd.get_gl_index_id());
         }
         Some(removed)
+    }
+
+    /// Full DROP TABLE — counterpart of [`Self::put_and_write`]:
+    ///
+    /// 1. Mark every index of the table as pending-drop in the
+    ///    `dropped_indexes` registry. The compaction filter walks
+    ///    that registry to sweep prefix-matched rows asynchronously.
+    /// 2. Delete the DDL entry row so the next startup's
+    ///    [`Self::init`] doesn't see the table.
+    /// 3. Remove from in-memory catalogue (and the
+    ///    `index_num_to_keydef` reverse index).
+    ///
+    /// Returns `Ok(true)` if the table was present and dropped,
+    /// `Ok(false)` if no entry was found (idempotent — DROP TABLE
+    /// IF EXISTS races with concurrent drops). Errors propagate
+    /// from the dict writes (typically `ErrorKind::Unavailable` on
+    /// WAL failure).
+    ///
+    /// Translated from `Rdb_ddl_manager::remove` + the surrounding
+    /// drop_table machinery at `rdb_datadic.cc:3683` and the
+    /// drop_index registry add at `rdb_datadic.cc:4994..4998`.
+    pub async fn drop_table_with_dict(
+        &self,
+        db: &slatedb::Db,
+        table_name: &str,
+    ) -> Result<bool, slatedb::Error> {
+        // Snapshot the index ids while holding only the read lock —
+        // dict writes are async and we shouldn't hold the write
+        // lock across `.await`. After the dict writes commit we
+        // take the write lock and complete the in-memory removal.
+        let gl_ids: Vec<crate::globals::GlIndexId> = {
+            let st = self.state.read();
+            match st.ddl_map.get(table_name) {
+                Some(tdef) => tdef
+                    .key_descrs()
+                    .iter()
+                    .map(|kd| kd.get_gl_index_id())
+                    .collect(),
+                None => return Ok(false),
+            }
+        };
+
+        // 1. Register each index for the compaction-filter sweep.
+        //    Each `add` is idempotent (re-adding rewrites the same
+        //    version stamp), so retries are safe.
+        for gl in &gl_ids {
+            crate::codec::dict::dropped_indexes::add(db, *gl).await?;
+        }
+
+        // 2. Delete the DDL entry. After this point the table is
+        //    gone from the persistent dictionary; the in-memory
+        //    catalogue removal below is a best-effort cleanup —
+        //    a crash here would leave the in-memory state
+        //    inconsistent with the dict, but the next startup's
+        //    `init` would resync from the dict.
+        crate::codec::dict::ddl_entry_index_start_number::remove(db, table_name)
+            .await?;
+
+        // 3. In-memory removal. Returning Ok(false) is the
+        //    intermediate-race case: another caller dropped it
+        //    between the snapshot above and now.
+        let mut st = self.state.write();
+        let removed = st.ddl_map.remove(table_name).is_some();
+        for gl in &gl_ids {
+            st.index_num_to_keydef.remove(gl);
+        }
+        Ok(removed)
     }
 
     /// Rename a `TblDef` (in-memory). Clones the table descriptor
@@ -1330,5 +1397,110 @@ mod tests {
         assert!(m.find("db.t2").is_none());
 
         engine.close().await.expect("close");
+    }
+
+    // ----- drop_table_with_dict -----
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_table_with_dict_removes_in_memory_and_dict() {
+        let engine = EngineDb::open_in_memory("drop_ok").await.expect("open");
+        let m = DdlManager::new();
+
+        let tdef = Arc::new(
+            TblDef::new("db.users")
+                .unwrap()
+                .with_keys(vec![pk(100, 1), sk(101, 1, "by_email")]),
+        );
+        m.put_and_write(tdef, engine.db())
+            .await
+            .expect("put_and_write");
+
+        // Pre-conditions: present in-memory + in dict.
+        assert!(m.find("db.users").is_some());
+        assert!(
+            ddl_entry_index_start_number::read_typed(engine.db(), "db.users")
+                .await
+                .expect("read")
+                .is_some()
+        );
+
+        let dropped = m
+            .drop_table_with_dict(engine.db(), "db.users")
+            .await
+            .expect("drop");
+        assert!(dropped);
+
+        // In-memory: gone.
+        assert!(m.find("db.users").is_none());
+        // Dict DDL entry: gone.
+        assert!(
+            ddl_entry_index_start_number::read_typed(engine.db(), "db.users")
+                .await
+                .expect("read")
+                .is_none()
+        );
+        // Reverse index (gl_index_id → KeyDef): gone.
+        assert!(
+            m.find_key_by_id(GlIndexId { cf_id: 1, index_id: 100 }).is_none()
+        );
+        assert!(
+            m.find_key_by_id(GlIndexId { cf_id: 1, index_id: 101 }).is_none()
+        );
+
+        // Each index registered for sweep in dropped_indexes.
+        let dropped_set =
+            crate::codec::dict::dropped_indexes::list(engine.db())
+                .await
+                .expect("list dropped");
+        assert!(dropped_set.contains(&GlIndexId { cf_id: 1, index_id: 100 }));
+        assert!(dropped_set.contains(&GlIndexId { cf_id: 1, index_id: 101 }));
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_table_with_dict_missing_table_returns_false() {
+        let engine = EngineDb::open_in_memory("drop_missing").await.expect("open");
+        let m = DdlManager::new();
+
+        let dropped = m
+            .drop_table_with_dict(engine.db(), "db.never_existed")
+            .await
+            .expect("drop");
+        assert!(!dropped);
+
+        // Nothing was registered for sweep.
+        let dropped_set =
+            crate::codec::dict::dropped_indexes::list(engine.db())
+                .await
+                .expect("list dropped");
+        assert!(dropped_set.is_empty());
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_table_with_dict_is_idempotent() {
+        let engine = EngineDb::open_in_memory("drop_idem").await.expect("open");
+        let m = DdlManager::new();
+
+        let tdef = Arc::new(
+            TblDef::new("db.t").unwrap().with_keys(vec![pk(200, 2)]),
+        );
+        m.put_and_write(tdef, engine.db())
+            .await
+            .expect("put_and_write");
+
+        assert!(
+            m.drop_table_with_dict(engine.db(), "db.t")
+                .await
+                .expect("drop 1")
+        );
+        // Second call is a no-op.
+        assert!(
+            !m.drop_table_with_dict(engine.db(), "db.t")
+                .await
+                .expect("drop 2")
+        );
     }
 }

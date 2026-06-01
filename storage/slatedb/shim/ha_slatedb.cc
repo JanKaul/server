@@ -125,7 +125,10 @@ static int slatedb_init_func(void *p)
   /* Required handlerton fields. */
   slatedb_hton->create= slatedb_create_handler;
   slatedb_hton->flags=  HTON_CAN_RECREATE;
-  slatedb_hton->drop_table= [](handlerton *, const char *) { return -1; };
+  slatedb_hton->drop_table= [](handlerton *, const char *path) -> int {
+    int32_t rc= slatedb::slatedb_drop_table(rust::String(path));
+    return slatedb_status_to_ha_err(rc);
+  };
 
   /* Transaction callbacks — each dispatches into Rust via the
      cxx bridge. The Rust side owns the per-THD `TxnRegistry`. */

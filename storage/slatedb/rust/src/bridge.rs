@@ -79,6 +79,21 @@ mod ffi {
         /// `false` if no engine is installed (uninited / post-shutdown).
         fn slatedb_has_table(name: String) -> bool;
 
+        /// DROP TABLE callback — counterpart of the (future) CREATE
+        /// TABLE wiring. Marks each of the table's indexes as
+        /// pending-drop in the system CF, deletes the DDL entry, and
+        /// removes the in-memory catalogue entry. Idempotent —
+        /// returns `super::status::OK` whether or not the table
+        /// was present.
+        ///
+        /// `name` is MariaDB's on-disk path form (`./db/tbl` or
+        /// `./db/tbl#P#part`) — normalized internally before lookup.
+        ///
+        /// Returns: OK on success (including not-present),
+        /// NO_ENGINE pre-init, BAD_TABLE_PATH on malformed input,
+        /// ENGINE_IO_FAILED on dict-write failure.
+        fn slatedb_drop_table(name: String) -> i32;
+
         // ----- per-handler lifecycle -----
         //
         // Opaque `HaSlateDb` handle owned on the C++ side as
@@ -416,6 +431,27 @@ pub(crate) fn slatedb_has_table(name: String) -> bool {
     }
 }
 
+pub(crate) fn slatedb_drop_table(name: String) -> i32 {
+    let Some(state) = ({
+        let guard = ENGINE.read();
+        guard.as_ref().map(|s| (s.ddl.clone(), s.db.clone()))
+    }) else {
+        return crate::handler::status::NO_ENGINE;
+    };
+    let (ddl, engine) = state;
+    let normalized = match crate::utils::names::normalize_tablename(&name) {
+        Ok(n) => n,
+        Err(_) => return crate::handler::status::BAD_TABLE_PATH,
+    };
+    let Some(runtime) = crate::runtime::get() else {
+        return status::RUNTIME_INIT_FAILED;
+    };
+    match runtime.block_on(ddl.drop_table_with_dict(engine.db(), &normalized)) {
+        Ok(_) => status::OK,
+        Err(_) => status::ENGINE_IO_FAILED,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Internal accessors (not exposed via cxx)
 // ---------------------------------------------------------------------------
@@ -613,6 +649,93 @@ mod tests {
         let _g = SERIALISE.lock();
         let _ = slatedb_shutdown();
         assert!(!slatedb_has_table("anything".into()));
+    }
+
+    #[test]
+    fn drop_table_removes_from_catalogue() {
+        let _g = SERIALISE.lock();
+        let _ = slatedb_shutdown();
+        assert_eq!(slatedb_init_in_memory("drop_bridge".into()), status::OK);
+
+        // Install a fixture table via the internal accessor (skipping
+        // the cxx create-table surface, which isn't wired yet).
+        let ddl = current_ddl().expect("ddl");
+        let engine = current_engine().expect("engine");
+        crate::runtime::block_on(async {
+            use crate::codec::key::{
+                IndexType, KeyDef, INDEX_INFO_VERSION_LATEST,
+                PRIMARY_FORMAT_VERSION_LATEST,
+            };
+            let mut kd = KeyDef::new_skeleton(
+                100,
+                1,
+                0,
+                INDEX_INFO_VERSION_LATEST as u16,
+                IndexType::Primary,
+                PRIMARY_FORMAT_VERSION_LATEST,
+                false,
+                "pk",
+            );
+            kd.maxlength = 12;
+            let tdef = std::sync::Arc::new(
+                crate::codec::tbl_def::TblDef::new("appdb.drop_me")
+                    .unwrap()
+                    .with_keys(vec![std::sync::Arc::new(kd)]),
+            );
+            ddl.put_and_write(tdef, engine.db())
+                .await
+                .expect("put_and_write");
+        });
+        assert!(slatedb_has_table("appdb.drop_me".into()));
+
+        // C++ shim hands us MariaDB's on-disk form `./db/tbl`.
+        assert_eq!(
+            slatedb_drop_table("./appdb/drop_me".into()),
+            status::OK,
+        );
+        assert!(!slatedb_has_table("appdb.drop_me".into()));
+
+        assert_eq!(slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn drop_table_missing_returns_ok() {
+        let _g = SERIALISE.lock();
+        let _ = slatedb_shutdown();
+        assert_eq!(slatedb_init_in_memory("drop_missing".into()), status::OK);
+
+        // DROP TABLE IF EXISTS on a never-created table.
+        assert_eq!(
+            slatedb_drop_table("./appdb/nowhere".into()),
+            status::OK,
+        );
+
+        assert_eq!(slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn drop_table_without_engine_returns_no_engine() {
+        let _g = SERIALISE.lock();
+        let _ = slatedb_shutdown();
+        assert_eq!(
+            slatedb_drop_table("./db/t".into()),
+            crate::handler::status::NO_ENGINE,
+        );
+    }
+
+    #[test]
+    fn drop_table_with_malformed_name_returns_bad_path() {
+        let _g = SERIALISE.lock();
+        let _ = slatedb_shutdown();
+        assert_eq!(slatedb_init_in_memory("drop_bad_name".into()), status::OK);
+
+        // Not `./db/tbl` shape → normalize_tablename errors.
+        assert_eq!(
+            slatedb_drop_table("not_a_path".into()),
+            crate::handler::status::BAD_TABLE_PATH,
+        );
+
+        assert_eq!(slatedb_shutdown(), status::OK);
     }
 
     #[test]
