@@ -26,6 +26,14 @@ default = []
 # Enables MTR-style simulated-failure helpers in `utils::dbug`. Kept off by
 # default so release builds don't ship the corruption simulators.
 dbug = []
+# Enables the cxx::bridge Field/TABLE callback surface
+# (`src/bridge_field.rs`). When on, the Rust build expects the C++
+# shim header `storage/slatedb/shim/slatedb_field_callbacks.h` to
+# provide the inline callback implementations. Off by default so
+# `cargo test --lib` works without the C++ build context — CMake's
+# `corrosion_import_crate(... FEATURES field_callbacks)` turns it on
+# for the real plugin build.
+field_callbacks = []
 
 [dev-dependencies]
 testcontainers = "0.27"
