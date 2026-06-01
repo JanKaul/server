@@ -234,6 +234,116 @@ pub fn encode_row_value(
     Ok(dst.len() - start)
 }
 
+/// Sink for the value-blob decoder. Cxx-wrapper counterpart
+/// implements the trait by calling `field_set_null` /
+/// `field_set_value` on a live `Pin<&mut FieldRef>`. Tests use a
+/// mock.
+///
+/// Methods take `field_idx` referring to the slot in the table's
+/// field declaration order — same indexing as
+/// [`RowValueSource`].
+pub trait RowValueSink {
+    /// True iff this field is a PK keypart and therefore lives in
+    /// the row key, not the value blob. The decoder skips PK
+    /// fields entirely — the caller reconstructs them from the
+    /// row key separately.
+    fn is_in_pk(&self, field_idx: u32) -> bool;
+
+    /// Number of bytes the field consumes from the value blob
+    /// when non-null. Must match the encoder's
+    /// `RowValueSource::pack_length` for this field.
+    fn pack_length(&self, field_idx: u32) -> u32;
+
+    /// Mark this field as SQL NULL. Called when the corresponding
+    /// null bit is set in the bitmap; no bytes are consumed.
+    fn set_null(&mut self, field_idx: u32);
+
+    /// Copy `src` (exactly `pack_length(field_idx)` bytes) into
+    /// the field's storage. Called for non-null non-PK fields.
+    fn set_field_bytes(
+        &mut self,
+        field_idx: u32,
+        src: &[u8],
+    ) -> Result<(), slatedb::Error>;
+}
+
+/// Decode a value blob written by [`encode_row_value`] back into
+/// the row's columns via `sink`. Counterpart of MyRocks'
+/// `Rdb_converter::decode` at `rdb_converter.cc` (the
+/// per-row decoder loop).
+///
+/// Wire format (Stage 0 — same as the encoder):
+/// ```text
+/// [ null bitmap: layout.bitmap_bytes bytes ]
+/// [ per-non-PK-field bytes... ]
+/// ```
+///
+/// For each field in declaration order:
+/// - If `sink.is_in_pk(i)`: skipped (PK fields are decoded from
+///   the row key by the caller).
+/// - Else if the null bit is set in the bitmap header: invokes
+///   `sink.set_null(i)`; no bytes consumed.
+/// - Else: consumes `sink.pack_length(i)` bytes from the input
+///   and invokes `sink.set_field_bytes(i, slice)`.
+///
+/// Returns the number of bytes consumed from `src`. A well-formed
+/// value blob is consumed exactly; trailing bytes (if any) are
+/// ignored at this level (the caller can detect them by comparing
+/// against `src.len()`).
+///
+/// ## Errors
+///
+/// - `Data` if `src` is shorter than the null bitmap or runs out
+///   mid-field (truncated value blob — corruption or schema drift).
+/// - Whatever `sink.set_field_bytes` returns.
+///
+/// ## Stage 0 omissions
+///
+/// Symmetric with the encoder — no TTL prefix, no unpack_info
+/// block, no debug checksum suffix. Decode of any of those would
+/// need to slot in BEFORE the null bitmap (TTL), BETWEEN it and
+/// the field bytes (unpack_info), or AFTER (checksum).
+pub fn decode_row_value(
+    layout: &ValueNullBitmapLayout,
+    field_count: u32,
+    sink: &mut dyn RowValueSink,
+    src: &[u8],
+) -> Result<usize, slatedb::Error> {
+    let bitmap_bytes = layout.bitmap_bytes as usize;
+    if src.len() < bitmap_bytes {
+        return Err(slatedb::Error::data(format!(
+            "decode_row_value: value blob too short for null bitmap — \
+             have {} bytes, need {}",
+            src.len(),
+            bitmap_bytes,
+        )));
+    }
+    let bitmap = &src[..bitmap_bytes];
+    let mut cursor = bitmap_bytes;
+
+    for i in 0..field_count {
+        if sink.is_in_pk(i) {
+            continue;
+        }
+        if is_null_bit_set(bitmap, layout, i) {
+            sink.set_null(i);
+            continue;
+        }
+        let n = sink.pack_length(i) as usize;
+        if cursor.saturating_add(n) > src.len() {
+            return Err(slatedb::Error::data(format!(
+                "decode_row_value: value blob truncated at field {i} — \
+                 have {} bytes remaining, need {n}",
+                src.len() - cursor,
+            )));
+        }
+        sink.set_field_bytes(i, &src[cursor..cursor + n])?;
+        cursor += n;
+    }
+
+    Ok(cursor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -619,5 +729,254 @@ mod tests {
         };
         assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
         assert!(err.to_string().contains("expected pack_length"));
+    }
+
+    // ----- decode_row_value -----
+
+    /// Recording sink for the decoder. Captures set_null /
+    /// set_field_bytes calls so tests can assert what happened.
+    struct MockSink {
+        is_in_pk: Vec<bool>,
+        pack_length: Vec<u32>,
+        // For each field, the last set_field_bytes call's input
+        // (or None if not called / set_null instead).
+        last_set_bytes: Vec<Option<Vec<u8>>>,
+        // For each field, whether set_null was called.
+        set_null_called: Vec<bool>,
+        // Optional error to return on a specific field's
+        // set_field_bytes.
+        error_on_field: Option<u32>,
+    }
+
+    impl RowValueSink for MockSink {
+        fn is_in_pk(&self, i: u32) -> bool {
+            self.is_in_pk[i as usize]
+        }
+        fn pack_length(&self, i: u32) -> u32 {
+            self.pack_length[i as usize]
+        }
+        fn set_null(&mut self, i: u32) {
+            self.set_null_called[i as usize] = true;
+        }
+        fn set_field_bytes(
+            &mut self,
+            i: u32,
+            src: &[u8],
+        ) -> Result<(), slatedb::Error> {
+            if Some(i) == self.error_on_field {
+                return Err(slatedb::Error::invalid(
+                    "MockSink: synthetic field set error".into(),
+                ));
+            }
+            self.last_set_bytes[i as usize] = Some(src.to_vec());
+            Ok(())
+        }
+    }
+
+    fn mock_sink(n: usize) -> MockSink {
+        MockSink {
+            is_in_pk: vec![false; n],
+            pack_length: vec![1; n],
+            last_set_bytes: vec![None; n],
+            set_null_called: vec![false; n],
+            error_on_field: None,
+        }
+    }
+
+    #[test]
+    fn decode_row_value_empty_blob_no_fields() {
+        let layout = compute_value_null_bitmap_layout(0, |_| false, |_| false);
+        let mut sink = mock_sink(0);
+        let n = decode_row_value(&layout, 0, &mut sink, &[]).expect("dec");
+        assert_eq!(n, 0);
+    }
+
+    #[test]
+    fn decode_row_value_single_non_nullable_field() {
+        let layout = compute_value_null_bitmap_layout(1, |_| false, |_| false);
+        let mut sink = mock_sink(1);
+        sink.pack_length = vec![2];
+
+        // No bitmap (no nullable fields), 2 bytes of field data.
+        let blob = [0xAA, 0xBB];
+        let n = decode_row_value(&layout, 1, &mut sink, &blob).expect("dec");
+        assert_eq!(n, 2);
+        assert_eq!(sink.last_set_bytes[0], Some(vec![0xAA, 0xBB]));
+        assert!(!sink.set_null_called[0]);
+    }
+
+    #[test]
+    fn decode_row_value_nullable_null_field_calls_set_null_consumes_no_bytes() {
+        let layout = compute_value_null_bitmap_layout(1, |_| true, |_| false);
+        let mut sink = mock_sink(1);
+        sink.pack_length = vec![4];
+
+        // Bitmap byte with bit 0 set — field 0 is NULL.
+        let blob = [0x01];
+        let n = decode_row_value(&layout, 1, &mut sink, &blob).expect("dec");
+        assert_eq!(n, 1);
+        assert!(sink.set_null_called[0]);
+        assert!(sink.last_set_bytes[0].is_none());
+    }
+
+    #[test]
+    fn decode_row_value_nullable_non_null_field_reads_bytes_after_bitmap() {
+        let layout = compute_value_null_bitmap_layout(1, |_| true, |_| false);
+        let mut sink = mock_sink(1);
+        sink.pack_length = vec![3];
+
+        // Bitmap byte zero (field not-null), then 3 field bytes.
+        let blob = [0x00, 0xDE, 0xAD, 0xBE];
+        let n = decode_row_value(&layout, 1, &mut sink, &blob).expect("dec");
+        assert_eq!(n, 4);
+        assert!(!sink.set_null_called[0]);
+        assert_eq!(sink.last_set_bytes[0], Some(vec![0xDE, 0xAD, 0xBE]));
+    }
+
+    #[test]
+    fn decode_row_value_skips_pk_fields_entirely() {
+        // 3 fields: PK at 0 and 2; field 1 nullable, present.
+        let layout = compute_value_null_bitmap_layout(
+            3,
+            |i| i == 1,
+            |i| i == 0 || i == 2,
+        );
+        let mut sink = mock_sink(3);
+        sink.is_in_pk = vec![true, false, true];
+        sink.pack_length = vec![8, 4, 4];
+
+        // Bitmap: field 1 not-null → 0x00. Field 1 bytes follow.
+        let blob = [0x00, 0x11, 0x22, 0x33, 0x44];
+        let n = decode_row_value(&layout, 3, &mut sink, &blob).expect("dec");
+        assert_eq!(n, 5);
+        // Only field 1 should have been touched.
+        assert_eq!(sink.last_set_bytes[0], None);
+        assert_eq!(sink.last_set_bytes[1], Some(vec![0x11, 0x22, 0x33, 0x44]));
+        assert_eq!(sink.last_set_bytes[2], None);
+    }
+
+    #[test]
+    fn decode_row_value_multiple_fields_consumed_in_order() {
+        let layout = compute_value_null_bitmap_layout(
+            3,
+            |i| i == 1 || i == 2,
+            |_| false,
+        );
+        let mut sink = mock_sink(3);
+        sink.pack_length = vec![1, 2, 3];
+
+        // Bitmap: field 1 NULL, field 2 not-null.
+        // Bit 0 → field 1 NULL → bit 0 set.
+        // Bit 1 → field 2 NULL → bit 1 clear.
+        // Bitmap = 0b00000001 = 0x01.
+        // Field 0 bytes (1), field 1 skipped (NULL), field 2 bytes (3).
+        let blob = [0x01, 0xAA, 0xDD, 0xEE, 0xFF];
+        let n = decode_row_value(&layout, 3, &mut sink, &blob).expect("dec");
+        assert_eq!(n, 5);
+        assert_eq!(sink.last_set_bytes[0], Some(vec![0xAA]));
+        assert!(sink.set_null_called[1]);
+        assert_eq!(sink.last_set_bytes[2], Some(vec![0xDD, 0xEE, 0xFF]));
+    }
+
+    #[test]
+    fn decode_row_value_rejects_truncated_bitmap() {
+        let layout = compute_value_null_bitmap_layout(8, |_| true, |_| false);
+        // bitmap needs 1 byte; provide 0.
+        let mut sink = mock_sink(8);
+        let blob: Vec<u8> = vec![];
+        let err = match decode_row_value(&layout, 8, &mut sink, &blob) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
+        assert_eq!(err.kind(), slatedb::ErrorKind::Data);
+        assert!(err.to_string().contains("null bitmap"));
+    }
+
+    #[test]
+    fn decode_row_value_rejects_truncated_field_bytes() {
+        let layout = compute_value_null_bitmap_layout(1, |_| false, |_| false);
+        let mut sink = mock_sink(1);
+        sink.pack_length = vec![4];
+
+        // Only 2 bytes of field data, needs 4.
+        let blob = [0xAA, 0xBB];
+        let err = match decode_row_value(&layout, 1, &mut sink, &blob) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
+        assert_eq!(err.kind(), slatedb::ErrorKind::Data);
+        assert!(err.to_string().contains("truncated"));
+    }
+
+    #[test]
+    fn decode_row_value_propagates_sink_error() {
+        let layout = compute_value_null_bitmap_layout(2, |_| false, |_| false);
+        let mut sink = mock_sink(2);
+        sink.pack_length = vec![1, 1];
+        sink.error_on_field = Some(1);
+
+        let blob = [0xAA, 0xBB];
+        let err = match decode_row_value(&layout, 2, &mut sink, &blob) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(err.to_string().contains("synthetic field set error"));
+    }
+
+    // ----- encode/decode round-trip -----
+
+    #[test]
+    fn encode_decode_round_trips_for_a_realistic_table() {
+        // 4 fields: 0 = PK (non-null, 8 bytes), 1 = nullable str
+        // (currently null, 16 bytes when present), 2 = non-nullable
+        // int (4 bytes), 3 = nullable int (currently present, 4 bytes).
+        let is_nullable_vec = [false, true, false, true];
+        let is_in_pk_vec = [true, false, false, false];
+        let layout = compute_value_null_bitmap_layout(
+            4,
+            |i| is_nullable_vec[i as usize],
+            |i| is_in_pk_vec[i as usize],
+        );
+
+        // Encode.
+        let mut enc_src = mock(4);
+        enc_src.is_in_pk = is_in_pk_vec.to_vec();
+        enc_src.is_null = vec![false, true, false, false];
+        enc_src.pack_length = vec![8, 16, 4, 4];
+        enc_src.bytes = vec![
+            vec![0; 8],                   // PK — not written
+            vec![0; 16],                  // NULL — not written
+            vec![0xCA, 0xFE, 0xBA, 0xBE], // int = 0xCAFEBABE
+            vec![0x12, 0x34, 0x56, 0x78], // nullable int present
+        ];
+        let mut blob: Vec<u8> = Vec::new();
+        encode_row_value(&layout, 4, &mut enc_src, &mut blob).expect("enc");
+
+        // Decode into a fresh sink and assert the symmetry.
+        let mut dec_sink = mock_sink(4);
+        dec_sink.is_in_pk = is_in_pk_vec.to_vec();
+        dec_sink.pack_length = enc_src.pack_length.clone();
+        let n =
+            decode_row_value(&layout, 4, &mut dec_sink, &blob).expect("dec");
+        assert_eq!(n, blob.len(), "decoder consumes the whole blob");
+
+        // PK field: never touched.
+        assert!(!dec_sink.set_null_called[0]);
+        assert_eq!(dec_sink.last_set_bytes[0], None);
+        // Field 1 (nullable, was NULL).
+        assert!(dec_sink.set_null_called[1]);
+        assert_eq!(dec_sink.last_set_bytes[1], None);
+        // Field 2 (non-nullable, was present).
+        assert!(!dec_sink.set_null_called[2]);
+        assert_eq!(
+            dec_sink.last_set_bytes[2],
+            Some(vec![0xCA, 0xFE, 0xBA, 0xBE]),
+        );
+        // Field 3 (nullable, present).
+        assert!(!dec_sink.set_null_called[3]);
+        assert_eq!(
+            dec_sink.last_set_bytes[3],
+            Some(vec![0x12, 0x34, 0x56, 0x78]),
+        );
     }
 }
