@@ -36,9 +36,10 @@
 
 use std::sync::Arc;
 
-use slatedb::Error;
+use slatedb::{DbIterator, Error, KeyValue};
 
 use crate::codec::tbl_def::TblDef;
+use crate::engine::txn_registry::TxnRegistry;
 
 /// Status codes specific to handler operations. Reuses the
 /// [`crate::bridge::status`] codes for engine-not-installed; adds
@@ -281,6 +282,14 @@ pub struct HaSlateDb {
     /// MariaDB needs to invalidate that handle. C++ counterpart is
     /// `m_retrieved_record` at `ha_rocksdb.cc:11954`.
     retrieved_record: bytes::BytesMut,
+
+    /// Active full-table-scan iterator, set by [`Self::rnd_init`],
+    /// advanced by [`Self::rnd_next`], cleared by [`Self::rnd_end`].
+    /// Bound to the per-THD transaction's snapshot at `rnd_init`
+    /// time (via [`crate::engine::txn::EngineTxn::scan_prefix`]),
+    /// so it stays SSI-consistent with the txn's `get` / `put` /
+    /// `delete` ops through the rest of the statement.
+    scan_iter: Option<DbIterator>,
 }
 
 impl Default for HaSlateDb {
@@ -301,6 +310,7 @@ impl HaSlateDb {
             keyread_only: false,
             insert_with_update: false,
             retrieved_record: bytes::BytesMut::new(),
+            scan_iter: None,
         }
     }
 
@@ -938,6 +948,102 @@ impl HaSlateDb {
             }
         }
         Ok(())
+    }
+
+    // ----- table-scan read path (rnd_init / rnd_next / rnd_end) -----
+
+    /// Open a full-table scan on the PK keyspace, scoped to the
+    /// per-THD transaction's snapshot. Translated from
+    /// `ha_rocksdb::rnd_init` at `ha_rocksdb.cc:9776`.
+    ///
+    /// The C++ has two modes (`scan = true` for full table scan,
+    /// `scan = false` for prepared point lookups via `rnd_pos`).
+    /// Stage 0 supports the full-scan case only — `rnd_pos` lands
+    /// in a follow-up slice when MariaDB's position-byte plumbing
+    /// crosses the cxx boundary.
+    ///
+    /// Errors:
+    /// - `Invalid` if the handler isn't open.
+    /// - `Invalid` if no PK index is present on the bound table
+    ///   (corruption — every table has explicit or hidden PK).
+    /// - `Invalid` if `thd_id` has no registered txn (caller must
+    ///   issue `external_lock(F_RDLCK | F_WRLCK)` first).
+    /// - Whatever `EngineTxn::scan_prefix` returns (I/O failure).
+    pub async fn rnd_init(
+        &mut self,
+        thd_id: u64,
+        registry: &TxnRegistry,
+    ) -> Result<(), Error> {
+        use crate::codec::key::INDEX_NUMBER_SIZE;
+
+        let tdef = self.tbl_def.as_ref().ok_or_else(|| {
+            Error::invalid("rnd_init: handler not open".into())
+        })?;
+        let pk_idx = self.pk_index().ok_or_else(|| {
+            Error::invalid(
+                "rnd_init: no PK keydef on bound table (corruption)".into(),
+            )
+        })?;
+        let pk_kd = tdef
+            .key(pk_idx as usize)
+            .expect("pk_index returns valid slot");
+
+        // Index prefix: u32_be(index_number). `get_infimum_key`
+        // populates the first 4 bytes and reports `size = 4`.
+        let mut prefix = [0u8; INDEX_NUMBER_SIZE];
+        let mut size = 0;
+        pk_kd.get_infimum_key(&mut prefix, &mut size);
+
+        // Take the txn out of the registry so we can call
+        // `scan_prefix(&self)` on it without holding the registry
+        // lock across the await. Put it back regardless of outcome.
+        let txn = registry.take(thd_id).ok_or_else(|| {
+            Error::invalid(
+                "rnd_init: no txn for thd_id — external_lock must run first"
+                    .into(),
+            )
+        })?;
+        let iter_result = txn.scan_prefix(&prefix[..size]).await;
+        registry.reinsert(thd_id, txn);
+
+        self.scan_iter = Some(iter_result?);
+        Ok(())
+    }
+
+    /// Advance the active scan iterator. Returns `Ok(None)` at
+    /// end-of-data, `Ok(Some(kv))` on a row, `Err` on I/O failure
+    /// or invalidation.
+    ///
+    /// Translated from `ha_rocksdb::rnd_next` at
+    /// `ha_rocksdb.cc:9863` — minus the per-row decode step (the
+    /// caller routes `kv.value` through
+    /// [`crate::codec::row_value::decode_row_value`] +
+    /// `TableRefRowValueSink` to fill `record[0]`). PK column
+    /// reconstruction from `kv.key` happens in the same cxx-bridge
+    /// layer.
+    ///
+    /// Returns `Err(Invalid)` if [`Self::rnd_init`] wasn't called.
+    pub async fn rnd_next(&mut self) -> Result<Option<KeyValue>, Error> {
+        let iter = self.scan_iter.as_mut().ok_or_else(|| {
+            Error::invalid("rnd_next: rnd_init not called".into())
+        })?;
+        iter.next().await
+    }
+
+    /// Tear down the active scan. Idempotent — calling on a handler
+    /// that hasn't run `rnd_init` is OK. Translated from
+    /// `ha_rocksdb::rnd_end` at `ha_rocksdb.cc:9929`; we just drop
+    /// the `DbIterator` (its underlying segment iterators clean
+    /// themselves up on Drop).
+    pub fn rnd_end(&mut self) -> Result<(), Error> {
+        self.scan_iter = None;
+        Ok(())
+    }
+
+    /// Whether a scan is currently in progress. Diagnostic /
+    /// test accessor.
+    pub fn has_active_scan(&self) -> bool {
+        self.scan_iter.is_some()
     }
 }
 
@@ -2034,5 +2140,210 @@ mod tests {
 
         h.close().unwrap();
         assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    // ----- rnd_init / rnd_next / rnd_end (table-scan read path) -----
+
+    /// Seed `count` rows under the PK prefix `u32_be(index_number)`
+    /// of the bound table's PK keydef. The value is just the row's
+    /// 1-byte index — enough to verify ordering and visibility.
+    /// Writes are committed via a fresh txn so a later reader's
+    /// snapshot sees them.
+    async fn seed_rows_under_pk(
+        index_number: u32,
+        count: u8,
+        db: &crate::engine::db::EngineDb,
+    ) {
+        let mut txn = db.begin_default().await.expect("begin seed");
+        for i in 0..count {
+            let mut k = index_number.to_be_bytes().to_vec();
+            k.push(i);
+            txn.put(&k, &[i]).expect("put");
+        }
+        txn.commit().await.expect("commit seed");
+    }
+
+    #[test]
+    fn rnd_init_then_next_walks_all_committed_rows_under_pk() {
+        let _g = SERIALISE.lock();
+        // PK index_number = 100, cf_id = 1 (matches `install_engine_with_fixture`).
+        install_engine_with_fixture("appdb.t_scan");
+        let db = crate::bridge::current_engine().expect("engine");
+        let reg = crate::bridge::current_txn_registry().expect("registry");
+        crate::runtime::block_on(async {
+            seed_rows_under_pk(100, 3, &db).await;
+        });
+
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/t_scan").expect("open");
+
+        crate::runtime::block_on(async {
+            // External_lock creates the per-THD txn that rnd_init
+            // will scan under.
+            h.external_lock(7777, ExternalLockType::Read, false)
+                .await
+                .expect("acquire read lock");
+            h.rnd_init(7777, &reg).await.expect("rnd_init");
+            assert!(h.has_active_scan());
+
+            let mut seen: Vec<u8> = Vec::new();
+            while let Some(kv) = h.rnd_next().await.expect("rnd_next") {
+                // Value carries the seeded byte; lets us check the
+                // iteration order (sorted by PK suffix).
+                assert_eq!(kv.value.len(), 1);
+                seen.push(kv.value[0]);
+            }
+            assert_eq!(seen, vec![0, 1, 2]);
+
+            h.rnd_end().expect("rnd_end");
+            assert!(!h.has_active_scan());
+
+            // Returning the txn to its quiescent state.
+            reg.rollback(7777);
+        });
+
+        h.close().unwrap();
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn rnd_init_uses_txn_snapshot_not_live_view() {
+        // SSI snapshot: writes committed AFTER rnd_init's begin
+        // must NOT appear in the scan.
+        let _g = SERIALISE.lock();
+        install_engine_with_fixture("appdb.t_scan_snapshot");
+        let db = crate::bridge::current_engine().expect("engine");
+        let reg = crate::bridge::current_txn_registry().expect("registry");
+
+        crate::runtime::block_on(async {
+            seed_rows_under_pk(100, 1, &db).await;
+        });
+
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/t_scan_snapshot").expect("open");
+
+        crate::runtime::block_on(async {
+            // Reader's snapshot pinned by external_lock → begin.
+            h.external_lock(8888, ExternalLockType::Read, false)
+                .await
+                .expect("acquire");
+
+            // Writer commits an additional row AFTER reader's begin.
+            let mut writer = db.begin_default().await.expect("writer begin");
+            {
+                let mut k = 100u32.to_be_bytes().to_vec();
+                k.push(0x99); // suffix outside the seed range
+                writer.put(&k, &[0x99]).expect("put");
+            }
+            writer.commit().await.expect("writer commit");
+
+            // Reader's rnd_init opens scan_prefix under the begin
+            // snapshot — only the original seed is visible.
+            h.rnd_init(8888, &reg).await.expect("rnd_init");
+            let mut count = 0;
+            while let Some(_kv) = h.rnd_next().await.expect("rnd_next") {
+                count += 1;
+            }
+            assert_eq!(count, 1, "post-begin write must not appear");
+            h.rnd_end().expect("rnd_end");
+            reg.rollback(8888);
+        });
+
+        h.close().unwrap();
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn rnd_init_excludes_sibling_index_prefixes() {
+        // Rows under a sibling index's prefix don't bleed into a
+        // PK-prefix scan.
+        let _g = SERIALISE.lock();
+        install_engine_with_fixture("appdb.t_scan_sibling");
+        let db = crate::bridge::current_engine().expect("engine");
+        let reg = crate::bridge::current_txn_registry().expect("registry");
+
+        crate::runtime::block_on(async {
+            // Seed one row under PK index 100 …
+            seed_rows_under_pk(100, 1, &db).await;
+            // … and two under a different index (e.g. a synthetic SK at 200).
+            let mut t = db.begin_default().await.expect("begin");
+            for i in 0u8..2 {
+                let mut k = 200u32.to_be_bytes().to_vec();
+                k.push(i);
+                t.put(&k, &[i]).expect("put");
+            }
+            t.commit().await.expect("commit");
+        });
+
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/t_scan_sibling").expect("open");
+
+        crate::runtime::block_on(async {
+            h.external_lock(9999, ExternalLockType::Read, false)
+                .await
+                .expect("acquire");
+            h.rnd_init(9999, &reg).await.expect("rnd_init");
+
+            let mut count = 0;
+            while let Some(_kv) = h.rnd_next().await.expect("rnd_next") {
+                count += 1;
+            }
+            assert_eq!(count, 1, "only PK-prefixed row is visible");
+            h.rnd_end().expect("rnd_end");
+            reg.rollback(9999);
+        });
+
+        h.close().unwrap();
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn rnd_next_without_init_returns_invalid() {
+        let mut h = HaSlateDb::new();
+        let err = crate::runtime::block_on(h.rnd_next()).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("rnd_init not called"));
+    }
+
+    #[test]
+    fn rnd_init_without_txn_returns_invalid() {
+        let _g = SERIALISE.lock();
+        install_engine_with_fixture("appdb.t_scan_notxn");
+        let reg = crate::bridge::current_txn_registry().expect("registry");
+
+        let mut h = HaSlateDb::new();
+        h.open("./appdb/t_scan_notxn").expect("open");
+
+        let err = crate::runtime::block_on(h.rnd_init(12345, &reg)).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("no txn for thd_id"));
+
+        h.close().unwrap();
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn rnd_init_without_open_handler_returns_invalid() {
+        let _g = SERIALISE.lock();
+        install_engine_with_fixture("appdb.t_scan_unbound");
+        let reg = crate::bridge::current_txn_registry().expect("registry");
+
+        let mut h = HaSlateDb::new(); // not opened
+        let err = crate::runtime::block_on(h.rnd_init(1, &reg)).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("handler not open"));
+
+        assert_eq!(crate::bridge::slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn rnd_end_is_idempotent_and_clears_scan_iter() {
+        let mut h = HaSlateDb::new();
+        // No prior init: rnd_end is still a clean no-op.
+        h.rnd_end().expect("noop end");
+        assert!(!h.has_active_scan());
+
+        // Second call still OK.
+        h.rnd_end().expect("noop end #2");
     }
 }
