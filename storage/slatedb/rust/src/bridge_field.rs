@@ -157,6 +157,57 @@ pub mod ffi {
         /// Borrow the in-progress row buffer (`record[0]`).
         /// Length is `table->s->stored_rec_length`.
         fn table_record_buf(t: &TableRef) -> &[u8];
+
+        // ----- Schema introspection (CREATE TABLE) -----
+
+        /// Opaque wrapper around MariaDB's `KEY *` (one entry of
+        /// `TABLE_SHARE::key_info`). Same lifetime contract as
+        /// [`FieldRef`] / [`TableRef`].
+        type KeyInfoRef;
+
+        /// Number of declared keys (`TABLE_SHARE::keys`).
+        fn table_key_count(t: &TableRef) -> u32;
+
+        /// True iff the table has a user-declared PRIMARY KEY.
+        /// `false` means the SQL layer didn't supply one and the
+        /// engine should synthesise a hidden PK at CREATE time.
+        fn table_has_primary_key(t: &TableRef) -> bool;
+
+        /// Index of the PRIMARY KEY within `key_info[]`. Only
+        /// meaningful when [`table_has_primary_key`] is `true`
+        /// (callers must guard with that first).
+        fn table_primary_key_index(t: &TableRef) -> u32;
+
+        /// Borrow the `i`-th `KEY` from a TABLE's `key_info[]`.
+        /// Same thread-local-scratch pattern as
+        /// [`table_field_at`] — must not be retained past the
+        /// callback boundary.
+        fn table_key_at(t: &TableRef, key_index: u32) -> &KeyInfoRef;
+
+        /// Key name (`KEY::name`). Allocates a fresh `String` —
+        /// CREATE TABLE is a one-shot path where per-key
+        /// allocation is acceptable.
+        fn key_name(k: &KeyInfoRef) -> String;
+    }
+
+    extern "Rust" {
+        /// CREATE TABLE entry point — called by the C++ shim's
+        /// `ha_slatedb::create` once it has wrapped `TABLE *form`
+        /// in a `TableRef`. Allocates index ids, builds skeleton
+        /// `KeyDef`s for each declared key (and a synthetic hidden
+        /// PK if none was declared), and writes the resulting
+        /// `TblDef` to the system-CF catalogue via
+        /// `DdlManager::put_and_write`.
+        ///
+        /// `name` is MariaDB's on-disk path form
+        /// (`./db/tbl[#P#part]`); the Rust side normalises it.
+        ///
+        /// Per-keypart `FieldPacking::setup` is deferred — the
+        /// keys land as skeletons that the future codec pack
+        /// pipeline fleshes out. CREATE TABLE only needs the
+        /// index identity (cf_id + index_id + name + type) for
+        /// catalogue lookup to work.
+        fn slatedb_create_table(name: String, table: &TableRef) -> i32;
     }
 }
 
@@ -209,10 +260,307 @@ pub fn pack_with_sort_string(
     Ok(max_len)
 }
 
-#[cfg(all(test, not(feature = "field_callbacks")))]
+/// Build a [`crate::codec::tbl_def::TblDef`] from primitive
+/// schema inputs the C++ shim extracted from `TABLE *form` at
+/// CREATE TABLE time.
+///
+/// Each `key_names[i]` becomes a skeleton `KeyDef` in slot `i`.
+/// The key at `primary_key_index` (if `Some`) gets
+/// `IndexType::Primary`; all others (including when
+/// `primary_key_index` is `None`) get `IndexType::Secondary`.
+/// If no primary was declared, a synthetic `IndexType::HiddenPrimary`
+/// is appended at the end.
+///
+/// `index_ids` must have exactly one id per `key_names` entry plus
+/// one extra when a hidden PK is synthesised (so total length is
+/// `key_names.len()` or `key_names.len() + 1`). Caller is
+/// responsible for allocating these via
+/// [`crate::engine::ddl_manager::DdlManager::get_and_update_next_number`].
+///
+/// All keys land on `default_cf_id` — Stage 0 has no per-key CF
+/// routing (MyRocks' `COMMENT='cf=...'` syntax is deferred).
+///
+/// Returns `Err(Invalid)` if `index_ids.len()` doesn't match what
+/// `key_names.len()` + `primary_key_index` would require, or if
+/// `full_name` is not a valid `db.tbl[#P#part]` path.
+///
+/// This helper is the testable core of
+/// [`slatedb_create_table`] — pure Rust, no cxx dependency, so
+/// it compiles and tests both with and without the
+/// `field_callbacks` feature.
+#[cfg_attr(not(feature = "field_callbacks"), allow(dead_code))]
+pub(crate) fn build_tbl_def_from_schema(
+    full_name: &str,
+    key_names: &[String],
+    primary_key_index: Option<usize>,
+    index_ids: &[u32],
+    default_cf_id: u32,
+) -> Result<crate::codec::tbl_def::TblDef, slatedb::Error> {
+    use crate::codec::key::{
+        IndexType, KeyDef, INDEX_INFO_VERSION_LATEST,
+        PRIMARY_FORMAT_VERSION_LATEST, SECONDARY_FORMAT_VERSION_LATEST,
+    };
+    use crate::codec::tbl_def::TblDef;
+    use std::sync::Arc;
+
+    if let Some(pk_idx) = primary_key_index {
+        if pk_idx >= key_names.len() {
+            return Err(slatedb::Error::invalid(format!(
+                "build_tbl_def_from_schema: primary_key_index {} \
+                 out of range for {} keys",
+                pk_idx,
+                key_names.len(),
+            )));
+        }
+    }
+
+    let needs_hidden_pk = primary_key_index.is_none();
+    let expected_id_count = key_names.len() + usize::from(needs_hidden_pk);
+    if index_ids.len() != expected_id_count {
+        return Err(slatedb::Error::invalid(format!(
+            "build_tbl_def_from_schema: expected {} index_ids \
+             (one per key{}), got {}",
+            expected_id_count,
+            if needs_hidden_pk { " + 1 for hidden PK" } else { "" },
+            index_ids.len(),
+        )));
+    }
+
+    let mut keys: Vec<Arc<KeyDef>> = Vec::with_capacity(expected_id_count);
+    for (i, name) in key_names.iter().enumerate() {
+        let is_pk = primary_key_index == Some(i);
+        let (index_type, format_version) = if is_pk {
+            (IndexType::Primary, PRIMARY_FORMAT_VERSION_LATEST)
+        } else {
+            (IndexType::Secondary, SECONDARY_FORMAT_VERSION_LATEST)
+        };
+        keys.push(Arc::new(KeyDef::new_skeleton(
+            index_ids[i],
+            default_cf_id,
+            i as u32,
+            INDEX_INFO_VERSION_LATEST as u16,
+            index_type,
+            format_version,
+            false,
+            name.clone(),
+        )));
+    }
+
+    if needs_hidden_pk {
+        let hidden_id = index_ids[key_names.len()];
+        keys.push(Arc::new(KeyDef::new_skeleton(
+            hidden_id,
+            default_cf_id,
+            key_names.len() as u32,
+            INDEX_INFO_VERSION_LATEST as u16,
+            IndexType::HiddenPrimary,
+            PRIMARY_FORMAT_VERSION_LATEST,
+            false,
+            "HIDDEN_PK_NAME",
+        )));
+    }
+
+    Ok(TblDef::new(full_name)?.with_keys(keys))
+}
+
+/// Cxx `extern "Rust"` body — see the declaration in [`ffi`] for
+/// the wire contract. The C++ shim's `ha_slatedb::create` wraps
+/// `TABLE *form` in a [`ffi::TableRef`] and calls this.
+#[cfg(feature = "field_callbacks")]
+fn slatedb_create_table(name: String, table: &ffi::TableRef) -> i32 {
+    use crate::bridge::status;
+    use crate::handler::status as handler_status;
+    use std::sync::Arc;
+
+    let Some(ddl) = crate::bridge::current_ddl() else {
+        return handler_status::NO_ENGINE;
+    };
+    let Some(engine) = crate::bridge::current_engine() else {
+        return handler_status::NO_ENGINE;
+    };
+    let normalized = match crate::utils::names::normalize_tablename(&name) {
+        Ok(n) => n,
+        Err(_) => return handler_status::BAD_TABLE_PATH,
+    };
+
+    let key_count = ffi::table_key_count(table);
+    let has_pk = ffi::table_has_primary_key(table);
+    let pk_index = if has_pk {
+        Some(ffi::table_primary_key_index(table) as usize)
+    } else {
+        None
+    };
+
+    let mut key_names: Vec<String> = Vec::with_capacity(key_count as usize);
+    for i in 0..key_count {
+        let key_ref = ffi::table_key_at(table, i);
+        key_names.push(ffi::key_name(key_ref));
+    }
+
+    // Allocate one id per declared key + one more for the
+    // synthetic hidden PK (when needed). These are sequential
+    // SeqGenerator allocations — concurrent CREATE TABLEs get
+    // distinct ranges because get_and_update_next_number is a
+    // single atomic increment.
+    let needed_ids = key_count as usize + usize::from(!has_pk);
+    let mut index_ids: Vec<u32> = Vec::with_capacity(needed_ids);
+    for _ in 0..needed_ids {
+        index_ids.push(ddl.get_and_update_next_number());
+    }
+
+    let tdef = match build_tbl_def_from_schema(
+        &normalized,
+        &key_names,
+        pk_index,
+        &index_ids,
+        // Stage 0: everyone lives in cf_id=1. Per-key CF routing
+        // (MyRocks' COMMENT='cf=...' parser) is deferred.
+        1,
+    ) {
+        Ok(t) => t,
+        Err(_) => return status::ENGINE_IO_FAILED,
+    };
+
+    let Some(runtime) = crate::runtime::get() else {
+        return status::RUNTIME_INIT_FAILED;
+    };
+    match runtime.block_on(ddl.put_and_write(Arc::new(tdef), engine.db())) {
+        Ok(_) => status::OK,
+        Err(_) => status::ENGINE_IO_FAILED,
+    }
+}
+
+#[cfg(test)]
 mod tests {
-    //! Without the `field_callbacks` feature there's no `FieldRef`
-    //! to construct in Rust tests, so this module is intentionally
-    //! empty when the feature is off. The function is exercised by
-    //! the C++ build (slice 3 onward).
+    use super::*;
+    use crate::codec::key::IndexType;
+
+    #[test]
+    fn build_tbl_def_with_user_pk_only() {
+        let t = build_tbl_def_from_schema(
+            "db.t",
+            &["PRIMARY".to_string()],
+            Some(0),
+            &[100],
+            1,
+        )
+        .expect("build");
+        assert_eq!(t.key_count(), 1);
+        let k0 = t.key(0).unwrap();
+        assert_eq!(k0.index_type, IndexType::Primary);
+        assert_eq!(k0.get_index_number(), 100);
+        assert_eq!(k0.cf_id(), 1);
+        assert_eq!(k0.get_name(), "PRIMARY");
+    }
+
+    #[test]
+    fn build_tbl_def_appends_hidden_pk_when_no_user_pk() {
+        let t = build_tbl_def_from_schema("db.t", &[], None, &[200], 1)
+            .expect("build");
+        assert_eq!(t.key_count(), 1);
+        let hpk = t.key(0).unwrap();
+        assert_eq!(hpk.index_type, IndexType::HiddenPrimary);
+        assert_eq!(hpk.get_index_number(), 200);
+        assert_eq!(hpk.get_name(), "HIDDEN_PK_NAME");
+    }
+
+    #[test]
+    fn build_tbl_def_with_pk_and_secondary() {
+        let t = build_tbl_def_from_schema(
+            "db.t",
+            &["PRIMARY".to_string(), "by_email".to_string()],
+            Some(0),
+            &[100, 101],
+            1,
+        )
+        .expect("build");
+        assert_eq!(t.key_count(), 2);
+        assert_eq!(t.key(0).unwrap().index_type, IndexType::Primary);
+        assert_eq!(t.key(1).unwrap().index_type, IndexType::Secondary);
+        assert_eq!(t.key(1).unwrap().get_name(), "by_email");
+    }
+
+    #[test]
+    fn build_tbl_def_pk_at_nonzero_slot() {
+        // SQL layer may put the PRIMARY at any slot — verify the
+        // index_type assignment follows primary_key_index, not slot 0.
+        let t = build_tbl_def_from_schema(
+            "db.t",
+            &["by_email".to_string(), "PRIMARY".to_string()],
+            Some(1),
+            &[100, 101],
+            1,
+        )
+        .expect("build");
+        assert_eq!(t.key(0).unwrap().index_type, IndexType::Secondary);
+        assert_eq!(t.key(1).unwrap().index_type, IndexType::Primary);
+    }
+
+    #[test]
+    fn build_tbl_def_hidden_pk_with_secondaries() {
+        // Table with secondary keys but no user-declared PRIMARY —
+        // hidden PK lands at the end.
+        let t = build_tbl_def_from_schema(
+            "db.t",
+            &["by_email".to_string(), "by_name".to_string()],
+            None,
+            &[100, 101, 102],
+            1,
+        )
+        .expect("build");
+        assert_eq!(t.key_count(), 3);
+        assert_eq!(t.key(0).unwrap().index_type, IndexType::Secondary);
+        assert_eq!(t.key(1).unwrap().index_type, IndexType::Secondary);
+        let hpk = t.key(2).unwrap();
+        assert_eq!(hpk.index_type, IndexType::HiddenPrimary);
+        assert_eq!(hpk.get_index_number(), 102);
+    }
+
+    #[test]
+    fn build_tbl_def_rejects_wrong_index_id_count() {
+        // One key, no PK → needs 1 + 1 (hidden) = 2 index_ids, got 1.
+        let err = match build_tbl_def_from_schema(
+            "db.t",
+            &["by_email".to_string()],
+            None,
+            &[100],
+            1,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("index_ids"));
+    }
+
+    #[test]
+    fn build_tbl_def_rejects_pk_index_out_of_range() {
+        let err = match build_tbl_def_from_schema(
+            "db.t",
+            &["PRIMARY".to_string()],
+            Some(5),
+            &[100],
+            1,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("primary_key_index"));
+    }
+
+    #[test]
+    fn build_tbl_def_rejects_malformed_name() {
+        let err = match build_tbl_def_from_schema(
+            "no_dot_at_all",
+            &[],
+            None,
+            &[100],
+            1,
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+    }
 }

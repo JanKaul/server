@@ -100,6 +100,14 @@ struct TableRef {
   TABLE *ptr;
 };
 
+/* Wrapper around MariaDB `KEY *` (one entry of `TABLE_SHARE::key_info`).
+   Returned to Rust via `table_key_at` for CREATE TABLE schema
+   introspection. Same lifetime rule as FieldRef: valid only for the
+   duration of the cxx callback that handed it to Rust. */
+struct KeyInfoRef {
+  KEY *ptr;
+};
+
 /* --------------------------------------------------------------- */
 /*  Field accessors — primitive return, const FieldRef             */
 /* --------------------------------------------------------------- */
@@ -277,6 +285,49 @@ inline ::rust::Slice<const uint8_t> table_record_buf(const TableRef &t) {
   return ::rust::Slice<const uint8_t>(
       t.ptr->record[0],
       t.ptr->s->stored_rec_length);
+}
+
+/* --------------------------------------------------------------- */
+/*  Schema introspection (used by CREATE TABLE)                    */
+/* --------------------------------------------------------------- */
+
+/* Number of declared keys (TABLE_SHARE::keys).  */
+inline uint32_t table_key_count(const TableRef &t) {
+  return static_cast<uint32_t>(t.ptr->s->keys);
+}
+
+/* True iff the table has a user-declared PRIMARY KEY. False means
+   the SQL layer didn't supply one and the engine should synthesise
+   a hidden PK on CREATE. Matches the C++ check
+   `table->s->primary_key != MAX_KEY`. */
+inline bool table_has_primary_key(const TableRef &t) {
+  return t.ptr->s->primary_key != MAX_KEY;
+}
+
+/* Index into the `key_info[]` array of the PRIMARY KEY. Only valid
+   when `table_has_primary_key` returned true — the C++ side
+   returns whatever the underlying field holds when there's no PK,
+   and the Rust caller must not consult it in that case. */
+inline uint32_t table_primary_key_index(const TableRef &t) {
+  return static_cast<uint32_t>(t.ptr->s->primary_key);
+}
+
+/* Borrow the `i`-th `KEY` entry from `TABLE_SHARE::key_info`. Same
+   thread-local-scratch pattern as `table_field_at` — the returned
+   `&KeyInfoRef` is valid only for the duration of the cxx
+   callback that handed it back to Rust. Caller must not retain. */
+inline const KeyInfoRef &table_key_at(const TableRef &t,
+                                      uint32_t key_index) {
+  thread_local KeyInfoRef scratch{nullptr};
+  scratch.ptr = &t.ptr->s->key_info[key_index];
+  return scratch;
+}
+
+/* Key name (`KEY::name`). Allocates a fresh `rust::String` copy —
+   CREATE TABLE is a one-shot path so the per-key allocation is
+   fine. */
+inline ::rust::String key_name(const KeyInfoRef &k) {
+  return ::rust::String(k.ptr->name.str, k.ptr->name.length);
 }
 
 }  /* namespace slatedb */

@@ -28,6 +28,10 @@
 #include "sql_class.h"
 #include "log.h"
 #include "slatedb_bridge/bridge.h"
+/* For the slatedb::TableRef struct definition — the cxx-generated
+   bridge_field.h only forward-declares it (opaque on the Rust
+   side); we need the full struct to construct one from `TABLE *`. */
+#include "slatedb_field_callbacks.h"
 
 static handlerton *slatedb_hton;
 
@@ -258,13 +262,19 @@ int ha_slatedb::external_lock(THD *thd, int lock_type)
   DBUG_RETURN(slatedb_status_to_ha_err(rc));
 }
 
-int ha_slatedb::create(const char *, TABLE *, HA_CREATE_INFO *)
+int ha_slatedb::create(const char *name, TABLE *form, HA_CREATE_INFO *)
 {
   DBUG_ENTER("ha_slatedb::create");
-  /* CREATE TABLE no-op for Stage 0 — the catalogue is populated by
-     a future slice once the C++ schema description can be threaded
-     into TblDef::new + DdlManager::put_and_write. */
-  DBUG_RETURN(0);
+  /* Build a TableRef around `form` and hand off to Rust. The cxx
+     bridge reads the schema (key_count / primary_key_index /
+     key_at / key_name) via the schema-introspection callbacks
+     defined in slatedb_field_callbacks.h, allocates index_ids
+     from the DdlManager's SeqGenerator, builds a TblDef with
+     skeleton KeyDefs, and writes it to the system-CF catalogue
+     via DdlManager::put_and_write. */
+  slatedb::TableRef tref{form};
+  int32_t rc= slatedb::slatedb_create_table(rust::String(name), tref);
+  DBUG_RETURN(slatedb_status_to_ha_err(rc));
 }
 
 THR_LOCK_DATA **ha_slatedb::store_lock(THD *thd, THR_LOCK_DATA **to,
