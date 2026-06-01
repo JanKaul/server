@@ -243,6 +243,25 @@ pub mod ffi {
         /// unique-check pre-read, no auto-incr field bump from the
         /// row, no TTL prefix, no debug checksum suffix.
         fn slatedb_write_row(thd_id: u64, name: String, table: &TableRef) -> i32;
+
+        /// DELETE row entry — called by `ha_slatedb::delete_row`
+        /// for explicit-PK tables. Builds the PK row key from
+        /// `table` (live row in `record[0]`) and issues a
+        /// `delete` on the per-THD transaction.
+        ///
+        /// `name` is the already-canonical `db.tbl[#P#part]`
+        /// catalogue key. `thd_id` must already have a registered
+        /// txn (`external_lock(F_WRLCK)` runs first).
+        ///
+        /// Stage 0 limitation: **explicit-PK tables only**.
+        /// Hidden-PK delete needs the captured rowid from the
+        /// prior scan/read (MyRocks's `m_last_rowkey`), which
+        /// isn't plumbed yet. Calling this against a hidden-PK
+        /// table returns `ENGINE_IO_FAILED`. No SK deletes, no
+        /// pre-read for foreign-key checks, no read-free-rpl
+        /// optimisation — Stage 0 ports the minimum that makes
+        /// `DELETE FROM t WHERE pk = ?` correct.
+        fn slatedb_delete_row(thd_id: u64, name: String, table: &TableRef) -> i32;
     }
 }
 
@@ -644,6 +663,80 @@ fn slatedb_write_row(thd_id: u64, name: String, table: &ffi::TableRef) -> i32 {
     let _ = engine;
 
     match put_result {
+        Ok(_) => status::OK,
+        Err(_) => status::ENGINE_IO_FAILED,
+    }
+}
+
+/// Cxx `extern "Rust"` entry — called by the C++ shim's
+/// `ha_slatedb::delete_row`. Builds the PK row key from the live
+/// MariaDB row (via `pack_record_via_table`) and issues a
+/// `delete` on the per-THD transaction.
+///
+/// `name` is the canonical `db.tbl[#P#part]` catalogue key;
+/// `thd_id` must already have a registered txn.
+///
+/// ## Flow
+///
+/// 1. Resolve `TblDef` by name. Fail with `NO_SUCH_TABLE` if not
+///    present.
+/// 2. Pick the PK `KeyDef`. **Explicit PK required in Stage 0** —
+///    hidden-PK delete needs the captured rowid from the prior
+///    scan (MyRocks's `m_last_rowkey`), which isn't plumbed.
+///    Returns `ENGINE_IO_FAILED` for hidden-PK tables.
+/// 3. Pack the PK from `record[0]` via [`pack_record_via_table`].
+/// 4. Take the per-THD txn, call `delete(pk_key)`, put it back.
+///
+/// Symmetric with [`slatedb_write_row`] — same lookup chain, same
+/// take/reinsert dance against [`crate::engine::txn_registry::TxnRegistry`].
+/// No value-blob handling (delete only needs the key).
+///
+/// Returns: `OK` on success; `NO_ENGINE` pre-init; `NO_SUCH_TABLE`
+/// if catalogue lookup fails; `ENGINE_IO_FAILED` for hidden-PK
+/// tables (not yet supported) or any codec/txn error.
+#[cfg(feature = "field_callbacks")]
+fn slatedb_delete_row(thd_id: u64, name: String, table: &ffi::TableRef) -> i32 {
+    use crate::bridge::status;
+    use crate::codec::key::IndexType;
+    use crate::handler::status as handler_status;
+
+    // ----- engine + catalogue lookup -----
+    let Some(ddl) = crate::bridge::current_ddl() else {
+        return handler_status::NO_ENGINE;
+    };
+    let Some(registry) = crate::bridge::current_txn_registry() else {
+        return handler_status::NO_ENGINE;
+    };
+    let Some(tdef) = ddl.find(&name) else {
+        return handler_status::NO_SUCH_TABLE;
+    };
+    let Some(pk_kd) = find_pk_keydef(&tdef) else {
+        return status::ENGINE_IO_FAILED;
+    };
+
+    // Hidden-PK delete needs the captured rowid from m_last_rowkey
+    // — deferred per the function-level docs.
+    if pk_kd.index_type == IndexType::HiddenPrimary {
+        return status::ENGINE_IO_FAILED;
+    }
+
+    // ----- PK row key -----
+    let mut pk_buf: Vec<u8> =
+        vec![0u8; pk_kd.max_storage_fmt_length() as usize];
+    let written = match pack_record_via_table(&pk_kd, table, None, &mut pk_buf) {
+        Ok(n) => n,
+        Err(_) => return status::ENGINE_IO_FAILED,
+    };
+    pk_buf.truncate(written);
+
+    // ----- txn delete -----
+    let Some(mut txn) = registry.take(thd_id) else {
+        return handler_status::NO_ENGINE;
+    };
+    let delete_result = txn.delete(&pk_buf);
+    registry.reinsert(thd_id, txn);
+
+    match delete_result {
         Ok(_) => status::OK,
         Err(_) => status::ENGINE_IO_FAILED,
     }

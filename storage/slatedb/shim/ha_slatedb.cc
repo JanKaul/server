@@ -303,6 +303,29 @@ int ha_slatedb::write_row(const uchar *)
   DBUG_RETURN(slatedb_status_to_ha_err(rc));
 }
 
+int ha_slatedb::delete_row(const uchar *)
+{
+  DBUG_ENTER("ha_slatedb::delete_row");
+  /* Symmetric with write_row: `buf` is unused — Rust reads the
+     PK columns out of `record[0]` via the cxx Field callbacks.
+     The per-THD txn must already exist (external_lock(F_WRLCK)
+     ran first).
+
+     Stage 0 limitation: hidden-PK tables aren't supported here —
+     the Rust side returns ENGINE_IO_FAILED for them. Hidden-PK
+     delete needs `m_last_rowkey` captured during the prior scan,
+     which isn't plumbed yet. */
+  THD *const thd= table->in_use;
+  const std::string full_name=
+      std::string(table->s->db.str, table->s->db.length) + "." +
+      std::string(table->s->table_name.str, table->s->table_name.length);
+  slatedb::TableRef tref{table};
+  int32_t rc= slatedb::slatedb_delete_row(thd_get_thread_id(thd),
+                                          rust::String(full_name),
+                                          tref);
+  DBUG_RETURN(slatedb_status_to_ha_err(rc));
+}
+
 THR_LOCK_DATA **ha_slatedb::store_lock(THD *thd, THR_LOCK_DATA **to,
                                        enum thr_lock_type lock_type)
 {
