@@ -14,17 +14,28 @@
   along with this program; if not, write to the Free Software
   Foundation, Inc., 51 Franklin St, Fifth Floor, Boston, MA 02110-1335 USA */
 
-/* Stage 0 checkpoint 1: bare-minimum ha_slatedb skeleton — plugin loads
-   and SHOW ENGINES lists SLATEDB. No storage, no Rust, no cxx yet. */
+/* Stage 0 checkpoint 2: ha_slatedb dispatches lifecycle / lock /
+   extra methods through the cxx Rust bridge. Each ha_slatedb owns a
+   `rust::Box<slatedb::HaSlateDb>` whose drop runs when the handler
+   is destroyed. Per the cxx contract, memory ownership stays on the
+   side that allocated — the Rust crate built the HaSlateDb instance
+   (via `slatedb::new_ha_slatedb()`) and the Box's dtor drops it
+   back into Rust. */
 
 #include "my_global.h"
 #include "thr_lock.h"
 #include "handler.h"
 #include "my_base.h"
+#include "slatedb_bridge/bridge.h"
 
 class ha_slatedb: public handler
 {
   THR_LOCK_DATA lock;
+
+  /* Per-handler Rust state — opaque on this side. Constructed via
+     `slatedb::new_ha_slatedb()` in the ctor; dropped via the Box's
+     dtor when this instance is destroyed. */
+  rust::Box<slatedb::HaSlateDb> m_rust;
 
 public:
   ha_slatedb(handlerton *hton, TABLE_SHARE *table_arg);
@@ -63,6 +74,7 @@ public:
   void position(const uchar *record) override;
 
   int info(uint) override;
+  int extra(enum ha_extra_function operation) override;
   int external_lock(THD *thd, int lock_type) override;
   int create(const char *name, TABLE *form, HA_CREATE_INFO *create_info) override;
 

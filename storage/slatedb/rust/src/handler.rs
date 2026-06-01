@@ -177,9 +177,12 @@ impl HaExtraFunction {
 }
 
 /// MariaDB's `int lock_type` parameter to `external_lock`. Values
-/// from `<sys/file.h>` (`F_RDLCK = 1`, `F_WRLCK = 2`, `F_UNLCK = 8`).
-/// Pinned here so the bridge can pass the raw int and we map to
-/// the typed enum.
+/// from `include/my_global.h` (`F_RDLCK = 1`, `F_WRLCK = 2`,
+/// `F_UNLCK = 3`). These are MariaDB's *own* `F_*LCK` constants —
+/// not the POSIX `<sys/file.h>` ones (which differ across libc:
+/// glibc has F_UNLCK=2, BSD has F_UNLCK=8). The MariaDB SQL layer
+/// always uses the my_global.h values, so the cxx bridge passes
+/// those.
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalLockType {
@@ -187,8 +190,8 @@ pub enum ExternalLockType {
     Read = 1,
     /// `F_WRLCK = 2` — table is being written.
     Write = 2,
-    /// `F_UNLCK = 8` — table is being released. Maybe-commit point.
-    Unlock = 8,
+    /// `F_UNLCK = 3` — table is being released. Maybe-commit point.
+    Unlock = 3,
 }
 
 impl ExternalLockType {
@@ -199,7 +202,7 @@ impl ExternalLockType {
         match v {
             1 => Some(Self::Read),
             2 => Some(Self::Write),
-            8 => Some(Self::Unlock),
+            3 => Some(Self::Unlock),
             _ => None,
         }
     }
@@ -1592,18 +1595,22 @@ mod tests {
     }
 
     #[test]
-    fn external_lock_type_from_i32_matches_sys_file_h() {
+    fn external_lock_type_from_i32_matches_my_global_h() {
         assert_eq!(ExternalLockType::from_i32(1), Some(ExternalLockType::Read));
         assert_eq!(
             ExternalLockType::from_i32(2),
             Some(ExternalLockType::Write),
         );
+        // F_UNLCK = 3 per MariaDB's `include/my_global.h:145`.
         assert_eq!(
-            ExternalLockType::from_i32(8),
+            ExternalLockType::from_i32(3),
             Some(ExternalLockType::Unlock),
         );
         // Unknown ints return None.
         assert_eq!(ExternalLockType::from_i32(0), None);
+        // 8 is the BSD/POSIX libc value for F_UNLCK — explicitly
+        // NOT accepted because MariaDB itself uses my_global.h's 3.
+        assert_eq!(ExternalLockType::from_i32(8), None);
         assert_eq!(ExternalLockType::from_i32(99), None);
         assert_eq!(ExternalLockType::from_i32(-1), None);
     }
