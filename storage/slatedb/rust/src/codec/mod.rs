@@ -9,5 +9,6 @@ pub mod dict;
 pub mod field_pack;
 pub mod key;
 pub mod prefix;
+pub mod row_value;
 pub mod tbl_def;
 pub mod value;
