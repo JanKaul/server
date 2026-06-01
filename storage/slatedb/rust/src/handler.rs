@@ -57,30 +57,39 @@ pub mod status {
     pub const NO_SUCH_TABLE: i32 = 12;
 }
 
-/// MariaDB's `enum thr_lock_type` from `include/thr_lock.h`. Numeric
-/// values are stable across versions — they're part of MariaDB's
-/// internal ABI.
+/// MariaDB's `enum thr_lock_type` from `include/thr_lock.h:34`.
+/// Numeric values are stable across versions — they're part of
+/// MariaDB's internal ABI.
 ///
 /// We translate this enum so [`HaSlateDb::store_lock`] can pattern-
 /// match on the values the C++ side passes us. The cxx surface
 /// marshals them as `i32` and the bridge maps to/from this enum.
+///
+/// Note: variants are ORDERED to match MariaDB's enum declaration
+/// order so the discriminants line up exactly. Range comparisons
+/// in `store_lock` (e.g. `>= WriteAllowWrite` to detect a write
+/// variant) rely on this ordering.
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThrLockType {
     Ignore = -1,
     Unlock = 0,
     ReadDefault = 1,
-    Read = 2,
-    ReadHighPriority = 3,
-    ReadNoInsert = 4,
-    ReadWithSharedLocks = 5,
-    WriteAllowWrite = 6,
-    WriteConcurrentInsert = 7,
-    WriteDelayed = 8,
-    WriteDefault = 9,
-    WriteLowPriority = 10,
-    Write = 11,
-    WriteOnly = 12,
+    /// Read with `NOWAIT`/`SKIP LOCKED` semantics.
+    ReadSkipLocked = 2,
+    Read = 3,
+    ReadWithSharedLocks = 4,
+    ReadHighPriority = 5,
+    ReadNoInsert = 6,
+    WriteAllowWrite = 7,
+    WriteConcurrentInsert = 8,
+    WriteDelayed = 9,
+    WriteDefault = 10,
+    WriteLowPriority = 11,
+    /// Write with `NOWAIT`/`SKIP LOCKED` semantics.
+    WriteSkipLocked = 12,
+    Write = 13,
+    WriteOnly = 14,
 }
 
 impl ThrLockType {
@@ -94,17 +103,19 @@ impl ThrLockType {
             -1 => Self::Ignore,
             0 => Self::Unlock,
             1 => Self::ReadDefault,
-            2 => Self::Read,
-            3 => Self::ReadHighPriority,
-            4 => Self::ReadNoInsert,
-            5 => Self::ReadWithSharedLocks,
-            6 => Self::WriteAllowWrite,
-            7 => Self::WriteConcurrentInsert,
-            8 => Self::WriteDelayed,
-            9 => Self::WriteDefault,
-            10 => Self::WriteLowPriority,
-            11 => Self::Write,
-            12 => Self::WriteOnly,
+            2 => Self::ReadSkipLocked,
+            3 => Self::Read,
+            4 => Self::ReadWithSharedLocks,
+            5 => Self::ReadHighPriority,
+            6 => Self::ReadNoInsert,
+            7 => Self::WriteAllowWrite,
+            8 => Self::WriteConcurrentInsert,
+            9 => Self::WriteDelayed,
+            10 => Self::WriteDefault,
+            11 => Self::WriteLowPriority,
+            12 => Self::WriteSkipLocked,
+            13 => Self::Write,
+            14 => Self::WriteOnly,
             _ => Self::Ignore,
         }
     }
@@ -1272,10 +1283,13 @@ mod tests {
 
     #[test]
     fn thr_lock_type_from_i32_round_trips_known_values() {
-        for v in [-1i32, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12] {
+        // Covers TL_IGNORE = -1 through TL_WRITE_ONLY = 14 per
+        // include/thr_lock.h:34 (16 distinct discriminants).
+        for v in [-1i32, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14] {
             assert_eq!(ThrLockType::from_i32(v) as i32, v);
         }
         // Unknown -> Ignore.
+        assert_eq!(ThrLockType::from_i32(15), ThrLockType::Ignore);
         assert_eq!(ThrLockType::from_i32(99), ThrLockType::Ignore);
         assert_eq!(ThrLockType::from_i32(-2), ThrLockType::Ignore);
     }
