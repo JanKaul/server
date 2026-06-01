@@ -127,19 +127,29 @@ pub mod ffi {
         /// `min(field.pack_length(), dst.len())` bytes.
         fn field_ptr_bytes(f: &FieldRef, dst: &mut [u8]);
 
-        // ----- Write column state (mutating) -----
+        // ----- Write column state (table-indexed) -----
+        //
+        // cxx requires a `&mut` argument to return `&mut T`, so
+        // we expose the mutating ops as TableRef-indexed free
+        // functions rather than methods on `Pin<&mut FieldRef>`.
+        // The lifetime gymnastics for the latter add no real
+        // safety — the underlying `Field` (owned by MariaDB) is
+        // pinned by the blocked thread regardless of how we
+        // borrow into it.
 
-        /// Copy `src` into the Field's storage. Returns the
-        /// number of bytes written. Caller is responsible for
-        /// validating `src.len()` against `pack_length()`.
-        fn field_set_value(f: Pin<&mut FieldRef>, src: &[u8]) -> u32;
+        /// Copy `src` into the `i`-th field's storage. Returns
+        /// the number of bytes written
+        /// (`min(pack_length, src.len())`). The decoder always
+        /// passes exactly `pack_length(i)` bytes so the full
+        /// source is copied.
+        fn table_field_set_value(t: &TableRef, i: u32, src: &[u8]) -> u32;
 
-        /// Mark this Field as SQL NULL. Caller must ensure the
-        /// Field is NULLABLE.
-        fn field_set_null(f: Pin<&mut FieldRef>);
+        /// Mark the `i`-th field as SQL NULL. Caller must ensure
+        /// the field is NULLABLE.
+        fn table_field_set_null(t: &TableRef, i: u32);
 
-        /// Mark this Field as NOT NULL.
-        fn field_set_notnull(f: Pin<&mut FieldRef>);
+        /// Mark the `i`-th field as NOT NULL.
+        fn table_field_set_notnull(t: &TableRef, i: u32);
 
         // ----- TABLE access -----
 
@@ -419,6 +429,75 @@ impl<'a> crate::codec::row_value::RowValueSource for TableRefRowValueSource<'a> 
         // returns), so `min(pl, pl) = pl` — no short write.
         ffi::field_ptr_bytes(field, dst);
         Ok(ffi::field_pack_length(field) as usize)
+    }
+}
+
+/// `RowValueSink` implementation backed by a live `TableRef`.
+/// Symmetric counterpart of [`TableRefRowValueSource`] — the
+/// read-path decoder writes column bytes back into MariaDB
+/// `Field`s through this sink.
+///
+/// `is_in_pk` is precomputed at construction (same shape as
+/// `TableRefRowValueSource`). `set_null` and `set_field_bytes`
+/// dispatch through `field_set_null` and `field_set_value` on a
+/// `Pin<&mut FieldRef>` obtained from `table_field_at_mut`.
+///
+/// Lifetime contract: `&TableRef` borrowed for the sink's
+/// lifetime — same no-retain rule as the rest of bridge_field.
+#[cfg(feature = "field_callbacks")]
+pub struct TableRefRowValueSink<'a> {
+    table: &'a ffi::TableRef,
+    pk_field_mask: Vec<bool>,
+}
+
+#[cfg(feature = "field_callbacks")]
+impl<'a> TableRefRowValueSink<'a> {
+    /// Build a sink from a TableRef + a precomputed PK exclusion
+    /// mask (see [`TableRefRowValueSource::pk_field_mask_for`] —
+    /// the helper is shared).
+    pub fn new(table: &'a ffi::TableRef, pk_field_mask: Vec<bool>) -> Self {
+        Self {
+            table,
+            pk_field_mask,
+        }
+    }
+}
+
+#[cfg(feature = "field_callbacks")]
+impl<'a> crate::codec::row_value::RowValueSink for TableRefRowValueSink<'a> {
+    fn is_in_pk(&self, i: u32) -> bool {
+        self.pk_field_mask
+            .get(i as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn pack_length(&self, i: u32) -> u32 {
+        let field = ffi::table_field_at(self.table, i);
+        ffi::field_pack_length(field)
+    }
+
+    fn set_null(&mut self, i: u32) {
+        ffi::table_field_set_null(self.table, i);
+    }
+
+    fn set_field_bytes(
+        &mut self,
+        i: u32,
+        src: &[u8],
+    ) -> Result<(), slatedb::Error> {
+        // Mark NOT NULL first — MariaDB's null flag lives in a
+        // separate bit from `field->ptr`'s contents. The decoder
+        // only calls set_field_bytes for non-null fields, so we
+        // always clear the null bit before writing.
+        ffi::table_field_set_notnull(self.table, i);
+        let _n = ffi::table_field_set_value(self.table, i, src);
+        // `table_field_set_value` writes
+        // `min(pack_length, src.len())` bytes — the decoder
+        // passes exactly `pack_length(i)`, so the full source is
+        // copied. No short-write check (the sink trait doesn't
+        // enforce one).
+        Ok(())
     }
 }
 

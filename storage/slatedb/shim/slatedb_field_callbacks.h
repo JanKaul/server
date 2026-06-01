@@ -223,30 +223,38 @@ inline void field_ptr_bytes(const FieldRef &f,
 }
 
 /* --------------------------------------------------------------- */
-/*  Write column state — mutating, non-const FieldRef              */
+/*  Write column state — table-indexed (no Pin<&mut FieldRef>      */
+/*  lifetime gymnastics).                                          */
+/*                                                                 */
+/*  cxx refuses to return `&mut T` from a function with no `&mut`  */
+/*  parameter, so we expose the mutating ops as TableRef-indexed   */
+/*  free functions instead. The caller passes `&TableRef` + field  */
+/*  index; the C++ shim derefs `t.ptr->field[i]` and operates on   */
+/*  the Field directly. Conceptually we're still mutating only     */
+/*  the underlying `Field` (owned by MariaDB), not the TableRef.   */
 /* --------------------------------------------------------------- */
 
-/* Copy `src` into the Field's storage. The caller is expected to
-   have validated the size against `pack_length()`. Returns the
-   number of bytes written. Used by unpack paths reconstructing a
-   row.  */
-inline uint32_t field_set_value(FieldRef &f,
-                                ::rust::Slice<const uint8_t> src) {
-  size_t n = f.ptr->pack_length();
+/* Copy `src` into the `i`-th field's storage. Returns the bytes
+   written (`min(pack_length(), src.size())`). Used by unpack paths
+   reconstructing a row. */
+inline uint32_t table_field_set_value(const TableRef &t, uint32_t i,
+                                      ::rust::Slice<const uint8_t> src) {
+  Field *const f = t.ptr->field[i];
+  size_t n = f->pack_length();
   if (n > src.size()) n = src.size();
-  memcpy(f.ptr->ptr, src.data(), n);
+  memcpy(f->ptr, src.data(), n);
   return static_cast<uint32_t>(n);
 }
 
-/* Mark this Field as SQL NULL. Caller is responsible for ensuring
-   the Field is NULLABLE (the C++ asserts internally). */
-inline void field_set_null(FieldRef &f) {
-  f.ptr->set_null();
+/* Mark the `i`-th field as SQL NULL. Caller is responsible for
+   ensuring the field is NULLABLE (the C++ asserts internally). */
+inline void table_field_set_null(const TableRef &t, uint32_t i) {
+  t.ptr->field[i]->set_null();
 }
 
-/* Mark this Field as NOT NULL.  */
-inline void field_set_notnull(FieldRef &f) {
-  f.ptr->set_notnull();
+/* Mark the `i`-th field as NOT NULL. */
+inline void table_field_set_notnull(const TableRef &t, uint32_t i) {
+  t.ptr->field[i]->set_notnull();
 }
 
 /* --------------------------------------------------------------- */
@@ -274,6 +282,7 @@ inline const FieldRef &table_field_at(const TableRef &t,
   scratch.ptr = t.ptr->field[field_index];
   return scratch;
 }
+
 
 /* Borrow the in-progress row buffer (`record[0]`). The returned
    pointer is valid for the duration of the current handler call.
