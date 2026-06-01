@@ -158,12 +158,17 @@ pub mod ffi {
         /// Length is `table->s->stored_rec_length`.
         fn table_record_buf(t: &TableRef) -> &[u8];
 
-        // ----- Schema introspection (CREATE TABLE) -----
+        // ----- Schema introspection (CREATE TABLE / value blob) -----
 
         /// Opaque wrapper around MariaDB's `KEY *` (one entry of
         /// `TABLE_SHARE::key_info`). Same lifetime contract as
         /// [`FieldRef`] / [`TableRef`].
         type KeyInfoRef;
+
+        /// Number of declared columns (`TABLE_SHARE::fields`).
+        /// The value-blob encoder uses this to bound its
+        /// field-iteration loop.
+        fn table_field_count(t: &TableRef) -> u32;
 
         /// Number of declared keys (`TABLE_SHARE::keys`).
         fn table_key_count(t: &TableRef) -> u32;
@@ -208,6 +213,26 @@ pub mod ffi {
         /// index identity (cf_id + index_id + name + type) for
         /// catalogue lookup to work.
         fn slatedb_create_table(name: String, table: &TableRef) -> i32;
+
+        /// INSERT row entry — called by `ha_slatedb::write_row`
+        /// after `ha_external_lock(F_WRLCK)` has created the per-THD
+        /// transaction. Builds the PK row key + value blob from
+        /// `table` (live row in `record[0]`) and puts them via the
+        /// per-THD transaction.
+        ///
+        /// `name` is the already-canonical `db.tbl[#P#part]`
+        /// catalogue key — the C++ shim builds it from
+        /// `TABLE_SHARE::db` + `TABLE_SHARE::table_name` (path
+        /// normalisation isn't needed because we don't get a path
+        /// from MariaDB at write_row time).
+        /// `thd_id` is `thd_get_thread_id(thd)`. The thd must
+        /// already have a registered txn — `external_lock(F_WRLCK)`
+        /// is the responsibility of the SQL layer to call first.
+        ///
+        /// Stage 0: writes only the PK row, no secondary keys, no
+        /// unique-check pre-read, no auto-incr field bump from the
+        /// row, no TTL prefix, no debug checksum suffix.
+        fn slatedb_write_row(thd_id: u64, name: String, table: &TableRef) -> i32;
     }
 }
 
@@ -329,30 +354,37 @@ pub struct TableRefRowValueSource<'a> {
 
 #[cfg(feature = "field_callbacks")]
 impl<'a> TableRefRowValueSource<'a> {
-    /// Build a source from a TableRef + the table's PK key def
-    /// + the total field count. Precomputes the PK exclusion mask
-    /// so `is_in_pk(i)` is O(1) per lookup.
+    /// Build a source from a TableRef + a precomputed PK
+    /// exclusion mask. The mask is a `Vec<bool>` of length
+    /// `field_count` where `mask[i] = true` iff field `i` is a
+    /// PK keypart (and thus skipped in the value blob).
     ///
-    /// `field_count` is typically `ffi::table_field_count(table)`
-    /// (when that callback lands) — taken as a parameter for now
-    /// because the schema-introspection surface didn't expose it
-    /// yet and tighter coupling here doesn't add value.
-    pub fn new(
-        table: &'a ffi::TableRef,
-        pk_def: &crate::codec::key::KeyDef,
-        field_count: u32,
-    ) -> Self {
-        let mut pk_field_mask = vec![false; field_count as usize];
-        for fpi in &pk_def.pack_info {
-            let idx = fpi.field_index() as usize;
-            if idx < pk_field_mask.len() {
-                pk_field_mask[idx] = true;
-            }
-        }
+    /// Build the mask via [`Self::pk_field_mask_for`].
+    /// Splitting this two-step lets the caller reuse the same
+    /// mask for the null-bitmap layout computation (which also
+    /// needs `is_in_pk`) without borrowing the source.
+    pub fn new(table: &'a ffi::TableRef, pk_field_mask: Vec<bool>) -> Self {
         Self {
             table,
             pk_field_mask,
         }
+    }
+
+    /// Build the per-field PK exclusion mask. `mask[i] = true`
+    /// iff field `i` (by its `TABLE_SHARE::field[]` index) is a
+    /// keypart of `pk_def`.
+    pub fn pk_field_mask_for(
+        pk_def: &crate::codec::key::KeyDef,
+        field_count: u32,
+    ) -> Vec<bool> {
+        let mut mask = vec![false; field_count as usize];
+        for fpi in &pk_def.pack_info {
+            let idx = fpi.field_index() as usize;
+            if idx < mask.len() {
+                mask[idx] = true;
+            }
+        }
+        mask
     }
 }
 
@@ -387,6 +419,154 @@ impl<'a> crate::codec::row_value::RowValueSource for TableRefRowValueSource<'a> 
         // returns), so `min(pl, pl) = pl` — no short write.
         ffi::field_ptr_bytes(field, dst);
         Ok(ffi::field_pack_length(field) as usize)
+    }
+}
+
+/// Find the primary-key `KeyDef` in a `TblDef`. Returns the
+/// last key slot (which is the hidden PK on hidden-PK tables, or
+/// the only Primary on explicit-PK tables — search by index_type).
+///
+/// Used by [`slatedb_write_row`] / future read-path entries that
+/// need the PK for row-key encoding / value-blob PK exclusion.
+#[cfg(feature = "field_callbacks")]
+fn find_pk_keydef(
+    tdef: &crate::codec::tbl_def::TblDef,
+) -> Option<std::sync::Arc<crate::codec::key::KeyDef>> {
+    use crate::codec::key::IndexType;
+    tdef.key_descrs()
+        .iter()
+        .find(|kd| {
+            matches!(kd.index_type, IndexType::Primary | IndexType::HiddenPrimary)
+        })
+        .cloned()
+}
+
+/// Cxx `extern "Rust"` entry — called by the C++ shim's
+/// `ha_slatedb::write_row`. Builds the PK row key + value blob
+/// from the live MariaDB row (accessed via `table`) and issues a
+/// `put` on the per-THD transaction.
+///
+/// `name` is MariaDB's on-disk path form (`./db/tbl[#P#part]`);
+/// `thd_id` is `thd_get_thread_id(thd)`. The thd's txn must
+/// already exist — `ha_slatedb::external_lock(F_WRLCK)` creates
+/// it before MariaDB issues the write.
+///
+/// ## Flow
+///
+/// 1. Resolve `TblDef` by name (DdlManager lookup). Fail with
+///    `NO_SUCH_TABLE` if not in the catalogue.
+/// 2. Pick the PK `KeyDef`.
+/// 3. Build PK row key:
+///    - Hidden-PK: allocate a fresh rowid via
+///      `TblDef::fetch_add_hidden_pk_val(1)`, encode
+///      `u32_be(index_number) || u64_be(rowid)`.
+///    - Explicit-PK: call [`pack_record_via_table`] to walk the
+///      keyparts and emit memcmp bytes via `field_sort_string`.
+/// 4. Build value blob: precompute the null-bitmap layout via
+///    [`crate::codec::row_value::compute_value_null_bitmap_layout`],
+///    construct a [`TableRefRowValueSource`], call
+///    [`crate::codec::row_value::encode_row_value`].
+/// 5. Look up the per-THD txn in [`crate::engine::txn_registry::TxnRegistry`],
+///    call `put(pk_key, value_blob)`.
+///
+/// Stage 0 limitations: no SK writes (only PK row), no
+/// unique-check pre-read, no auto-incr field bump from the row
+/// value, no TTL prefix, no debug checksum.
+///
+/// Returns: `OK` on success; `NO_ENGINE` pre-init; `NO_SUCH_TABLE`
+/// if the catalogue lookup fails; `ENGINE_IO_FAILED` on any
+/// codec or txn error.
+#[cfg(feature = "field_callbacks")]
+fn slatedb_write_row(thd_id: u64, name: String, table: &ffi::TableRef) -> i32 {
+    use crate::bridge::status;
+    use crate::codec::key::{IndexType, INDEX_NUMBER_SIZE};
+    use crate::codec::row_value::{
+        compute_value_null_bitmap_layout, encode_row_value,
+    };
+    use crate::handler::status as handler_status;
+
+    // ----- engine + catalogue lookup -----
+    let Some(ddl) = crate::bridge::current_ddl() else {
+        return handler_status::NO_ENGINE;
+    };
+    let Some(engine) = crate::bridge::current_engine() else {
+        return handler_status::NO_ENGINE;
+    };
+    let Some(registry) = crate::bridge::current_txn_registry() else {
+        return handler_status::NO_ENGINE;
+    };
+    let Some(tdef) = ddl.find(&name) else {
+        return handler_status::NO_SUCH_TABLE;
+    };
+    let Some(pk_kd) = find_pk_keydef(&tdef) else {
+        // A table with no PK keydef at all is a corruption — every
+        // table either has an explicit PK or a synthetic hidden PK.
+        return status::ENGINE_IO_FAILED;
+    };
+
+    // ----- PK row key -----
+    let is_hidden_pk = pk_kd.index_type == IndexType::HiddenPrimary;
+    let mut pk_buf: Vec<u8> = Vec::new();
+
+    if is_hidden_pk {
+        let rowid = tdef.fetch_add_hidden_pk_val(1);
+        pk_buf.resize(INDEX_NUMBER_SIZE + crate::globals::SIZEOF_HIDDEN_PK_COLUMN, 0);
+        let mut written = 0usize;
+        pk_kd.get_infimum_key(&mut pk_buf, &mut written);
+        match pk_kd.build_hidden_pk_id_buf(rowid, &mut pk_buf[written..]) {
+            Ok(_) => {}
+            Err(_) => return status::ENGINE_IO_FAILED,
+        }
+    } else {
+        // Pre-allocate enough room for the largest possible PK
+        // encoding (max_storage_fmt_length / `maxlength`). The
+        // orchestrator returns the actual bytes written.
+        pk_buf.resize(pk_kd.max_storage_fmt_length() as usize, 0);
+        let written = match pack_record_via_table(&pk_kd, table, None, &mut pk_buf) {
+            Ok(n) => n,
+            Err(_) => return status::ENGINE_IO_FAILED,
+        };
+        pk_buf.truncate(written);
+    }
+
+    // ----- value blob -----
+    let field_count = ffi::table_field_count(table);
+    let pk_field_mask =
+        TableRefRowValueSource::pk_field_mask_for(&pk_kd, field_count);
+    let layout = {
+        // Shared borrow of pk_field_mask for the layout closure.
+        // Ends at the closing brace; pk_field_mask is then moved
+        // into the source below.
+        let mask = &pk_field_mask;
+        compute_value_null_bitmap_layout(
+            field_count,
+            |i| ffi::field_real_maybe_null(ffi::table_field_at(table, i)),
+            |i| mask.get(i as usize).copied().unwrap_or(false),
+        )
+    };
+    let mut source = TableRefRowValueSource::new(table, pk_field_mask);
+
+    let mut value_buf: Vec<u8> = Vec::new();
+    if encode_row_value(&layout, field_count, &mut source, &mut value_buf).is_err()
+    {
+        return status::ENGINE_IO_FAILED;
+    }
+
+    // ----- txn put -----
+    let Some(mut txn) = registry.take(thd_id) else {
+        // No txn for this THD — external_lock must run first.
+        return handler_status::NO_ENGINE;
+    };
+    let put_result = txn.put(&pk_buf, &value_buf);
+    registry.reinsert(thd_id, txn);
+    // engine borrow is unused — we go through the registry's txn,
+    // not the raw db handle. Keep the lookup so this fails fast
+    // when init/shutdown is mid-flight.
+    let _ = engine;
+
+    match put_result {
+        Ok(_) => status::OK,
+        Err(_) => status::ENGINE_IO_FAILED,
     }
 }
 

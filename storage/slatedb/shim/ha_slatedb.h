@@ -77,6 +77,7 @@ public:
   int extra(enum ha_extra_function operation) override;
   int external_lock(THD *thd, int lock_type) override;
   int create(const char *name, TABLE *form, HA_CREATE_INFO *create_info) override;
+  int write_row(const uchar *buf) override;
 
   THR_LOCK_DATA **store_lock(THD *thd, THR_LOCK_DATA **to,
                              enum thr_lock_type lock_type) override;

@@ -291,6 +291,12 @@ inline ::rust::Slice<const uint8_t> table_record_buf(const TableRef &t) {
 /*  Schema introspection (used by CREATE TABLE)                    */
 /* --------------------------------------------------------------- */
 
+/* Number of declared columns (TABLE_SHARE::fields). The value-blob
+   encoder uses this to bound its field-iteration loop. */
+inline uint32_t table_field_count(const TableRef &t) {
+  return static_cast<uint32_t>(t.ptr->s->fields);
+}
+
 /* Number of declared keys (TABLE_SHARE::keys).  */
 inline uint32_t table_key_count(const TableRef &t) {
   return static_cast<uint32_t>(t.ptr->s->keys);

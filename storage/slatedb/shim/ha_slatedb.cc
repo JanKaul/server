@@ -277,6 +277,32 @@ int ha_slatedb::create(const char *name, TABLE *form, HA_CREATE_INFO *)
   DBUG_RETURN(slatedb_status_to_ha_err(rc));
 }
 
+int ha_slatedb::write_row(const uchar *)
+{
+  DBUG_ENTER("ha_slatedb::write_row");
+  /* `buf` is unused — Rust accesses the column bytes via the
+     cxx Field callbacks (`field_ptr_bytes`), which read from
+     `field->ptr` (= record[0]) directly.
+
+     The per-THD txn must already exist; MariaDB's SQL layer
+     calls `external_lock(F_WRLCK)` before `write_row`, and our
+     external_lock impl uses TxnRegistry::get_or_create to set
+     it up.
+
+     Build the fully-qualified table name from this handler's
+     bound TABLE_SHARE (`db.table_name`) — the Rust side
+     normalises and looks up the TblDef. */
+  THD *const thd= table->in_use;
+  const std::string full_name=
+      std::string(table->s->db.str, table->s->db.length) + "." +
+      std::string(table->s->table_name.str, table->s->table_name.length);
+  slatedb::TableRef tref{table};
+  int32_t rc= slatedb::slatedb_write_row(thd_get_thread_id(thd),
+                                         rust::String(full_name),
+                                         tref);
+  DBUG_RETURN(slatedb_status_to_ha_err(rc));
+}
+
 THR_LOCK_DATA **ha_slatedb::store_lock(THD *thd, THR_LOCK_DATA **to,
                                        enum thr_lock_type lock_type)
 {
