@@ -17,7 +17,10 @@
 
 use object_store::ObjectStore;
 use slatedb::filter_policy::{BloomFilterPolicy, FilterPolicy};
-use slatedb::{CompactionFilterSupplier, CompactorBuilder, Db, DbBuilder, MergeOperator};
+use slatedb::{
+    CompactionFilterSupplier, CompactorBuilder, Db, DbBuilder, DbIterator,
+    MergeOperator,
+};
 use slatedb::Error;
 use std::sync::Arc;
 
@@ -101,6 +104,25 @@ impl EngineDb {
     pub async fn close(&self) -> Result<(), Error> {
         self.db.close().await
     }
+
+    /// Open a prefix-bounded iterator on the live engine view.
+    /// Returns rows whose keys start with `prefix` (inclusive
+    /// lower bound, exclusive on the lexicographic successor of
+    /// `prefix`).
+    ///
+    /// Used by the read path (`rnd_init` / `index_read`) to
+    /// iterate a single index's rows — pass the index's prefix
+    /// (`varint(cf_id) || u32_be(index_number)`) from
+    /// [`crate::codec::key::KeyDef::get_infimum_key`].
+    ///
+    /// Stage 0: reads the live engine view, NOT the per-txn
+    /// snapshot. SSI consistency between rnd_next reads and the
+    /// current transaction will land when the iterator is keyed
+    /// off the active `EngineTxn`'s snapshot. Documented at the
+    /// caller (`HaSlateDb::rnd_init`).
+    pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<DbIterator, Error> {
+        self.db.scan_prefix(prefix).await
+    }
 }
 
 #[cfg(test)]
@@ -150,6 +172,54 @@ mod tests {
             .expect("open");
         // The Arc we hold is the same one the builder consumed (refcount > 1).
         assert!(Arc::strong_count(engine.extractor()) >= 2);
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn scan_prefix_returns_rows_under_prefix_in_order() {
+        let engine = EngineDb::open_in_memory("test_scan_prefix")
+            .await
+            .expect("open");
+
+        // Two index families under different (cf_id, index_id)
+        // prefixes; only the second's rows should come back from
+        // a scan_prefix on it.
+        let cf_a_prefix = crate::codec::prefix::build_key_prefix(7, 100);
+        let cf_b_prefix = crate::codec::prefix::build_key_prefix(7, 200);
+
+        // Seed in mixed order to verify the iterator returns sorted.
+        for (suffix, val) in [
+            (&[0x02u8][..], b"two".as_slice()),
+            (&[0x00u8][..], b"zero".as_slice()),
+            (&[0x01u8][..], b"one".as_slice()),
+        ] {
+            let mut k = cf_b_prefix.to_vec();
+            k.extend_from_slice(suffix);
+            engine.db().put(&k, val).await.expect("put");
+        }
+        // Decoy under a DIFFERENT prefix — must NOT come back.
+        {
+            let mut k = cf_a_prefix.to_vec();
+            k.extend_from_slice(&[0x99u8]);
+            engine.db().put(&k, b"decoy").await.expect("put");
+        }
+
+        let mut it =
+            engine.scan_prefix(&cf_b_prefix).await.expect("scan");
+        // Rows come back in sorted-suffix order.
+        let mut collected: Vec<Bytes> = Vec::new();
+        while let Some(kv) = it.next().await.expect("next") {
+            collected.push(kv.value);
+        }
+        assert_eq!(
+            collected,
+            vec![
+                Bytes::from_static(b"zero"),
+                Bytes::from_static(b"one"),
+                Bytes::from_static(b"two"),
+            ],
+        );
+
         engine.close().await.expect("close");
     }
 }
