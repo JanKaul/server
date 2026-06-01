@@ -302,6 +302,94 @@ pub fn pack_record_via_table(
     key_def.pack_record(&mut packer, hidden_pk_id, dst)
 }
 
+/// `RowValueSource` implementation backed by a live `TableRef`.
+///
+/// The cxx-side counterpart of [`crate::codec::row_value::RowValueSource`]
+/// — supplies the per-field info that
+/// [`crate::codec::row_value::encode_row_value`] consumes when
+/// the encoder runs against an actual MariaDB row.
+///
+/// `is_in_pk` is precomputed at construction from the PK `KeyDef`'s
+/// `pack_info[].field_index` values (populated by `KeyDef::setup`).
+/// `is_null` / `pack_length` / `write_field_bytes` all dispatch
+/// through the cxx callbacks (`field_is_real_null`,
+/// `field_pack_length`, `field_ptr_bytes`).
+///
+/// Lifetime contract: the `&TableRef` is borrowed for the source's
+/// lifetime — same retention rule as everywhere else in this
+/// module (must not outlive the cxx callback that handed it back
+/// to Rust).
+#[cfg(feature = "field_callbacks")]
+pub struct TableRefRowValueSource<'a> {
+    table: &'a ffi::TableRef,
+    /// Per-field mask: `pk_field_mask[i] = true` iff field `i` is
+    /// a PK keypart and must be skipped in the value blob.
+    pk_field_mask: Vec<bool>,
+}
+
+#[cfg(feature = "field_callbacks")]
+impl<'a> TableRefRowValueSource<'a> {
+    /// Build a source from a TableRef + the table's PK key def
+    /// + the total field count. Precomputes the PK exclusion mask
+    /// so `is_in_pk(i)` is O(1) per lookup.
+    ///
+    /// `field_count` is typically `ffi::table_field_count(table)`
+    /// (when that callback lands) — taken as a parameter for now
+    /// because the schema-introspection surface didn't expose it
+    /// yet and tighter coupling here doesn't add value.
+    pub fn new(
+        table: &'a ffi::TableRef,
+        pk_def: &crate::codec::key::KeyDef,
+        field_count: u32,
+    ) -> Self {
+        let mut pk_field_mask = vec![false; field_count as usize];
+        for fpi in &pk_def.pack_info {
+            let idx = fpi.field_index() as usize;
+            if idx < pk_field_mask.len() {
+                pk_field_mask[idx] = true;
+            }
+        }
+        Self {
+            table,
+            pk_field_mask,
+        }
+    }
+}
+
+#[cfg(feature = "field_callbacks")]
+impl<'a> crate::codec::row_value::RowValueSource for TableRefRowValueSource<'a> {
+    fn is_in_pk(&self, i: u32) -> bool {
+        self.pk_field_mask
+            .get(i as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn is_null(&self, i: u32) -> bool {
+        let field = ffi::table_field_at(self.table, i);
+        ffi::field_is_real_null(field)
+    }
+
+    fn pack_length(&self, i: u32) -> u32 {
+        let field = ffi::table_field_at(self.table, i);
+        ffi::field_pack_length(field)
+    }
+
+    fn write_field_bytes(
+        &mut self,
+        i: u32,
+        dst: &mut [u8],
+    ) -> Result<usize, slatedb::Error> {
+        let field = ffi::table_field_at(self.table, i);
+        // `field_ptr_bytes` writes `min(pack_length, dst.len())`
+        // bytes. The encoder pre-sizes `dst` to exactly
+        // `pack_length(i)` (which is the same value the cxx side
+        // returns), so `min(pl, pl) = pl` — no short write.
+        ffi::field_ptr_bytes(field, dst);
+        Ok(ffi::field_pack_length(field) as usize)
+    }
+}
+
 /// Build a [`crate::codec::tbl_def::TblDef`] from primitive
 /// schema inputs the C++ shim extracted from `TABLE *form` at
 /// CREATE TABLE time.
