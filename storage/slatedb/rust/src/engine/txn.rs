@@ -13,7 +13,7 @@
 //! relevant interface stubs.
 
 use bytes::Bytes;
-use slatedb::{DbTransaction, Error, IsolationLevel};
+use slatedb::{DbIterator, DbTransaction, Error, IsolationLevel};
 
 use crate::engine::db::EngineDb;
 
@@ -50,6 +50,25 @@ impl EngineTxn {
 
     pub fn delete(&mut self, key: &[u8]) -> Result<(), Error> {
         self.inner.delete(key)
+    }
+
+    /// Open a prefix-bounded iterator scoped to this transaction's
+    /// snapshot. The returned `DbIterator` reads the keyspace as
+    /// of the txn's begin sequence — so two `scan_prefix` calls on
+    /// the same txn see the same data, and a `scan_prefix` here
+    /// is SSI-consistent with this txn's `get` / `put` /
+    /// `delete` ops at commit time.
+    ///
+    /// Counterpart of [`crate::engine::db::EngineDb::scan_prefix`]
+    /// (live-engine view, no txn snapshot). The read path
+    /// (`rnd_init` / `index_read`) should prefer this one when an
+    /// active transaction exists.
+    ///
+    /// `prefix` is typically the index prefix produced by
+    /// [`crate::codec::key::KeyDef::get_infimum_key`]
+    /// (`varint(cf_id) || u32_be(index_number)`).
+    pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<DbIterator, Error> {
+        self.inner.scan_prefix(prefix).await
     }
 
     /// Commit. Returns the SSI conflict as `slatedb::Error` with
@@ -183,6 +202,113 @@ mod tests {
         t.release_savepoint("sp1").expect("release is no-op");
 
         t.rollback();
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn txn_scan_prefix_sees_committed_data_under_prefix() {
+        let engine = EngineDb::open_in_memory("txn_scan_basic")
+            .await
+            .expect("open");
+
+        let prefix = crate::codec::prefix::build_key_prefix(7, 100);
+
+        // Seed three rows under the prefix.
+        let mut seed = engine.begin_default().await.expect("begin seed");
+        for suffix in [&[0u8][..], &[1u8][..], &[2u8][..]] {
+            let mut k = prefix.to_vec();
+            k.extend_from_slice(suffix);
+            seed.put(&k, &[42u8]).expect("put");
+        }
+        seed.commit().await.expect("commit seed");
+
+        // Open a reader txn and scan.
+        let reader = engine.begin_default().await.expect("begin reader");
+        let mut it = reader.scan_prefix(&prefix).await.expect("scan");
+        let mut count = 0;
+        while let Some(_kv) = it.next().await.expect("next") {
+            count += 1;
+        }
+        assert_eq!(count, 3);
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn txn_scan_prefix_does_not_see_writes_committed_after_begin() {
+        // SSI snapshot semantics: a scan via a txn sees data as of
+        // its begin sequence, NOT writes committed after.
+        let engine = EngineDb::open_in_memory("txn_scan_snapshot")
+            .await
+            .expect("open");
+
+        let prefix = crate::codec::prefix::build_key_prefix(7, 100);
+
+        // Seed one row.
+        let mut seed = engine.begin_default().await.expect("seed");
+        {
+            let mut k = prefix.to_vec();
+            k.push(0x01);
+            seed.put(&k, &[42u8]).expect("put");
+        }
+        seed.commit().await.expect("commit seed");
+
+        // Reader begins (snapshot pinned here).
+        let reader = engine.begin_default().await.expect("reader");
+
+        // Writer commits ANOTHER row under the same prefix AFTER the
+        // reader's snapshot.
+        let mut writer = engine.begin_default().await.expect("writer");
+        {
+            let mut k = prefix.to_vec();
+            k.push(0x02);
+            writer.put(&k, &[43u8]).expect("put");
+        }
+        writer.commit().await.expect("commit writer");
+
+        // Reader still sees only the seed row.
+        let mut it = reader.scan_prefix(&prefix).await.expect("scan");
+        let mut count = 0;
+        while let Some(_kv) = it.next().await.expect("next") {
+            count += 1;
+        }
+        assert_eq!(count, 1, "txn scan must not see post-begin writes");
+
+        engine.close().await.expect("close");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn txn_scan_prefix_excludes_other_index_prefixes() {
+        // Sibling indexes' rows don't bleed into a scan of THIS
+        // index's prefix.
+        let engine = EngineDb::open_in_memory("txn_scan_isolation")
+            .await
+            .expect("open");
+
+        let want_prefix = crate::codec::prefix::build_key_prefix(7, 100);
+        let other_prefix = crate::codec::prefix::build_key_prefix(7, 200);
+
+        let mut seed = engine.begin_default().await.expect("begin");
+        for (pfx, suffixes) in
+            [(&want_prefix[..], &[&[0u8][..]][..]), (&other_prefix[..], &[&[0u8][..], &[1u8][..]][..])]
+        {
+            for s in suffixes {
+                let mut k = pfx.to_vec();
+                k.extend_from_slice(s);
+                seed.put(&k, &[]).expect("put");
+            }
+        }
+        seed.commit().await.expect("commit");
+
+        let reader = engine.begin_default().await.expect("reader");
+        let mut it = reader.scan_prefix(&want_prefix).await.expect("scan");
+        let mut count = 0;
+        while let Some(_kv) = it.next().await.expect("next") {
+            count += 1;
+        }
+        // Only the single row under want_prefix.
+        assert_eq!(count, 1);
+
         engine.close().await.expect("close");
     }
 

@@ -105,21 +105,19 @@ impl EngineDb {
         self.db.close().await
     }
 
-    /// Open a prefix-bounded iterator on the live engine view.
+    /// Open a prefix-bounded iterator on the **live engine view**.
     /// Returns rows whose keys start with `prefix` (inclusive
     /// lower bound, exclusive on the lexicographic successor of
     /// `prefix`).
     ///
-    /// Used by the read path (`rnd_init` / `index_read`) to
-    /// iterate a single index's rows — pass the index's prefix
-    /// (`varint(cf_id) || u32_be(index_number)`) from
-    /// [`crate::codec::key::KeyDef::get_infimum_key`].
-    ///
-    /// Stage 0: reads the live engine view, NOT the per-txn
-    /// snapshot. SSI consistency between rnd_next reads and the
-    /// current transaction will land when the iterator is keyed
-    /// off the active `EngineTxn`'s snapshot. Documented at the
-    /// caller (`HaSlateDb::rnd_init`).
+    /// **Read-path callers should prefer
+    /// [`crate::engine::txn::EngineTxn::scan_prefix`]** when an
+    /// active transaction exists — that one is bound to the
+    /// txn's snapshot and is SSI-consistent with its `get` /
+    /// `put` / `delete` ops at commit time. This live-view
+    /// variant is for callers that genuinely want
+    /// see-everything-committed semantics (catalogue scans,
+    /// compaction-filter introspection, etc.).
     pub async fn scan_prefix(&self, prefix: &[u8]) -> Result<DbIterator, Error> {
         self.db.scan_prefix(prefix).await
     }
