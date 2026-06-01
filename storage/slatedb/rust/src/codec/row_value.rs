@@ -122,6 +122,118 @@ pub fn is_null_bit_set(
     (byte & pos.bit_mask) != 0
 }
 
+/// Source of per-field info the value-blob encoder needs. The cxx
+/// wrapper implements this against a live `TableRef`; tests
+/// implement it with mock data.
+///
+/// Methods take `field_idx` referring to the slot in the table's
+/// field declaration order — same indexing as the
+/// [`ValueNullBitmapLayout::field_positions`] vec.
+pub trait RowValueSource {
+    /// True iff this field is a PK keypart and must NOT appear in
+    /// the value blob (PK fields live in the row key and are
+    /// reconstructed from there on read).
+    fn is_in_pk(&self, field_idx: u32) -> bool;
+
+    /// True iff this field currently holds SQL NULL.
+    fn is_null(&self, field_idx: u32) -> bool;
+
+    /// Number of bytes this field contributes when non-null
+    /// (MariaDB `Field::pack_length()`).
+    fn pack_length(&self, field_idx: u32) -> u32;
+
+    /// Write `pack_length(field_idx)` bytes for this non-null
+    /// field into the front of `dst`. Returns the actual count
+    /// written — must equal `pack_length(field_idx)`; the encoder
+    /// rejects a mismatch as corruption.
+    fn write_field_bytes(
+        &mut self,
+        field_idx: u32,
+        dst: &mut [u8],
+    ) -> Result<usize, slatedb::Error>;
+}
+
+/// Encode a row's value blob into `dst` from the row's column
+/// data. Counterpart of MyRocks' `Rdb_converter::encode_value_slice`
+/// at `rdb_converter.cc:688`.
+///
+/// Wire format (Stage 0):
+/// ```text
+/// [ null bitmap: layout.bitmap_bytes bytes ]
+/// [ per-non-PK-field bytes... ]
+/// ```
+/// `layout` must have been computed by [`compute_value_null_bitmap_layout`]
+/// for this table's schema; `field_count` is the total number of
+/// declared fields (matching `layout.field_positions.len()`).
+///
+/// Iteration is in field declaration order. For each field:
+/// - If `source.is_in_pk(i)`: skipped (PK fields aren't in the
+///   value blob).
+/// - Else if `source.is_null(i)`: the null bit is set in the
+///   bitmap; no bytes are appended.
+/// - Else: `source.pack_length(i)` bytes are appended (via
+///   `source.write_field_bytes`).
+///
+/// Returns the number of bytes appended to `dst`.
+///
+/// ## Stage 0 omissions (each documented at the deferral site
+/// in MyRocks)
+///
+/// - TTL prefix bytes — written before the null bitmap when the
+///   table has `ttl_duration > 0` (`rdb_converter.cc:704`).
+/// - unpack_info block from the PK pack's side channel — appended
+///   between the bitmap and the field bytes
+///   (`rdb_converter.cc:759`).
+/// - Debug checksum suffix — appended after the field bytes when
+///   `store_row_debug_checksums` is on.
+///
+/// All three land alongside their producers (TTL plumbing,
+/// pack_record unpack_info writer, checksum sysvar).
+///
+/// ## Errors
+///
+/// - `Invalid` if `source.write_field_bytes` returns a byte count
+///   different from `pack_length(field_idx)` (encoder-side
+///   sanity check on the source contract).
+/// - Whatever `source.write_field_bytes` returns.
+pub fn encode_row_value(
+    layout: &ValueNullBitmapLayout,
+    field_count: u32,
+    source: &mut dyn RowValueSource,
+    dst: &mut Vec<u8>,
+) -> Result<usize, slatedb::Error> {
+    let start = dst.len();
+    let bitmap_start = start;
+
+    // Reserve the leading null-bitmap region (zeroed). Later
+    // `set_null_bit` writes land here as we discover NULL fields.
+    dst.resize(start + layout.bitmap_bytes as usize, 0);
+
+    for i in 0..field_count {
+        if source.is_in_pk(i) {
+            continue;
+        }
+        if source.is_null(i) {
+            let bm_end = bitmap_start + layout.bitmap_bytes as usize;
+            set_null_bit(&mut dst[bitmap_start..bm_end], layout, i);
+            continue;
+        }
+        let n = source.pack_length(i) as usize;
+        let write_start = dst.len();
+        dst.resize(write_start + n, 0);
+        let written =
+            source.write_field_bytes(i, &mut dst[write_start..write_start + n])?;
+        if written != n {
+            return Err(slatedb::Error::invalid(format!(
+                "encode_row_value: field {i} source wrote {written} bytes, \
+                 expected pack_length {n}",
+            )));
+        }
+    }
+
+    Ok(dst.len() - start)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +387,237 @@ mod tests {
         for i in 0..8 {
             assert!(!is_null_bit_set(&bitmap, &layout, i));
         }
+    }
+
+    // ----- encode_row_value -----
+
+    /// Test fixture: pre-canned per-field state, mock pack_length,
+    /// pre-canned field bytes. Implements `RowValueSource`.
+    struct MockSource {
+        is_in_pk: Vec<bool>,
+        is_null: Vec<bool>,
+        pack_length: Vec<u32>,
+        // For each field, the bytes the source writes when asked.
+        // Length must match pack_length[i].
+        bytes: Vec<Vec<u8>>,
+        // Counts of write_field_bytes calls per field index.
+        calls: Vec<usize>,
+        // Optional error to return on a specific field's write.
+        error_on_field: Option<u32>,
+        // Optional "wrong byte count" mode for the wrong-length test.
+        short_write_on_field: Option<u32>,
+    }
+
+    impl RowValueSource for MockSource {
+        fn is_in_pk(&self, i: u32) -> bool {
+            self.is_in_pk[i as usize]
+        }
+        fn is_null(&self, i: u32) -> bool {
+            self.is_null[i as usize]
+        }
+        fn pack_length(&self, i: u32) -> u32 {
+            self.pack_length[i as usize]
+        }
+        fn write_field_bytes(
+            &mut self,
+            i: u32,
+            dst: &mut [u8],
+        ) -> Result<usize, slatedb::Error> {
+            self.calls[i as usize] += 1;
+            if Some(i) == self.error_on_field {
+                return Err(slatedb::Error::invalid(
+                    "MockSource: synthetic field write error".into(),
+                ));
+            }
+            let src = &self.bytes[i as usize];
+            if Some(i) == self.short_write_on_field {
+                // Write one fewer byte than pack_length expects.
+                let n = src.len().saturating_sub(1);
+                dst[..n].copy_from_slice(&src[..n]);
+                return Ok(n);
+            }
+            dst[..src.len()].copy_from_slice(src);
+            Ok(src.len())
+        }
+    }
+
+    fn mock(n: usize) -> MockSource {
+        MockSource {
+            is_in_pk: vec![false; n],
+            is_null: vec![false; n],
+            pack_length: vec![1; n],
+            bytes: (0..n).map(|i| vec![i as u8]).collect(),
+            calls: vec![0; n],
+            error_on_field: None,
+            short_write_on_field: None,
+        }
+    }
+
+    #[test]
+    fn encode_row_value_emits_only_bitmap_when_no_non_pk_fields() {
+        let layout =
+            compute_value_null_bitmap_layout(0, |_| false, |_| false);
+        let mut src = mock(0);
+        let mut dst = Vec::new();
+        let n = encode_row_value(&layout, 0, &mut src, &mut dst).expect("enc");
+        assert_eq!(n, 0);
+        assert_eq!(dst, vec![] as Vec<u8>);
+    }
+
+    #[test]
+    fn encode_row_value_single_non_nullable_field_appends_only_bytes() {
+        // 1 field, non-nullable, not-in-PK, pack_length=2 bytes.
+        let layout =
+            compute_value_null_bitmap_layout(1, |_| false, |_| false);
+        let mut src = mock(1);
+        src.pack_length = vec![2];
+        src.bytes = vec![vec![0xAA, 0xBB]];
+
+        let mut dst = Vec::new();
+        let n = encode_row_value(&layout, 1, &mut src, &mut dst).expect("enc");
+        // No bitmap bytes (no nullable field), 2 field bytes.
+        assert_eq!(n, 2);
+        assert_eq!(dst, vec![0xAA, 0xBB]);
+        assert_eq!(src.calls, vec![1]);
+    }
+
+    #[test]
+    fn encode_row_value_nullable_non_null_field_emits_bitmap_plus_bytes() {
+        // 1 field, nullable, not-in-PK, pack_length=2, currently not-null.
+        let layout =
+            compute_value_null_bitmap_layout(1, |_| true, |_| false);
+        let mut src = mock(1);
+        src.pack_length = vec![2];
+        src.bytes = vec![vec![0xCC, 0xDD]];
+
+        let mut dst = Vec::new();
+        let n = encode_row_value(&layout, 1, &mut src, &mut dst).expect("enc");
+        // 1 bitmap byte (zeroed — field is not-null), 2 field bytes.
+        assert_eq!(n, 3);
+        assert_eq!(dst, vec![0x00, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn encode_row_value_nullable_null_field_sets_bit_appends_nothing() {
+        // 1 field, nullable, currently NULL.
+        let layout =
+            compute_value_null_bitmap_layout(1, |_| true, |_| false);
+        let mut src = mock(1);
+        src.is_null = vec![true];
+        src.pack_length = vec![4];
+        src.bytes = vec![vec![0xDE, 0xAD, 0xBE, 0xEF]];
+
+        let mut dst = Vec::new();
+        let n = encode_row_value(&layout, 1, &mut src, &mut dst).expect("enc");
+        // 1 bitmap byte with bit 0 set, no field bytes.
+        assert_eq!(n, 1);
+        assert_eq!(dst, vec![0x01]);
+        // write_field_bytes NOT called for NULL fields.
+        assert_eq!(src.calls, vec![0]);
+    }
+
+    #[test]
+    fn encode_row_value_skips_pk_fields() {
+        // 3 fields: 0=PK (i64-ish, 8 bytes), 1=value (4 bytes,
+        // nullable, not-null), 2=PK (4 bytes). Only field 1
+        // should land in the value blob.
+        let layout = compute_value_null_bitmap_layout(
+            3,
+            |i| i == 1, // only field 1 is nullable
+            |i| i == 0 || i == 2,
+        );
+        let mut src = mock(3);
+        src.is_in_pk = vec![true, false, true];
+        src.pack_length = vec![8, 4, 4];
+        src.bytes = vec![
+            vec![0; 8],
+            vec![0x11, 0x22, 0x33, 0x44],
+            vec![0; 4],
+        ];
+
+        let mut dst = Vec::new();
+        let n = encode_row_value(&layout, 3, &mut src, &mut dst).expect("enc");
+        // 1 bitmap byte (field 1 is nullable, not-null → bit 0 clear),
+        // 4 bytes for field 1, nothing for PK fields.
+        assert_eq!(n, 5);
+        assert_eq!(dst, vec![0x00, 0x11, 0x22, 0x33, 0x44]);
+        // write_field_bytes called only for field 1.
+        assert_eq!(src.calls, vec![0, 1, 0]);
+    }
+
+    #[test]
+    fn encode_row_value_multiple_fields_emits_in_declaration_order() {
+        // 3 non-PK fields, mix of nullable and not. Field 1 is
+        // NULL, others not-null.
+        let layout = compute_value_null_bitmap_layout(
+            3,
+            |i| i == 1 || i == 2, // fields 1, 2 nullable
+            |_| false,
+        );
+        let mut src = mock(3);
+        src.pack_length = vec![1, 2, 3];
+        src.bytes = vec![vec![0xAA], vec![0xBB, 0xCC], vec![0xDD, 0xEE, 0xFF]];
+        src.is_null = vec![false, true, false];
+
+        let mut dst = Vec::new();
+        let n = encode_row_value(&layout, 3, &mut src, &mut dst).expect("enc");
+        // 1 bitmap byte (field 1 NULL → bit 0; field 2 not-null →
+        // bit 1 clear). Bitmap = 0b00000001 = 0x01.
+        // Field 0 bytes (1), field 1 bytes (skipped — NULL),
+        // field 2 bytes (3). Total = 1 + 1 + 3 = 5.
+        assert_eq!(n, 5);
+        assert_eq!(dst, vec![0x01, 0xAA, 0xDD, 0xEE, 0xFF]);
+        assert_eq!(src.calls, vec![1, 0, 1]);
+    }
+
+    #[test]
+    fn encode_row_value_appends_to_existing_dst_content() {
+        // Encoder writes after whatever's already in `dst`.
+        let layout =
+            compute_value_null_bitmap_layout(1, |_| false, |_| false);
+        let mut src = mock(1);
+        src.pack_length = vec![1];
+        src.bytes = vec![vec![0xFE]];
+
+        let mut dst: Vec<u8> = vec![0xCA, 0xFE];
+        let n = encode_row_value(&layout, 1, &mut src, &mut dst).expect("enc");
+        assert_eq!(n, 1);
+        assert_eq!(dst, vec![0xCA, 0xFE, 0xFE]);
+    }
+
+    #[test]
+    fn encode_row_value_propagates_source_error() {
+        let layout =
+            compute_value_null_bitmap_layout(2, |_| false, |_| false);
+        let mut src = mock(2);
+        src.pack_length = vec![1, 1];
+        src.error_on_field = Some(1);
+
+        let mut dst = Vec::new();
+        let err = match encode_row_value(&layout, 2, &mut src, &mut dst) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
+        assert!(err.to_string().contains("synthetic field write error"));
+    }
+
+    #[test]
+    fn encode_row_value_rejects_short_field_write() {
+        // Source claims pack_length=4 but only writes 3 bytes —
+        // encoder catches the mismatch.
+        let layout =
+            compute_value_null_bitmap_layout(1, |_| false, |_| false);
+        let mut src = mock(1);
+        src.pack_length = vec![4];
+        src.bytes = vec![vec![1, 2, 3, 4]];
+        src.short_write_on_field = Some(0);
+
+        let mut dst = Vec::new();
+        let err = match encode_row_value(&layout, 1, &mut src, &mut dst) {
+            Err(e) => e,
+            Ok(_) => panic!("expected error"),
+        };
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("expected pack_length"));
     }
 }
