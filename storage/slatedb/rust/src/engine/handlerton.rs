@@ -34,14 +34,9 @@
 //! - `prepare` / `commit_by_xid` / `rollback_by_xid` / `recover` — XA
 //!   two-phase commit. Needs system-CF marker schema + WAL flush
 //!   hook; bigger bear.
-//! - `start_tx_and_assign_read_view` — `START TRANSACTION WITH
-//!   CONSISTENT SNAPSHOT`. SlateDB captures the snapshot at
-//!   `DbTransaction::begin` (not on first read), so the semantics
-//!   collapse to plain `get_or_create`. Deferred until we have test
-//!   coverage that distinguishes the two cases.
-
 use slatedb::Error;
 
+use crate::engine::db::EngineDb;
 use crate::engine::txn_registry::TxnRegistry;
 
 /// MariaDB `commit` callback. `commit_tx=true` → full transaction
@@ -95,6 +90,32 @@ pub fn rollback(
     }
     registry.rollback(thd_id);
     Ok(())
+}
+
+/// MariaDB `start_consistent_snapshot` callback —
+/// `START TRANSACTION WITH CONSISTENT SNAPSHOT`. Pre-acquires the
+/// transaction (and therefore the read snapshot) at statement
+/// start instead of at first read.
+///
+/// On the MyRocks side this is a `get_or_create_tx + tx->set_params
+/// + tx->acquire_snapshot(true)` sequence
+/// (`ha_rocksdb.cc:rocksdb_start_tx_and_assign_read_view`). In our
+/// world the SlateDB default isolation (`SerializableSnapshot`)
+/// captures the snapshot at `DbTransaction::begin`, so by the time
+/// [`TxnRegistry::get_or_create`] returns the txn already has its
+/// read view pinned — no separate "acquire later" step is needed.
+///
+/// If a txn already exists for `thd_id` this is a no-op (matching
+/// the C++'s "if snapshot already set, do nothing" guard).
+///
+/// Errors propagate from the SlateDB `begin` call — typically
+/// `ErrorKind::Unavailable` if the WAL is currently unwritable.
+pub async fn start_tx_and_assign_read_view(
+    registry: &TxnRegistry,
+    thd_id: u64,
+    db: &EngineDb,
+) -> Result<(), Error> {
+    registry.get_or_create(thd_id, db).await
 }
 
 /// MariaDB `close_connection` callback — invoked when the client
@@ -233,6 +254,53 @@ mod tests {
         let reg = TxnRegistry::new();
         rollback(&reg, 42, true).expect("noop rollback");
         assert!(!reg.has(42));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_tx_and_assign_read_view_creates_txn() {
+        let db = EngineDb::open_in_memory("handlerton_start_tx_create")
+            .await
+            .expect("open");
+        let reg = TxnRegistry::new();
+
+        start_tx_and_assign_read_view(&reg, 30, &db)
+            .await
+            .expect("start tx");
+        assert!(reg.has(30));
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_tx_and_assign_read_view_is_idempotent() {
+        // Matches the C++ "if snapshot already set, do nothing" guard.
+        let db = EngineDb::open_in_memory("handlerton_start_tx_idem")
+            .await
+            .expect("open");
+        let reg = TxnRegistry::new();
+
+        start_tx_and_assign_read_view(&reg, 31, &db)
+            .await
+            .expect("start tx 1");
+        start_tx_and_assign_read_view(&reg, 31, &db)
+            .await
+            .expect("start tx 2 — idempotent");
+        assert_eq!(reg.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_tx_and_assign_read_view_then_commit_drains() {
+        // End-to-end shape: START TRANSACTION WITH CONSISTENT SNAPSHOT
+        // → ... → COMMIT.
+        let db = EngineDb::open_in_memory("handlerton_start_tx_commit")
+            .await
+            .expect("open");
+        let reg = TxnRegistry::new();
+
+        start_tx_and_assign_read_view(&reg, 32, &db)
+            .await
+            .expect("start tx");
+        commit(&reg, 32, true).await.expect("commit");
+        assert!(!reg.has(32));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

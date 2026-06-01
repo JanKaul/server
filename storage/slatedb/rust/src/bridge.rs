@@ -162,6 +162,14 @@ mod ffi {
         /// no savepoint support per Q10).
         fn slatedb_handlerton_commit(thd_id: u64, commit_tx: bool) -> i32;
 
+        /// MariaDB `start_consistent_snapshot` callback —
+        /// `START TRANSACTION WITH CONSISTENT SNAPSHOT`. Pre-acquires
+        /// the per-THD txn so the read view is pinned at statement
+        /// start instead of first read. SlateDB's SerializableSnapshot
+        /// default captures the snapshot at `begin`, so this is a
+        /// thin wrapper around `get_or_create_tx`.
+        fn slatedb_handlerton_start_consistent_snapshot(thd_id: u64) -> i32;
+
         /// MariaDB `rollback` callback. `rollback_tx=true` → full
         /// rollback; `false` → statement rollback (no-op in Stage 0).
         fn slatedb_handlerton_rollback(thd_id: u64, rollback_tx: bool) -> i32;
@@ -469,6 +477,24 @@ pub(crate) fn slatedb_handlerton_commit(thd_id: u64, commit_tx: bool) -> i32 {
     handlerton_result_to_status(r)
 }
 
+pub(crate) fn slatedb_handlerton_start_consistent_snapshot(thd_id: u64) -> i32 {
+    let Some(registry) = current_txn_registry() else {
+        return crate::handler::status::NO_ENGINE;
+    };
+    let Some(db) = current_engine() else {
+        return crate::handler::status::NO_ENGINE;
+    };
+    let Some(runtime) = crate::runtime::get() else {
+        return status::RUNTIME_INIT_FAILED;
+    };
+    let r = runtime.block_on(
+        crate::engine::handlerton::start_tx_and_assign_read_view(
+            &registry, thd_id, &db,
+        ),
+    );
+    handlerton_result_to_status(r)
+}
+
 pub(crate) fn slatedb_handlerton_rollback(thd_id: u64, rollback_tx: bool) -> i32 {
     let Some(registry) = current_txn_registry() else {
         return crate::handler::status::NO_ENGINE;
@@ -640,6 +666,37 @@ mod tests {
         assert!(!reg.has(7));
 
         assert_eq!(slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn handlerton_start_consistent_snapshot_creates_txn() {
+        let _g = SERIALISE.lock();
+        let _ = slatedb_shutdown();
+        assert_eq!(
+            slatedb_init_in_memory("handlerton_start_snapshot_bridge".into()),
+            status::OK,
+        );
+
+        let reg = current_txn_registry().expect("registry");
+        assert!(!reg.has(50));
+
+        assert_eq!(
+            slatedb_handlerton_start_consistent_snapshot(50),
+            status::OK,
+        );
+        assert!(reg.has(50));
+
+        assert_eq!(slatedb_shutdown(), status::OK);
+    }
+
+    #[test]
+    fn handlerton_start_consistent_snapshot_without_engine_returns_no_engine() {
+        let _g = SERIALISE.lock();
+        let _ = slatedb_shutdown();
+        assert_eq!(
+            slatedb_handlerton_start_consistent_snapshot(1),
+            crate::handler::status::NO_ENGINE,
+        );
     }
 
     #[test]
