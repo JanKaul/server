@@ -341,6 +341,52 @@ impl KeyDef {
         *size = INDEX_NUMBER_SIZE;
     }
 
+    /// Encode a hidden-PK rowid as 8 big-endian bytes into `dst`,
+    /// returning the byte count (always 8). Counterpart of
+    /// [`crate::handler::HaSlateDb::read_hidden_pk_id_from_rowkey`]
+    /// — together they round-trip the rowid portion of a hidden-PK
+    /// row key.
+    ///
+    /// Translated from MyRocks'
+    /// `Rdb_key_def::build_hidden_pk_id_buf`. The 4-byte
+    /// `index_number` prefix is written separately by the caller
+    /// (typically via [`Self::get_infimum_key`] into the same
+    /// buffer); MyRocks structures the call the same way.
+    ///
+    /// The C++ stores the hidden PK as `longlong` and writes
+    /// `u64_be`; we accept `i64` and cast, matching the on-wire
+    /// behaviour and the existing decoder.
+    ///
+    /// Errors:
+    /// - `Invalid` if this `KeyDef` is not a hidden PK (callers
+    ///   shouldn't reach here for explicit PKs — they'd dispatch
+    ///   through the keypart pack pipeline)
+    /// - `Invalid` if `dst` is shorter than 8 bytes
+    pub fn build_hidden_pk_id_buf(
+        &self,
+        hidden_pk_id: i64,
+        dst: &mut [u8],
+    ) -> Result<usize, slatedb::Error> {
+        if self.index_type != IndexType::HiddenPrimary {
+            return Err(slatedb::Error::invalid(format!(
+                "build_hidden_pk_id_buf: KeyDef {:?} is not a hidden PK \
+                 (index_type = {:?})",
+                self.name, self.index_type,
+            )));
+        }
+        if dst.len() < crate::globals::SIZEOF_HIDDEN_PK_COLUMN {
+            return Err(slatedb::Error::invalid(format!(
+                "build_hidden_pk_id_buf: dst too short — have {} bytes, \
+                 need {}",
+                dst.len(),
+                crate::globals::SIZEOF_HIDDEN_PK_COLUMN,
+            )));
+        }
+        let bytes = (hidden_pk_id as u64).to_be_bytes();
+        dst[..crate::globals::SIZEOF_HIDDEN_PK_COLUMN].copy_from_slice(&bytes);
+        Ok(crate::globals::SIZEOF_HIDDEN_PK_COLUMN)
+    }
+
     /// First key for "begin iterating from start of index". For
     /// reverse-CF indexes iteration starts at the physical supremum.
     /// Returns the count of leading bytes usable for bloom-filter prefix
@@ -1500,6 +1546,19 @@ mod tests {
         )
     }
 
+    fn hidden_pk(index_number: u32) -> KeyDef {
+        KeyDef::new_skeleton(
+            index_number,
+            7,
+            0,
+            INDEX_INFO_VERSION_LATEST as u16,
+            IndexType::HiddenPrimary,
+            PRIMARY_FORMAT_VERSION_LATEST,
+            false,
+            "HIDDEN_PK_NAME",
+        )
+    }
+
     #[test]
     fn skeleton_round_trips_identity_fields() {
         let kd = forward_pk(42);
@@ -1531,6 +1590,69 @@ mod tests {
         kd.get_supremum_key(&mut buf, &mut n);
         assert_eq!(n, 4);
         assert_eq!(&buf[..4], &[0x01, 0x02, 0x03, 0x05]);
+    }
+
+    #[test]
+    fn build_hidden_pk_id_buf_writes_big_endian_u64() {
+        let kd = hidden_pk(42);
+        let mut buf = [0u8; 16];
+        let n = kd.build_hidden_pk_id_buf(0x0102_0304_0506_0708, &mut buf).expect("write");
+        assert_eq!(n, 8);
+        assert_eq!(
+            &buf[..8],
+            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+        );
+        // Bytes past the encoded width are untouched.
+        assert_eq!(&buf[8..], &[0u8; 8]);
+    }
+
+    #[test]
+    fn build_hidden_pk_id_buf_round_trips_with_decoder() {
+        use crate::handler::HaSlateDb;
+        let kd = hidden_pk(0xDEAD_BEEF);
+        // Allocate a full row key: 4-byte index prefix + 8-byte rowid.
+        let mut rowkey = [0u8; INDEX_NUMBER_SIZE + 8];
+        let mut n = 0;
+        kd.get_infimum_key(&mut rowkey, &mut n);
+        assert_eq!(n, INDEX_NUMBER_SIZE);
+        let appended =
+            kd.build_hidden_pk_id_buf(0x1234_5678, &mut rowkey[n..]).expect("build");
+        assert_eq!(appended, 8);
+
+        let decoded = HaSlateDb::read_hidden_pk_id_from_rowkey(&rowkey).expect("decode");
+        assert_eq!(decoded, 0x1234_5678);
+    }
+
+    #[test]
+    fn build_hidden_pk_id_buf_round_trips_negative_value_unchanged() {
+        // The C++ stores hidden_pk as `longlong`; negative values
+        // round-trip via the `i64 as u64 as i64` cast pair.
+        use crate::handler::HaSlateDb;
+        let kd = hidden_pk(7);
+        let mut rowkey = [0u8; INDEX_NUMBER_SIZE + 8];
+        let mut n = 0;
+        kd.get_infimum_key(&mut rowkey, &mut n);
+        kd.build_hidden_pk_id_buf(-1, &mut rowkey[n..]).expect("build");
+        let decoded = HaSlateDb::read_hidden_pk_id_from_rowkey(&rowkey).expect("decode");
+        assert_eq!(decoded, -1);
+    }
+
+    #[test]
+    fn build_hidden_pk_id_buf_rejects_non_hidden_pk() {
+        let kd = forward_pk(7); // IndexType::Primary, not HiddenPrimary
+        let mut buf = [0u8; 8];
+        let err = kd.build_hidden_pk_id_buf(1, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("not a hidden PK"));
+    }
+
+    #[test]
+    fn build_hidden_pk_id_buf_rejects_short_dst() {
+        let kd = hidden_pk(7);
+        let mut buf = [0u8; 4]; // half the required width
+        let err = kd.build_hidden_pk_id_buf(1, &mut buf).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("dst too short"));
     }
 
     #[test]
