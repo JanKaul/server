@@ -35,10 +35,22 @@
 //!
 //! ## Status
 //!
-//! **Slice 1**: pure surface — no Rust callers yet. The
-//! declarations land alongside the C++ shim so slice 2
-//! (`pack_with_sort_string` — first real Rust caller) can wire
-//! straight through without further bridge changes.
+//! **Slice 1**: bridge surface (Rust `extern "C++"` + C++ shim).
+//! **Slice 2**: first Rust caller — [`pack_with_sort_string`].
+//! Wraps [`ffi::field_sort_string`] with size validation and a
+//! `Result` return. This is the Rust counterpart of MyRocks'
+//! `Rdb_key_def::pack_with_make_sort_key` (`rdb_datadic.cc:1489`)
+//! — the universal "encode a field's value in memcmp form via
+//! `field->sort_string`" pack routine.
+//!
+//! The function is not yet installed in [`FieldPacking::pack_func`].
+//! That slot's current signature (`fn(&mut FieldPacking, &mut
+//! FieldView, ...)`) was modelled before the cxx bridge existed
+//! and uses a Rust-side metadata POD rather than a live
+//! `&FieldRef`. Redesigning the slot's signature to accept
+//! `&FieldRef` (and threading that through every call site) is a
+//! separate slice that lands alongside the rest of the codec
+//! pack pipeline (`KeyDef::pack_record`).
 
 #[cfg(feature = "field_callbacks")]
 #[cxx::bridge(namespace = "slatedb")]
@@ -146,4 +158,61 @@ pub mod ffi {
         /// Length is `table->s->stored_rec_length`.
         fn table_record_buf(t: &TableRef) -> &[u8];
     }
+}
+
+/// Pack one keypart's value into `dst` in memcmp (sort) form via
+/// the C++ `field->sort_string` callback. Counterpart of MyRocks'
+/// `Rdb_key_def::pack_with_make_sort_key` at `rdb_datadic.cc:1489`
+/// — the universal pack routine for fixed-width key parts (every
+/// integer, date, float family in MyRocks installs this as the
+/// `pack_func` slot).
+///
+/// Writes exactly `fpi.max_image_len` bytes into the front of
+/// `dst` and returns that byte count so the caller can advance
+/// its write cursor.
+///
+/// ## Errors
+///
+/// - `Invalid` if `fpi.max_image_len < 0` (corruption — the
+///   metadata wasn't initialised by [`FieldPacking::setup`])
+/// - `Invalid` if `dst.len() < max_image_len` (the caller didn't
+///   reserve enough output space)
+///
+/// ## Lifetime
+///
+/// `field` is borrowed from MariaDB and valid only for the
+/// duration of this call. See the module doc for the retention
+/// rule.
+#[cfg(feature = "field_callbacks")]
+pub fn pack_with_sort_string(
+    fpi: &crate::codec::field_pack::FieldPacking,
+    field: &ffi::FieldRef,
+    dst: &mut [u8],
+) -> Result<usize, slatedb::Error> {
+    if fpi.max_image_len < 0 {
+        return Err(slatedb::Error::invalid(format!(
+            "pack_with_sort_string: invalid max_image_len {} \
+             (FieldPacking::setup must have run first)",
+            fpi.max_image_len,
+        )));
+    }
+    let max_len = fpi.max_image_len as usize;
+    if dst.len() < max_len {
+        return Err(slatedb::Error::invalid(format!(
+            "pack_with_sort_string: dst too short — have {} bytes, \
+             need {} (max_image_len)",
+            dst.len(),
+            max_len,
+        )));
+    }
+    ffi::field_sort_string(field, &mut dst[..max_len], max_len as u32);
+    Ok(max_len)
+}
+
+#[cfg(all(test, not(feature = "field_callbacks")))]
+mod tests {
+    //! Without the `field_callbacks` feature there's no `FieldRef`
+    //! to construct in Rust tests, so this module is intentionally
+    //! empty when the feature is off. The function is exercised by
+    //! the C++ build (slice 3 onward).
 }
