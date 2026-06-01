@@ -160,6 +160,43 @@ pub mod ffi {
             autocommit_boundary: bool,
         ) -> i32;
 
+        // ----- table-scan read path (rnd_init / rnd_next / rnd_end) -----
+        //
+        // Gated by `field_callbacks` because `ha_rnd_next` takes
+        // `&TableRef` to decode the value blob into MariaDB row
+        // storage. `ha_rnd_init` and `ha_rnd_end` are gated for
+        // symmetry — the three live and die together.
+
+        /// Open a full-table scan on the PK keyspace, scoped to
+        /// the per-THD transaction's snapshot. Stashes the
+        /// resulting iterator on this handler. `thd_id` must
+        /// already have a registered txn (external_lock first).
+        ///
+        /// Returns `OK` on success; `NO_ENGINE` pre-init;
+        /// `BAD_TABLE_PATH` if the handler isn't open or has no
+        /// PK; `ENGINE_IO_FAILED` if the txn isn't registered or
+        /// the underlying scan_prefix fails.
+        #[cfg(feature = "field_callbacks")]
+        fn ha_rnd_init(self: &mut HaSlateDb, thd_id: u64) -> i32;
+
+        /// Advance the active scan iterator and decode the
+        /// returned row into the live MariaDB row buffer
+        /// (`table->record[0]`) via the Field/TABLE callbacks.
+        ///
+        /// Returns `OK` on a successful row decode;
+        /// `END_OF_FILE` when the scan is exhausted;
+        /// `ENGINE_IO_FAILED` for I/O / codec failures or for
+        /// explicit-PK tables (Stage 0 limit — see method docs);
+        /// `BAD_TABLE_PATH` if `rnd_init` wasn't called first.
+        #[cfg(feature = "field_callbacks")]
+        fn ha_rnd_next(self: &mut HaSlateDb, table: &TableRef) -> i32;
+
+        /// Tear down the active scan. Idempotent — calling on a
+        /// handler that hasn't run `rnd_init` is OK. Always
+        /// returns `OK`.
+        #[cfg(feature = "field_callbacks")]
+        fn ha_rnd_end(self: &mut HaSlateDb) -> i32;
+
         // ----- handlerton txn callbacks -----
         //
         // Free functions invoked by MariaDB on transaction boundaries
@@ -480,6 +517,101 @@ impl HaSlateDb {
         let result = runtime.block_on(self.external_lock(thd_id, typed, autocommit_boundary));
         crate::handler::open_result_to_status(result)
     }
+
+    /// Cxx wrapper — opens the PK-prefix scan on the per-THD txn
+    /// via the global [`TxnRegistry`] and stashes the iterator on
+    /// this handler. Delegates to the Rust-native
+    /// [`HaSlateDb::rnd_init`].
+    #[cfg(feature = "field_callbacks")]
+    fn ha_rnd_init(&mut self, thd_id: u64) -> i32 {
+        let Some(registry) = current_txn_registry() else {
+            return crate::handler::status::NO_ENGINE;
+        };
+        let runtime = match crate::runtime::get() {
+            Some(rt) => rt,
+            None => return status::RUNTIME_INIT_FAILED,
+        };
+        let result = runtime.block_on(self.rnd_init(thd_id, &registry));
+        crate::handler::open_result_to_status(result)
+    }
+
+    /// Cxx wrapper — advances the scan iterator and decodes the
+    /// row into `table`'s live row buffer (`record[0]`).
+    ///
+    /// Stage 0 limitation: **hidden-PK tables only**. For
+    /// explicit-PK tables, we'd need to unpack the PK column
+    /// bytes back from `kv.key` into the PK Field storage —
+    /// requires the unpack-record pipeline that doesn't exist
+    /// yet (mirror of `pack_record_via_table` for the reverse
+    /// direction). Explicit-PK tables return `ENGINE_IO_FAILED`
+    /// at the guard. Hidden-PK tables work cleanly: the
+    /// synthetic rowid stays in the key (not exposed as a
+    /// column), so a value-blob decode populates every column.
+    ///
+    /// Returns: `OK` on a successful row decode; `END_OF_FILE`
+    /// when the scan is exhausted; `ENGINE_IO_FAILED` for
+    /// explicit-PK tables / I/O / codec failures;
+    /// `BAD_TABLE_PATH` if the handler isn't open or rnd_init
+    /// wasn't called.
+    #[cfg(feature = "field_callbacks")]
+    fn ha_rnd_next(&mut self, table: &ffi::TableRef) -> i32 {
+        use crate::codec::key::IndexType;
+        use crate::codec::row_value::{
+            compute_value_null_bitmap_layout, decode_row_value,
+        };
+
+        let tdef = match self.tbl_def() {
+            Some(t) => t.clone(),
+            None => return crate::handler::status::BAD_TABLE_PATH,
+        };
+        let Some(pk_kd) = find_pk_keydef(&tdef) else {
+            return status::ENGINE_IO_FAILED;
+        };
+        // Stage 0: explicit-PK rnd_next would need unpack_record
+        // (PK column reconstruction from key bytes), not yet
+        // implemented. Fail explicitly rather than silently
+        // leave PK columns uninitialised.
+        if pk_kd.index_type == IndexType::Primary {
+            return status::ENGINE_IO_FAILED;
+        }
+
+        let runtime = match crate::runtime::get() {
+            Some(rt) => rt,
+            None => return status::RUNTIME_INIT_FAILED,
+        };
+        let kv = match runtime.block_on(self.rnd_next()) {
+            Ok(Some(kv)) => kv,
+            Ok(None) => return status::END_OF_FILE,
+            Err(_) => return status::ENGINE_IO_FAILED,
+        };
+
+        // Decode value blob into record[0] via the cxx
+        // Field/TABLE callbacks.
+        let field_count = ffi::table_field_count(table);
+        let pk_field_mask =
+            TableRefRowValueSource::pk_field_mask_for(&pk_kd, field_count);
+        let layout = {
+            let mask = &pk_field_mask;
+            compute_value_null_bitmap_layout(
+                field_count,
+                |i| ffi::field_real_maybe_null(ffi::table_field_at(table, i)),
+                |i| mask.get(i as usize).copied().unwrap_or(false),
+            )
+        };
+        let mut sink = TableRefRowValueSink::new(table, pk_field_mask);
+
+        match decode_row_value(&layout, field_count, &mut sink, &kv.value) {
+            Ok(_) => status::OK,
+            Err(_) => status::ENGINE_IO_FAILED,
+        }
+    }
+
+    /// Cxx wrapper — drops the active scan iterator. Delegates
+    /// to [`HaSlateDb::rnd_end`], which is infallible.
+    #[cfg(feature = "field_callbacks")]
+    fn ha_rnd_end(&mut self) -> i32 {
+        crate::handler::open_result_to_status(self.rnd_end())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -503,6 +635,11 @@ pub mod status {
     /// support (Stage 0 savepoint stubs etc.). The C++ side maps
     /// this to `HA_ERR_WRONG_COMMAND`.
     pub const NOT_SUPPORTED: i32 = 4;
+    /// `rnd_next` reached end-of-scan. The C++ side maps this to
+    /// `HA_ERR_END_OF_FILE` — MariaDB's signal that the iterator
+    /// is exhausted (not actually an error; the SQL layer treats
+    /// it as "no more rows").
+    pub const END_OF_FILE: i32 = 5;
 }
 
 // ---------------------------------------------------------------------------

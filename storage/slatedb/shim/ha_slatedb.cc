@@ -51,6 +51,9 @@ static int slatedb_status_to_ha_err(int32_t status)
   /* status::NOT_SUPPORTED == 4 — maps directly. */
   if (status == 4)
     return HA_ERR_WRONG_COMMAND;
+  /* status::END_OF_FILE == 5 — rnd_next reached scan-end. */
+  if (status == 5)
+    return HA_ERR_END_OF_FILE;
   return HA_ERR_INTERNAL_ERROR;
 }
 
@@ -204,20 +207,38 @@ int ha_slatedb::close()
 int ha_slatedb::rnd_init(bool)
 {
   DBUG_ENTER("ha_slatedb::rnd_init");
-  DBUG_RETURN(0);
+  /* The `scan` boolean (true = full-scan, false = prepared point
+     lookups via rnd_pos) is dropped: Stage 0 only supports the
+     full-scan case. The Rust side opens a PK-prefix scan on the
+     per-THD txn's snapshot and stashes the iterator. The txn
+     must already exist (external_lock(F_RDLCK|F_WRLCK) ran
+     first). */
+  THD *const thd= table->in_use;
+  int32_t rc= m_rust->ha_rnd_init(thd_get_thread_id(thd));
+  DBUG_RETURN(slatedb_status_to_ha_err(rc));
 }
 
 int ha_slatedb::rnd_end()
 {
   DBUG_ENTER("ha_slatedb::rnd_end");
-  DBUG_RETURN(0);
+  int32_t rc= m_rust->ha_rnd_end();
+  DBUG_RETURN(slatedb_status_to_ha_err(rc));
 }
 
 int ha_slatedb::rnd_next(uchar *)
 {
   DBUG_ENTER("ha_slatedb::rnd_next");
-  /* DML / read path lands in a later slice. */
-  DBUG_RETURN(HA_ERR_END_OF_FILE);
+  /* `buf` is unused — Rust writes column bytes directly into
+     `table->record[0]` via the cxx Field/TABLE callbacks
+     (table_field_set_value / _null / _notnull), which buf
+     points to by MariaDB convention.
+
+     Stage 0 limitation: hidden-PK tables only. Explicit-PK
+     tables return ENGINE_IO_FAILED at the Rust guard (needs
+     PK-column unpack pipeline, deferred). */
+  slatedb::TableRef tref{table};
+  int32_t rc= m_rust->ha_rnd_next(tref);
+  DBUG_RETURN(slatedb_status_to_ha_err(rc));
 }
 
 int ha_slatedb::rnd_pos(uchar *, uchar *)
