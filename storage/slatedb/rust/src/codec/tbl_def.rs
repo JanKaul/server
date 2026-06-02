@@ -156,6 +156,23 @@ impl TblDef {
         self.key_descrs.get(idx)
     }
 
+    /// Take ownership of the inner `Vec<Arc<KeyDef>>`, leaving an
+    /// empty list behind. Symmetric counterpart of [`Self::put_keys`].
+    ///
+    /// Useful when the caller needs `&mut KeyDef` via `Arc::get_mut`
+    /// — that requires the Arc's strong count to be 1, which only
+    /// holds while no other clone exists. Taking the Vec out lets
+    /// the caller iterate + mutate without TblDef holding a parallel
+    /// reference, then put the keys back when done.
+    pub fn take_keys(&mut self) -> Vec<Arc<KeyDef>> {
+        std::mem::take(&mut self.key_descrs)
+    }
+
+    /// Reinstall a previously-taken key list. See [`Self::take_keys`].
+    pub fn put_keys(&mut self, keys: Vec<Arc<KeyDef>>) {
+        self.key_descrs = keys;
+    }
+
     /// Locate the index that owns the auto-increment counter — the
     /// table's primary or hidden-primary key.
     ///

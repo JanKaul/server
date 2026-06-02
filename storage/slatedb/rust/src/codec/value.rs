@@ -68,6 +68,48 @@ pub enum MysqlType {
     Geometry = 255,
 }
 
+impl MysqlType {
+    /// Map a raw `enum_field_types` value (as returned by the cxx
+    /// `field_real_type` callback) to a [`MysqlType`] variant.
+    /// Returns `None` for unrecognised codes — caller decides
+    /// whether to treat that as an error or a silent skip.
+    pub fn from_u32(v: u32) -> Option<Self> {
+        Some(match v {
+            0 => Self::Decimal,
+            1 => Self::Tiny,
+            2 => Self::Short,
+            3 => Self::Long,
+            4 => Self::Float,
+            5 => Self::Double,
+            6 => Self::Null,
+            7 => Self::Timestamp,
+            8 => Self::LongLong,
+            9 => Self::Int24,
+            10 => Self::Date,
+            11 => Self::Time,
+            12 => Self::DateTime,
+            13 => Self::Year,
+            14 => Self::NewDate,
+            15 => Self::Varchar,
+            16 => Self::Bit,
+            17 => Self::Timestamp2,
+            18 => Self::DateTime2,
+            19 => Self::Time2,
+            246 => Self::NewDecimal,
+            247 => Self::Enum,
+            248 => Self::Set,
+            249 => Self::TinyBlob,
+            250 => Self::MediumBlob,
+            251 => Self::LongBlob,
+            252 => Self::Blob,
+            253 => Self::VarString,
+            254 => Self::String,
+            255 => Self::Geometry,
+            _ => return None,
+        })
+    }
+}
+
 /// `UNSIGNED_FLAG` from MariaDB's `mysql_com.h`. Marshalled in via the
 /// cxx shim from `Field::flags`. Used by callers like
 /// `KeyDef::extract_ttl_col` that need to validate column attributes
@@ -214,6 +256,40 @@ impl TableShareView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mysql_type_from_u32_round_trips_known_values() {
+        // Spot-check across the low and high enum ranges.
+        for (v, want) in [
+            (0u32, MysqlType::Decimal),
+            (1, MysqlType::Tiny),
+            (3, MysqlType::Long),
+            (5, MysqlType::Double),
+            (8, MysqlType::LongLong),
+            (14, MysqlType::NewDate),
+            (15, MysqlType::Varchar),
+            (19, MysqlType::Time2),
+            (246, MysqlType::NewDecimal),
+            (252, MysqlType::Blob),
+            (254, MysqlType::String),
+            (255, MysqlType::Geometry),
+        ] {
+            assert_eq!(MysqlType::from_u32(v), Some(want), "{v}");
+            // The reverse: enum-as-u8 round-trips.
+            assert_eq!(want as u8 as u32, v);
+        }
+    }
+
+    #[test]
+    fn mysql_type_from_u32_rejects_gap_and_overflow() {
+        // The enum has gaps (20..=245 are unused).
+        assert_eq!(MysqlType::from_u32(20), None);
+        assert_eq!(MysqlType::from_u32(100), None);
+        assert_eq!(MysqlType::from_u32(245), None);
+        // Out of u8 range — definitely not a real enum_field_types.
+        assert_eq!(MysqlType::from_u32(256), None);
+        assert_eq!(MysqlType::from_u32(u32::MAX), None);
+    }
 
     fn nullable_int(output_offset: u32, null_byte: u32, null_bit: u8) -> FieldView {
         FieldView {

@@ -1384,7 +1384,7 @@ impl KeyDef {
     pub fn setup(
         &mut self,
         tbl: &crate::codec::value::TableShareView,
-        tbl_def: &crate::codec::tbl_def::TblDef,
+        key_count: u32,
     ) -> Result<(), slatedb::Error> {
         use crate::codec::field_pack::FieldPacking;
         use crate::codec::value::IndexKeyPartView;
@@ -1612,7 +1612,7 @@ impl KeyDef {
                     if hidden_pk_exists {
                         // Synthetic 1-part tail handled at the top of
                         // the next iteration.
-                        keyno_to_set = (tbl_def.key_count() as u32).saturating_sub(1);
+                        keyno_to_set = key_count.saturating_sub(1);
                         current_parts = &[];
                         cur_pos = 0;
                         keypart_to_set = 0;
@@ -3320,7 +3320,7 @@ mod tests {
         let tdef = tbl_def(vec![pk_arc]);
 
         let mut pk = pk_skel(100, 0);
-        pk.setup(&table, &tdef).expect("setup");
+        pk.setup(&table, tdef.key_count() as u32).expect("setup");
 
         assert_eq!(pk.key_parts, 1);
         assert_eq!(pk.pack_info.len(), 1);
@@ -3346,7 +3346,7 @@ mod tests {
         let tdef = tbl_def(vec![Arc::new(pk_skel(100, 0))]);
 
         let mut pk = pk_skel(100, 0);
-        pk.setup(&table, &tdef).expect("setup");
+        pk.setup(&table, tdef.key_count() as u32).expect("setup");
 
         assert_eq!(pk.key_parts, 2);
         assert_eq!(pk.pack_info[0].field_index(), 2);
@@ -3367,7 +3367,7 @@ mod tests {
         let tdef = tbl_def(vec![Arc::new(pk_skel(100, 0))]);
 
         let mut pk = pk_skel(100, 0);
-        pk.setup(&table, &tdef).expect("setup");
+        pk.setup(&table, tdef.key_count() as u32).expect("setup");
 
         assert_eq!(pk.key_parts, 2);
         // INDEX_NUMBER_SIZE (4) + 4 + 4 = 12.
@@ -3387,7 +3387,7 @@ mod tests {
         let tdef = tbl_def(vec![Arc::new(pk_skel(100, 0))]);
 
         let mut pk = pk_skel(100, 0);
-        pk.setup(&table, &tdef).expect("setup");
+        pk.setup(&table, tdef.key_count() as u32).expect("setup");
 
         // 4 (INDEX_NUMBER) + 1 (NULL byte) + 4 (LONG) = 9.
         assert_eq!(pk.maxlength, 9);
@@ -3411,7 +3411,7 @@ mod tests {
         let tdef = tbl_def(vec![Arc::new(pk_skel(100, 0)), Arc::new(sk_skel(101, 1))]);
 
         let mut sk = sk_skel(101, 1);
-        sk.setup(&table, &tdef).expect("setup");
+        sk.setup(&table, tdef.key_count() as u32).expect("setup");
 
         assert_eq!(sk.key_parts, 2, "SK has its own col + the PK col");
         assert_eq!(sk.pk_key_parts, 1);
@@ -3448,7 +3448,7 @@ mod tests {
         let tdef = tbl_def(vec![Arc::new(pk_skel(100, 0)), Arc::new(sk_skel(101, 1))]);
 
         let mut sk = sk_skel(101, 1);
-        sk.setup(&table, &tdef).expect("setup");
+        sk.setup(&table, tdef.key_count() as u32).expect("setup");
 
         // Total parts: 2 user-declared + pk_key_parts=1 attempted
         // append; one is deduped ⇒ 2 final parts.
@@ -3472,7 +3472,7 @@ mod tests {
         let tdef = tbl_def(vec![Arc::new(hidden_pk_skel(200, 0))]);
 
         let mut hpk = hidden_pk_skel(200, 0);
-        hpk.setup(&table, &tdef).expect("setup");
+        hpk.setup(&table, tdef.key_count() as u32).expect("setup");
 
         assert_eq!(hpk.key_parts, 1);
         assert_eq!(hpk.pack_info.len(), 1);
@@ -3508,7 +3508,7 @@ mod tests {
         ]);
 
         let mut sk = sk_skel(101, 0);
-        sk.setup(&table, &tdef).expect("setup");
+        sk.setup(&table, tdef.key_count() as u32).expect("setup");
 
         // 1 user-declared part + 1 synthetic hidden-PK rowid.
         assert_eq!(sk.key_parts, 2);
@@ -3532,13 +3532,13 @@ mod tests {
         let tdef = tbl_def(vec![Arc::new(pk_skel(100, 0))]);
 
         let mut pk = pk_skel(100, 0);
-        pk.setup(&table, &tdef).expect("first setup");
+        pk.setup(&table, tdef.key_count() as u32).expect("first setup");
         let first_maxlength = pk.maxlength;
         let first_key_parts = pk.key_parts;
 
         // Mutate post-setup, then re-call: short-circuit must leave the
         // post-setup state alone.
-        pk.setup(&table, &tdef).expect("second setup (no-op)");
+        pk.setup(&table, tdef.key_count() as u32).expect("second setup (no-op)");
         assert_eq!(pk.maxlength, first_maxlength);
         assert_eq!(pk.key_parts, first_key_parts);
     }
@@ -3557,7 +3557,7 @@ mod tests {
 
         // keyno=99 points past the only index.
         let mut bad = pk_skel(100, 99);
-        let err = bad.setup(&table, &tdef).unwrap_err();
+        let err = bad.setup(&table, tdef.key_count() as u32).unwrap_err();
         assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
     }
 
@@ -3575,7 +3575,7 @@ mod tests {
         let tdef = tbl_def(vec![Arc::new(pk_skel(100, 0))]);
 
         let mut pk = pk_skel(100, 0);
-        let err = pk.setup(&table, &tdef).unwrap_err();
+        let err = pk.setup(&table, tdef.key_count() as u32).unwrap_err();
         assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
     }
 }

@@ -1509,10 +1509,130 @@ pub(crate) fn build_tbl_def_from_schema(
     Ok(TblDef::new(full_name)?.with_keys(keys))
 }
 
+/// Build a [`crate::codec::value::FieldView`] for field `i` from
+/// the cxx Field/TABLE callbacks. The view carries enough metadata
+/// for [`crate::codec::field_pack::FieldPacking::setup`] to wire
+/// dispatch slots — `name`, `output_offset`, and `decimals` are
+/// left at defaults because setup doesn't consult them for any of
+/// the currently-wired types (integer / float / date / decimal /
+/// binary string).
+#[cfg(feature = "field_callbacks")]
+fn build_field_view_from_cxx(
+    table: &ffi::TableRef,
+    i: u32,
+) -> crate::codec::value::FieldView {
+    use crate::codec::value::{FieldView, MysqlType};
+
+    let f = ffi::table_field_at(table, i);
+    let null_marker: Option<(u32, u8)> = if ffi::field_real_maybe_null(f) {
+        let off = ffi::field_null_offset(f);
+        let bit = ffi::field_null_bit(f) as u8;
+        // off == -1 only when not nullable — guarded above.
+        Some((off as u32, bit))
+    } else {
+        None
+    };
+    FieldView {
+        // Name/output_offset/decimals defaulted — see fn doc.
+        name: String::new(),
+        mysql_type: MysqlType::from_u32(ffi::field_real_type(f))
+            .unwrap_or(MysqlType::Null),
+        pack_length: ffi::field_pack_length(f),
+        output_offset: 0,
+        null_marker,
+        length: ffi::field_field_length(f),
+        charset_id: ffi::field_charset_number(f),
+        flags: ffi::field_flags(f),
+        decimals: 0,
+    }
+}
+
+/// Build a [`crate::codec::value::TableShareView`] for `table` by
+/// walking each field and each KEY's keyparts via the cxx
+/// callbacks.
+///
+/// `synth_hidden_pk` says whether the engine will append a
+/// synthetic hidden PK (true when MariaDB didn't supply a
+/// `PRIMARY KEY`). The hidden-PK signal in TableShareView is just
+/// `hidden_pk_field.is_some()` — the actual index value is a
+/// sentinel (`field_count`, one past the real columns) because
+/// MariaDB has no real `Field` for the hidden rowid.
+#[cfg(feature = "field_callbacks")]
+fn build_table_share_view_from_cxx(
+    table: &ffi::TableRef,
+    synth_hidden_pk: bool,
+) -> crate::codec::value::TableShareView {
+    use crate::codec::value::{IndexKeyPartView, IndexSchemaView, TableShareView};
+
+    let field_count = ffi::table_field_count(table);
+    let fields = (0..field_count)
+        .map(|i| build_field_view_from_cxx(table, i))
+        .collect::<Vec<_>>();
+
+    let key_count = ffi::table_key_count(table);
+    let mut indexes: Vec<IndexSchemaView> = Vec::with_capacity(key_count as usize);
+    for ki in 0..key_count {
+        let key_ref = ffi::table_key_at(table, ki);
+        let user_parts = ffi::key_user_defined_parts(key_ref);
+        let ext_parts = ffi::key_ext_parts(key_ref);
+        let key_parts: Vec<IndexKeyPartView> = (0..ext_parts)
+            .map(|pi| {
+                let kp = ffi::key_part_at(key_ref, pi);
+                IndexKeyPartView {
+                    field_idx: ffi::key_part_field_index(kp),
+                    key_part_length: ffi::key_part_length(kp),
+                }
+            })
+            .collect();
+        indexes.push(IndexSchemaView {
+            user_defined_key_parts: user_parts,
+            ext_key_parts: ext_parts,
+            key_parts,
+        });
+    }
+
+    let primary_key_index: Option<u32> = if ffi::table_has_primary_key(table) {
+        Some(ffi::table_primary_key_index(table))
+    } else {
+        None
+    };
+    let hidden_pk_field: Option<u32> = if synth_hidden_pk {
+        Some(field_count) // sentinel — KeyDef::setup only checks is_some()
+    } else {
+        None
+    };
+
+    TableShareView {
+        fields,
+        null_bytes: ffi::table_null_bytes(table),
+        row_length: ffi::table_record_length(table),
+        hidden_pk_field,
+        indexes,
+        primary_key_index,
+    }
+}
+
 /// Cxx `extern "Rust"` body for CREATE TABLE — see the
 /// declaration in [`ffi`] for the wire contract. The C++ shim's
 /// `ha_slatedb::create` wraps `TABLE *form` in a
 /// [`ffi::TableRef`] and calls this.
+///
+/// Two-phase build:
+/// 1. **Skeleton keys** — allocate KeyDefs via the existing
+///    [`build_tbl_def_from_schema`] (Vec<Arc<KeyDef>>, every key
+///    with `maxlength == 0`).
+/// 2. **Setup pass** — build a [`TableShareView`] from cxx
+///    callbacks and call [`crate::codec::key::KeyDef::setup`] on
+///    each KeyDef via `Arc::get_mut` (refcount is 1 immediately
+///    after step 1, so `get_mut` always succeeds). Populates
+///    `pack_info` with dispatch slots
+///    (`pack_func`/`unpack_func`/`skip_func`/`max_image_len`)
+///    that the read path needs for explicit-PK row reconstruction.
+/// 3. **Persist** — Arc-wrap the populated TblDef and write it
+///    to the catalogue via `DdlManager::put_and_write`.
+///
+/// On setup failure (corrupt schema, unrecognised column type,
+/// etc.) returns `ENGINE_IO_FAILED`.
 #[cfg(feature = "field_callbacks")]
 fn slatedb_create_table(name: String, table: &ffi::TableRef) -> i32 {
     use std::sync::Arc;
@@ -1543,15 +1663,15 @@ fn slatedb_create_table(name: String, table: &ffi::TableRef) -> i32 {
     }
 
     // Allocate one id per declared key + one more for the
-    // synthetic hidden PK (when needed). These are sequential
-    // SeqGenerator allocations.
+    // synthetic hidden PK (when needed). Sequential SeqGenerator
+    // allocations.
     let needed_ids = key_count as usize + usize::from(!has_pk);
     let mut index_ids: Vec<u32> = Vec::with_capacity(needed_ids);
     for _ in 0..needed_ids {
         index_ids.push(ddl.get_and_update_next_number());
     }
 
-    let tdef = match build_tbl_def_from_schema(
+    let mut tdef = match build_tbl_def_from_schema(
         &normalized,
         &key_names,
         pk_index,
@@ -1564,6 +1684,13 @@ fn slatedb_create_table(name: String, table: &ffi::TableRef) -> i32 {
         Err(_) => return status::ENGINE_IO_FAILED,
     };
 
+    // ----- setup pass: populate FieldPacking on each KeyDef -----
+    let tbl_view = build_table_share_view_from_cxx(table, !has_pk);
+    let total_keys = tdef.key_count() as u32;
+    if !run_keydef_setup(&mut tdef, &tbl_view, total_keys) {
+        return status::ENGINE_IO_FAILED;
+    }
+
     let Some(runtime) = crate::runtime::get() else {
         return status::RUNTIME_INIT_FAILED;
     };
@@ -1571,6 +1698,37 @@ fn slatedb_create_table(name: String, table: &ffi::TableRef) -> i32 {
         Ok(_) => status::OK,
         Err(_) => status::ENGINE_IO_FAILED,
     }
+}
+
+/// Run [`crate::codec::key::KeyDef::setup`] on every KeyDef in
+/// `tdef` via `Arc::get_mut`. Returns `false` on any setup error
+/// or if a KeyDef's Arc has more than one strong reference (which
+/// shouldn't happen right after `build_tbl_def_from_schema` —
+/// every Arc has refcount 1).
+///
+/// Factored out so the cfg-gated `slatedb_create_table` body
+/// stays focused on the cxx/marshalling concerns.
+#[cfg(feature = "field_callbacks")]
+fn run_keydef_setup(
+    tdef: &mut crate::codec::tbl_def::TblDef,
+    tbl_view: &crate::codec::value::TableShareView,
+    key_count: u32,
+) -> bool {
+    // Walk the KeyDef Arcs and call setup. Need to grab mutable
+    // access via Arc::get_mut, which requires refcount == 1.
+    // We use take/replace of the inner Vec rather than exposing a
+    // mutable accessor on TblDef.
+    let mut keys = tdef.take_keys();
+    for kd_arc in keys.iter_mut() {
+        let Some(kd_mut) = std::sync::Arc::get_mut(kd_arc) else {
+            return false;
+        };
+        if kd_mut.setup(tbl_view, key_count).is_err() {
+            return false;
+        }
+    }
+    tdef.put_keys(keys);
+    true
 }
 
 #[cfg(test)]
