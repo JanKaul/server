@@ -185,6 +185,14 @@ inline uint64_t field_part_of_key(const FieldRef &f) {
   return f.ptr->part_of_key.to_ulonglong();
 }
 
+/* `Field::flags` — bitmap of column flags (UNSIGNED_FLAG,
+   BLOB_FLAG, ZEROFILL_FLAG, etc.). Used by unpack functions that
+   need to distinguish signed vs unsigned (unpack_integer flips
+   the sign bit only for signed types). */
+inline uint32_t field_flags(const FieldRef &f) {
+  return static_cast<uint32_t>(f.ptr->flags);
+}
+
 /* --------------------------------------------------------------- */
 /*  Read column bytes — fill-buffer                                */
 /* --------------------------------------------------------------- */
@@ -343,6 +351,67 @@ inline const KeyInfoRef &table_key_at(const TableRef &t,
    fine. */
 inline ::rust::String key_name(const KeyInfoRef &k) {
   return ::rust::String(k.ptr->name.str, k.ptr->name.length);
+}
+
+/* `KEY::user_defined_key_parts` — count of keyparts the user
+   wrote in `CREATE INDEX(...)`. Excludes the extended-keys tail. */
+inline uint32_t key_user_defined_parts(const KeyInfoRef &k) {
+  return static_cast<uint32_t>(k.ptr->user_defined_key_parts);
+}
+
+/* `KEY::ext_key_parts` — total keypart count including the
+   extended-keys tail. */
+inline uint32_t key_ext_parts(const KeyInfoRef &k) {
+  return static_cast<uint32_t>(k.ptr->ext_key_parts);
+}
+
+/* Wrapper around MariaDB `KEY_PART_INFO *` (one entry of
+   `KEY::key_part[]`). Same lifetime contract as FieldRef /
+   KeyInfoRef — borrowed only, valid for the duration of the
+   cxx callback that handed it to Rust. */
+struct KeyPartRef {
+  KEY_PART_INFO *ptr;
+};
+
+/* Borrow the `i`-th keypart from `KEY::key_part[]`. Returns a
+   reference to a thread-local scratch slot, re-pointed on each
+   call. Caller must not retain past the cxx callback boundary. */
+inline const KeyPartRef &key_part_at(const KeyInfoRef &k,
+                                     uint32_t part_idx) {
+  thread_local KeyPartRef scratch{nullptr};
+  scratch.ptr = &k.ptr->key_part[part_idx];
+  return scratch;
+}
+
+/* `KEY_PART_INFO::fieldnr` is 1-based in MariaDB; we convert to
+   0-based at the shim boundary so Rust callers don't need to
+   remember the off-by-one (every Rust consumer uses 0-based
+   indexing into `TABLE_SHARE::field[]`). */
+inline uint32_t key_part_field_index(const KeyPartRef &kp) {
+  return static_cast<uint32_t>(kp.ptr->fieldnr) - 1;
+}
+
+/* `KEY_PART_INFO::length` — bytes of this keypart's
+   mem-comparable image (prefix-index aware). */
+inline uint16_t key_part_length(const KeyPartRef &kp) {
+  return static_cast<uint16_t>(kp.ptr->length);
+}
+
+/* --------------------------------------------------------------- */
+/*  TABLE_SHARE row-layout constants                               */
+/* --------------------------------------------------------------- */
+
+/* `TABLE_SHARE::null_bytes` — leading bytes of the row buffer
+   that hold the per-nullable-column null bitmap. Always
+   `(nullable_field_count + 7) / 8`. */
+inline uint32_t table_null_bytes(const TableRef &t) {
+  return static_cast<uint32_t>(t.ptr->s->null_bytes);
+}
+
+/* `TABLE_SHARE::reclength` — total bytes of a packed row
+   (null_bytes + sum of per-column pack_length). */
+inline uint32_t table_record_length(const TableRef &t) {
+  return static_cast<uint32_t>(t.ptr->s->reclength);
 }
 
 }  /* namespace slatedb */

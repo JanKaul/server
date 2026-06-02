@@ -392,6 +392,12 @@ pub mod ffi {
         /// (MariaDB caps at 64 keys per table).
         fn field_part_of_key(f: &FieldRef) -> u64;
 
+        /// `Field::flags` — bitmap of column flags
+        /// (`UNSIGNED_FLAG`, `BLOB_FLAG`, `ZEROFILL_FLAG`, etc.).
+        /// Consumed by unpack functions that need to disambiguate
+        /// signed vs unsigned (e.g. `unpack_integer`).
+        fn field_flags(f: &FieldRef) -> u32;
+
         // ----- Read column bytes (fill-buffer) -----
 
         /// Encode the column's value into `dst` in memcmp (sort)
@@ -458,6 +464,47 @@ pub mod ffi {
         /// CREATE TABLE is a one-shot path where per-key
         /// allocation is acceptable.
         fn key_name(k: &KeyInfoRef) -> String;
+
+        /// `KEY::user_defined_key_parts` — count of keyparts the
+        /// user wrote in `CREATE INDEX(...)`. Excludes the
+        /// extended-keys tail.
+        fn key_user_defined_parts(k: &KeyInfoRef) -> u32;
+
+        /// `KEY::ext_key_parts` — total keypart count including
+        /// the extended-keys tail (PK columns implicitly appended
+        /// to non-unique SKs).
+        fn key_ext_parts(k: &KeyInfoRef) -> u32;
+
+        /// Opaque wrapper around MariaDB's `KEY_PART_INFO *` (one
+        /// entry of `KEY::key_part[]`). Same lifetime contract
+        /// as [`KeyInfoRef`] — borrowed only.
+        type KeyPartRef;
+
+        /// Borrow the `i`-th keypart from a `KEY`'s `key_part[]`
+        /// array (`i < key_ext_parts(k)`). Same thread-local
+        /// scratch pattern as the rest of the schema callbacks.
+        fn key_part_at(k: &KeyInfoRef, part_idx: u32) -> &KeyPartRef;
+
+        /// `KEY_PART_INFO::fieldnr` — index of the column this
+        /// keypart packs in `TABLE_SHARE::field[]`. **Returned
+        /// as 0-based** even though the underlying C++ field is
+        /// 1-based; the conversion happens in the shim so Rust
+        /// callers don't need to remember the off-by-one.
+        fn key_part_field_index(kp: &KeyPartRef) -> u32;
+
+        /// `KEY_PART_INFO::length` — bytes of this keypart's
+        /// mem-comparable image. Drives prefix-index sizing
+        /// (`KEY(name(20))` → 20).
+        fn key_part_length(kp: &KeyPartRef) -> u16;
+
+        /// `TABLE_SHARE::null_bytes` — bytes of null bitmap at
+        /// the start of every row buffer. Always
+        /// `(nullable_field_count + 7) / 8`.
+        fn table_null_bytes(t: &TableRef) -> u32;
+
+        /// `TABLE_SHARE::reclength` — total bytes of a packed
+        /// row buffer (`null_bytes + sum(pack_length)`).
+        fn table_record_length(t: &TableRef) -> u32;
     }
 }
 
