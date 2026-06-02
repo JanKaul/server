@@ -514,6 +514,124 @@ impl KeyDef {
         Ok(written)
     }
 
+    /// Mirror of [`Self::pack_record`] for the read path: walk a
+    /// memcmp-encoded key and dispatch to `unpack_keypart` for
+    /// each non-hidden keypart. The closure is responsible for
+    /// any per-keypart byte consumption from `reader` (typically
+    /// via the [`crate::codec::field_pack::FieldPacking::unpack_func`]
+    /// dispatch).
+    ///
+    /// Walks left-to-right: the 4-byte index prefix is verified to
+    /// match `self.index_number`, then each keypart is processed
+    /// in order. The hidden-PK extension at the end of an SK on a
+    /// hidden-PK table is consumed (8 raw bytes) without calling
+    /// the closure — the caller doesn't need to do anything with
+    /// the rowid (it's not a real column on the SQL side).
+    ///
+    /// Nullable keyparts have a 1-byte null marker prefix
+    /// (`0x00` = NULL, `0x01` = value present, anything else =
+    /// `Data` error). When the marker is NULL, the closure is
+    /// invoked with `is_null = true` and no body bytes consumed;
+    /// the closure is expected to mark the field NULL on the
+    /// sink side. When the marker is `0x01`, the closure handles
+    /// reading + writing the value bytes.
+    ///
+    /// ## Errors
+    ///
+    /// - `Invalid` if `self.index_type == IndexType::HiddenPrimary`
+    ///   — hidden PK doesn't have a structured packed form; callers
+    ///   should use [`crate::handler::HaSlateDb::read_hidden_pk_id_from_rowkey`]
+    ///   directly for that path.
+    /// - `Data` if `src` is shorter than `INDEX_NUMBER_SIZE` or
+    ///   doesn't start with `self.index_number` big-endian.
+    /// - `Data` if a nullable keypart's null-marker byte is
+    ///   neither `0x00` nor `0x01`.
+    /// - Whatever the `unpack_keypart` closure returns.
+    pub fn unpack_record(
+        &self,
+        unpack_keypart: &mut dyn FnMut(
+            usize,
+            &FieldPacking,
+            bool, /* is_null */
+            &mut crate::utils::buff::StringReader,
+        ) -> Result<(), slatedb::Error>,
+        hidden_pk_id_present: bool,
+        src: &[u8],
+    ) -> Result<(), slatedb::Error> {
+        use crate::utils::buff::StringReader;
+
+        if self.index_type == IndexType::HiddenPrimary {
+            return Err(slatedb::Error::invalid(
+                "unpack_record: hidden PK row keys aren't decoded \
+                 through this orchestrator — use read_hidden_pk_id_from_rowkey"
+                    .into(),
+            ));
+        }
+        if src.len() < INDEX_NUMBER_SIZE {
+            return Err(slatedb::Error::data(format!(
+                "unpack_record: src too short for index prefix — \
+                 have {} bytes, need at least {}",
+                src.len(),
+                INDEX_NUMBER_SIZE,
+            )));
+        }
+        // Verify the 4-byte big-endian index_number prefix.
+        if src[..INDEX_NUMBER_SIZE] != self.index_number_storage_form {
+            return Err(slatedb::Error::data(
+                "unpack_record: index prefix doesn't match this KeyDef".into(),
+            ));
+        }
+
+        let mut reader = StringReader::new(&src[INDEX_NUMBER_SIZE..]);
+
+        let n = self.key_parts as usize;
+        let is_sk = self.index_type == IndexType::Secondary;
+        let has_hidden_pk_extension = is_sk && hidden_pk_id_present && n > 0;
+
+        for i in 0..n {
+            let is_hidden_pk_slot = has_hidden_pk_extension && i + 1 == n;
+            if is_hidden_pk_slot {
+                // Consume the 8-byte rowid without invoking the
+                // closure — the SK's hidden-PK tail isn't a real
+                // column, so there's nothing to write to MariaDB.
+                if reader.read(crate::globals::SIZEOF_HIDDEN_PK_COLUMN).is_none() {
+                    return Err(slatedb::Error::data(format!(
+                        "unpack_record: src truncated at hidden-PK extension \
+                         (need {} bytes)",
+                        crate::globals::SIZEOF_HIDDEN_PK_COLUMN,
+                    )));
+                }
+                break;
+            }
+
+            let fpi = &self.pack_info[i];
+            let is_null = if fpi.maybe_null {
+                let marker_slice = reader.read(1).ok_or_else(|| {
+                    slatedb::Error::data(format!(
+                        "unpack_record: src truncated at null marker for \
+                         keypart {i}"
+                    ))
+                })?;
+                match marker_slice[0] {
+                    0 => true,
+                    1 => false,
+                    other => {
+                        return Err(slatedb::Error::data(format!(
+                            "unpack_record: invalid null marker {other:#x} \
+                             at keypart {i}"
+                        )));
+                    }
+                }
+            } else {
+                false
+            };
+
+            unpack_keypart(i, fpi, is_null, &mut reader)?;
+        }
+
+        Ok(())
+    }
+
     /// First key for "begin iterating from start of index". For
     /// reverse-CF indexes iteration starts at the physical supremum.
     /// Returns the count of leading bytes usable for bloom-filter prefix
@@ -1970,6 +2088,212 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
         assert!(err.to_string().contains("hidden-PK extension"));
+    }
+
+    // ----- unpack_record -----
+
+    #[test]
+    fn unpack_record_rejects_hidden_pk_index() {
+        let kd = hidden_pk(7);
+        let mut buf = [0u8; 12];
+        let mut unpacker = |_: usize,
+                            _: &FieldPacking,
+                            _: bool,
+                            _: &mut crate::utils::buff::StringReader|
+         -> Result<(), slatedb::Error> {
+            panic!("closure must not be called for hidden-PK reject path");
+        };
+        let err = kd.unpack_record(&mut unpacker, false, &buf).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("read_hidden_pk_id_from_rowkey"));
+        // silence unused-warning on buf if all branches early-return
+        let _ = &mut buf;
+    }
+
+    #[test]
+    fn unpack_record_rejects_short_src() {
+        let kd = kd_with_parts(0xCAFE, IndexType::Primary, 1, 4);
+        let buf = [0u8, 0u8]; // less than INDEX_NUMBER_SIZE
+        let mut unpacker = |_: usize,
+                            _: &FieldPacking,
+                            _: bool,
+                            _: &mut crate::utils::buff::StringReader|
+         -> Result<(), slatedb::Error> { Ok(()) };
+        let err = kd.unpack_record(&mut unpacker, false, &buf).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Data);
+        assert!(err.to_string().contains("src too short"));
+    }
+
+    #[test]
+    fn unpack_record_rejects_mismatched_index_prefix() {
+        // KeyDef expects index 0x0102_0304, but src starts with a
+        // different prefix.
+        let kd = kd_with_parts(0x0102_0304, IndexType::Primary, 1, 4);
+        let buf = [0xAA, 0xBB, 0xCC, 0xDD, 0, 0, 0, 0];
+        let mut unpacker = |_: usize,
+                            _: &FieldPacking,
+                            _: bool,
+                            _: &mut crate::utils::buff::StringReader|
+         -> Result<(), slatedb::Error> {
+            panic!("closure must not be called on prefix mismatch")
+        };
+        let err = kd.unpack_record(&mut unpacker, false, &buf).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Data);
+        assert!(err.to_string().contains("index prefix"));
+    }
+
+    #[test]
+    fn unpack_record_invokes_closure_for_each_keypart() {
+        // Round trip: build bytes via pack_record, decode via
+        // unpack_record. The packer puts `keypart_index` repeated
+        // into each 4-byte slot; the unpacker reads those 4 bytes
+        // back and records what it saw.
+        let kd = kd_with_parts(0x0102_0304, IndexType::Primary, 3, 4);
+        let mut packed = [0u8; 32];
+        let mut packer =
+            |i: usize, fpi: &FieldPacking, dst: &mut [u8]| -> Result<usize, slatedb::Error> {
+                let n = fpi.max_image_len as usize;
+                dst[..n].fill(i as u8);
+                Ok(n)
+            };
+        let n = kd.pack_record(&mut packer, None, &mut packed).expect("pack");
+        assert_eq!(n, INDEX_NUMBER_SIZE + 3 * 4);
+
+        let mut seen: Vec<(usize, Vec<u8>)> = Vec::new();
+        let mut unpacker = |i: usize,
+                            fpi: &FieldPacking,
+                            is_null: bool,
+                            reader: &mut crate::utils::buff::StringReader|
+         -> Result<(), slatedb::Error> {
+            assert!(!is_null, "non-nullable test keyparts");
+            let want = fpi.max_image_len as usize;
+            let bytes = reader.read(want).expect("read");
+            seen.push((i, bytes.to_vec()));
+            Ok(())
+        };
+        kd.unpack_record(&mut unpacker, false, &packed[..n])
+            .expect("unpack");
+        assert_eq!(seen.len(), 3);
+        assert_eq!(seen[0].1, vec![0, 0, 0, 0]);
+        assert_eq!(seen[1].1, vec![1, 1, 1, 1]);
+        assert_eq!(seen[2].1, vec![2, 2, 2, 2]);
+    }
+
+    #[test]
+    fn unpack_record_handles_nullable_keypart_null_marker() {
+        // Single nullable keypart. Build bytes manually: index
+        // prefix + 1 null-marker byte (0x00 = NULL). The closure
+        // should be called once with is_null=true and read no
+        // body bytes.
+        let mut kd = kd_with_parts(0x0102_0304, IndexType::Primary, 1, 4);
+        kd.pack_info[0].maybe_null = true;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]); // index prefix
+        buf.push(0x00); // null marker = NULL
+
+        let mut call_count = 0;
+        let mut unpacker = |_i: usize,
+                            _fpi: &FieldPacking,
+                            is_null: bool,
+                            _reader: &mut crate::utils::buff::StringReader|
+         -> Result<(), slatedb::Error> {
+            call_count += 1;
+            assert!(is_null);
+            Ok(())
+        };
+        kd.unpack_record(&mut unpacker, false, &buf).expect("unpack");
+        assert_eq!(call_count, 1);
+    }
+
+    #[test]
+    fn unpack_record_handles_nullable_keypart_value_marker() {
+        let mut kd = kd_with_parts(0x0102_0304, IndexType::Primary, 1, 4);
+        kd.pack_info[0].maybe_null = true;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        buf.push(0x01); // marker: value follows
+        buf.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+
+        let mut seen: Vec<u8> = Vec::new();
+        let mut unpacker = |_i: usize,
+                            fpi: &FieldPacking,
+                            is_null: bool,
+                            reader: &mut crate::utils::buff::StringReader|
+         -> Result<(), slatedb::Error> {
+            assert!(!is_null);
+            let want = fpi.max_image_len as usize;
+            let bytes = reader.read(want).expect("read");
+            seen.extend_from_slice(bytes);
+            Ok(())
+        };
+        kd.unpack_record(&mut unpacker, false, &buf).expect("unpack");
+        assert_eq!(seen, vec![0xAA, 0xBB, 0xCC, 0xDD]);
+    }
+
+    #[test]
+    fn unpack_record_rejects_invalid_null_marker() {
+        let mut kd = kd_with_parts(0x0102_0304, IndexType::Primary, 1, 4);
+        kd.pack_info[0].maybe_null = true;
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        buf.push(0x7F); // neither 0x00 nor 0x01
+
+        let mut unpacker = |_: usize,
+                            _: &FieldPacking,
+                            _: bool,
+                            _: &mut crate::utils::buff::StringReader|
+         -> Result<(), slatedb::Error> {
+            panic!("closure must not be called on bad marker");
+        };
+        let err = kd.unpack_record(&mut unpacker, false, &buf).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Data);
+        assert!(err.to_string().contains("null marker"));
+    }
+
+    #[test]
+    fn unpack_record_sk_with_hidden_pk_consumes_rowid_silently() {
+        // SK with 2 parts: the second is the synthetic hidden-PK
+        // extension. The closure should be called only for part 0;
+        // the 8 rowid bytes get consumed without dispatch.
+        let kd = kd_with_parts(0x0000_0064, IndexType::Secondary, 2, 4);
+        // Build a packed buffer: prefix (4) + part0 (4) + rowid (8)
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x64]);
+        buf.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        buf.extend_from_slice(&0x0001_0203_0405_0607u64.to_be_bytes());
+
+        let mut calls: Vec<usize> = Vec::new();
+        let mut unpacker = |i: usize,
+                            fpi: &FieldPacking,
+                            _is_null: bool,
+                            reader: &mut crate::utils::buff::StringReader|
+         -> Result<(), slatedb::Error> {
+            calls.push(i);
+            let n = fpi.max_image_len as usize;
+            let _ = reader.read(n).expect("read");
+            Ok(())
+        };
+        kd.unpack_record(&mut unpacker, true, &buf).expect("unpack");
+        assert_eq!(calls, vec![0]);
+    }
+
+    #[test]
+    fn unpack_record_propagates_closure_error() {
+        let kd = kd_with_parts(0x0102_0304, IndexType::Primary, 1, 4);
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+        buf.extend_from_slice(&[0, 0, 0, 0]);
+
+        let mut unpacker = |_: usize,
+                            _: &FieldPacking,
+                            _: bool,
+                            _: &mut crate::utils::buff::StringReader|
+         -> Result<(), slatedb::Error> {
+            Err(slatedb::Error::invalid("synthetic closure failure".into()))
+        };
+        let err = kd.unpack_record(&mut unpacker, false, &buf).unwrap_err();
+        assert_eq!(err.kind(), slatedb::ErrorKind::Invalid);
+        assert!(err.to_string().contains("synthetic closure failure"));
     }
 
     #[test]

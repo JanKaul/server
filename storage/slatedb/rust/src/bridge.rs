@@ -1059,6 +1059,105 @@ pub fn pack_record_via_table(
     key_def.pack_record(&mut packer, hidden_pk_id, dst)
 }
 
+/// Cxx wrapper around [`crate::codec::key::KeyDef::unpack_record`].
+/// Supplies an unpacker closure that, for each keypart, dispatches
+/// to [`crate::codec::field_pack::FieldPacking::unpack_func`],
+/// writes the unpacked bytes into a scratch buffer, and copies them
+/// into the field's storage via
+/// [`ffi::table_field_set_value`] / [`ffi::table_field_set_null`]
+/// (depending on the per-keypart null marker).
+///
+/// Symmetric counterpart of [`pack_record_via_table`]: the same
+/// scratch-per-keypart shape, but writing into the `TableRef`
+/// instead of reading from it.
+///
+/// `hidden_pk_id_present` is `true` when scanning an SK on a
+/// hidden-PK table — the orchestrator skips the trailing 8 rowid
+/// bytes (they aren't a real column). For PK scans (the only
+/// `ha_rnd_next` caller today) the value is `false`.
+///
+/// ## Stage 0 limitation
+///
+/// Keypart unpack only succeeds for fields whose
+/// `FieldPacking::unpack_func` slot is populated by
+/// `FieldPacking::setup` — i.e. fixed-width integer / float /
+/// date / decimal / time-with-fsp / year / NewDate / CHAR(n)
+/// with binary collation. VARCHAR + non-binary-collation CHAR
+/// columns leave `unpack_func == None`; for those, this wrapper
+/// returns `Invalid` rather than silently leaving the field
+/// uninitialised. `ha_rnd_next` propagates that to
+/// `ENGINE_IO_FAILED`.
+#[cfg(feature = "field_callbacks")]
+pub fn unpack_record_via_table(
+    key_def: &crate::codec::key::KeyDef,
+    table: &ffi::TableRef,
+    hidden_pk_id_present: bool,
+    src: &[u8],
+) -> Result<(), slatedb::Error> {
+    let mut unpacker =
+        |_kp_idx: usize,
+         fpi: &crate::codec::field_pack::FieldPacking,
+         is_null: bool,
+         reader: &mut crate::utils::buff::StringReader|
+         -> Result<(), slatedb::Error> {
+            let field_idx = fpi.field_index();
+            if is_null {
+                ffi::table_field_set_null(table, field_idx);
+                return Ok(());
+            }
+            let unpack_fn = fpi.unpack_func.ok_or_else(|| {
+                slatedb::Error::invalid(format!(
+                    "unpack_record_via_table: no unpack_func for keypart \
+                     mapped to field {field_idx} (Stage 0: only fixed-width \
+                     integer/float/date/decimal columns are supported)",
+                ))
+            })?;
+
+            // Allocate a scratch buffer of pack_length bytes — the
+            // unpack function writes the field's in-record image
+            // here, then we hand it to MariaDB via
+            // table_field_set_value.
+            let pack_len = ffi::field_pack_length(ffi::table_field_at(
+                table, field_idx,
+            )) as usize;
+            let mut scratch = vec![0u8; pack_len];
+
+            // unpack_func takes &mut FieldPacking and &mut FieldView
+            // even though none of the wired routines mutate them.
+            // Build local mutable copies so the orchestrator can
+            // keep &self / & FieldPacking.
+            let mut fpi_local = fpi.clone();
+            let mut field_local = crate::codec::value::FieldView {
+                name: String::new(),
+                mysql_type: crate::codec::value::MysqlType::Null,
+                pack_length: pack_len as u32,
+                output_offset: 0,
+                null_marker: None,
+                length: 0,
+                charset_id: 0,
+                // Crucial — unpack_integer reads UNSIGNED_FLAG from here.
+                flags: ffi::field_flags(ffi::table_field_at(table, field_idx)),
+                decimals: 0,
+            };
+
+            let code = unpack_fn(
+                &mut fpi_local,
+                &mut field_local,
+                &mut scratch,
+                reader,
+                None,
+            );
+            crate::codec::field_pack::unpack_status_to_result(code)?;
+
+            // Clear NULL first (the field may have been marked NULL
+            // by a previous row's decode) and copy bytes in.
+            ffi::table_field_set_notnull(table, field_idx);
+            let _ = ffi::table_field_set_value(table, field_idx, &scratch);
+            Ok(())
+        };
+    key_def.unpack_record(&mut unpacker, hidden_pk_id_present, src)
+}
+
 /// `RowValueSource` implementation backed by a live `TableRef`.
 /// The cxx-side counterpart of
 /// [`crate::codec::row_value::RowValueSource`] — supplies the

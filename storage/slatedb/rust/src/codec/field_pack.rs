@@ -154,7 +154,12 @@ pub static COLLATION_DATA_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(()
 /// `pack_func`/`unpack_func`/`skip_func` to pick the encoding routine.
 ///
 /// Original: `rdb_datadic.h:912` — `class Rdb_field_packing`.
-#[derive(Default)]
+///
+/// Clone is derived so the read-path orchestrator (`KeyDef::unpack_record`)
+/// can hand the closure a mutable copy without requiring `&mut KeyDef` —
+/// every field is Copy or Arc-wrapped, so the clone is cheap and
+/// reference-bumps the shared collation codec.
+#[derive(Default, Clone)]
 pub struct FieldPacking {
     /// Length of the mem-comparable image of the field, in bytes.
     pub max_image_len: i32,
