@@ -290,6 +290,31 @@ pub mod ffi {
         /// tables.
         #[cfg(feature = "field_callbacks")]
         fn slatedb_delete_row(thd_id: u64, name: String, table: &TableRef) -> i32;
+
+        /// UPDATE row entry — called by `ha_slatedb::update_row`.
+        /// For explicit-PK tables with the PK column(s) unchanged
+        /// this is identical to a write_row at the same PK
+        /// (overwrites the value blob in place via the per-THD
+        /// txn).
+        ///
+        /// ## Stage 0 limitations
+        ///
+        /// - **Explicit-PK only.** Hidden-PK update would need the
+        ///   captured rowid (MyRocks's `m_last_rowkey`) to reach
+        ///   the existing row's key; `slatedb_write_row` would
+        ///   instead allocate a *new* rowid and silently leak the
+        ///   old row. Returns `ENGINE_IO_FAILED` at the guard for
+        ///   hidden-PK tables.
+        /// - **PK columns must not change.** A PK-changing update
+        ///   would need delete-of-old + insert-of-new, which needs
+        ///   the old PK to come from `record[1]` (record-buffer
+        ///   swap on the C++ side, deferred). Caller-side
+        ///   contract — the Rust side can't detect a PK change
+        ///   without packing both old and new PKs first, which is
+        ///   the work that's deferred. SQL-layer users should
+        ///   prefer `DELETE … INSERT …` for PK changes in Stage 0.
+        #[cfg(feature = "field_callbacks")]
+        fn slatedb_update_row(thd_id: u64, name: String, table: &TableRef) -> i32;
     }
 
     // ----- Field/TABLE C++ callback surface -----
@@ -1295,6 +1320,53 @@ fn slatedb_delete_row(thd_id: u64, name: String, table: &ffi::TableRef) -> i32 {
         Ok(_) => status::OK,
         Err(_) => status::ENGINE_IO_FAILED,
     }
+}
+
+/// Cxx `extern "Rust"` entry — called by the C++ shim's
+/// `ha_slatedb::update_row`. For explicit-PK tables with the PK
+/// columns unchanged, an update is just a write at the same PK —
+/// SlateDB's last-write-wins semantics overwrite the value blob
+/// in place under the per-THD txn.
+///
+/// Implementation is intentionally a thin guard wrapping
+/// [`slatedb_write_row`]: we look up the PK keydef, refuse
+/// hidden-PK tables (would silently leak the old row to a fresh
+/// rowid), and delegate.
+///
+/// ## Stage 0 caller-side contract
+///
+/// The Rust side does not detect whether the PK columns
+/// actually changed — that would require packing both the new
+/// and old PKs and comparing them, and the "old PK" path needs
+/// `record[1]` access on the C++ side (deferred). A
+/// PK-changing UPDATE would leave an orphaned row at the old
+/// PK; SQL-layer users should prefer `DELETE … INSERT …` for
+/// those cases in Stage 0.
+#[cfg(feature = "field_callbacks")]
+fn slatedb_update_row(thd_id: u64, name: String, table: &ffi::TableRef) -> i32 {
+    use crate::codec::key::IndexType;
+
+    let Some(ddl) = current_ddl() else {
+        return crate::handler::status::NO_ENGINE;
+    };
+    let Some(tdef) = ddl.find(&name) else {
+        return crate::handler::status::NO_SUCH_TABLE;
+    };
+    let Some(pk_kd) = find_pk_keydef(&tdef) else {
+        return status::ENGINE_IO_FAILED;
+    };
+
+    // Hidden-PK update would call slatedb_write_row, which
+    // allocates a fresh rowid and inserts at THAT key — leaving
+    // the original row orphaned. Refuse rather than silently
+    // corrupt.
+    if pk_kd.index_type == IndexType::HiddenPrimary {
+        return status::ENGINE_IO_FAILED;
+    }
+
+    // Explicit-PK + PK-unchanged: write_row overwrites the same
+    // key (PK is derived from row data, identical → same key).
+    slatedb_write_row(thd_id, name, table)
 }
 
 /// Build a [`crate::codec::tbl_def::TblDef`] from primitive

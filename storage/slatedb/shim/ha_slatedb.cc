@@ -324,6 +324,30 @@ int ha_slatedb::write_row(const uchar *)
   DBUG_RETURN(slatedb_status_to_ha_err(rc));
 }
 
+int ha_slatedb::update_row(const uchar *, const uchar *)
+{
+  DBUG_ENTER("ha_slatedb::update_row");
+  /* `old_data` / `new_data` are unused — Rust reads PK + value
+     columns out of `record[0]` (= new_data by MariaDB convention)
+     via the cxx Field callbacks. The per-THD txn must already
+     exist (external_lock(F_WRLCK) ran first).
+
+     Stage 0 limitations:
+       - Explicit-PK only (hidden-PK returns ENGINE_IO_FAILED).
+       - Caller must ensure PK columns are unchanged; a
+         PK-changing UPDATE would orphan the old row. Prefer
+         DELETE + INSERT for PK changes in Stage 0. */
+  THD *const thd= table->in_use;
+  const std::string full_name=
+      std::string(table->s->db.str, table->s->db.length) + "." +
+      std::string(table->s->table_name.str, table->s->table_name.length);
+  slatedb::TableRef tref{table};
+  int32_t rc= slatedb::slatedb_update_row(thd_get_thread_id(thd),
+                                          rust::String(full_name),
+                                          tref);
+  DBUG_RETURN(slatedb_status_to_ha_err(rc));
+}
+
 int ha_slatedb::delete_row(const uchar *)
 {
   DBUG_ENTER("ha_slatedb::delete_row");
