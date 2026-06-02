@@ -610,19 +610,25 @@ impl HaSlateDb {
     /// Cxx wrapper — advances the scan iterator and decodes the
     /// row into `table`'s live row buffer (`record[0]`).
     ///
-    /// Stage 0 limitation: **hidden-PK tables only**. For
-    /// explicit-PK tables, we'd need to unpack the PK column
-    /// bytes back from `kv.key` into the PK Field storage —
-    /// requires the unpack-record pipeline that doesn't exist
-    /// yet (mirror of `pack_record_via_table` for the reverse
-    /// direction). Explicit-PK tables return `ENGINE_IO_FAILED`
-    /// at the guard. Hidden-PK tables work cleanly: the
-    /// synthetic rowid stays in the key (not exposed as a
-    /// column), so a value-blob decode populates every column.
+    /// Two-phase decode:
+    /// 1. **PK columns** (explicit-PK only): unpack from
+    ///    `kv.key` via [`unpack_record_via_table`] — the PK
+    ///    keypart bytes get unpacked into MariaDB's PK Field
+    ///    storage. Hidden-PK tables skip this step (the rowid
+    ///    isn't a real column).
+    /// 2. **Non-PK columns**: decode the value blob via
+    ///    [`TableRefRowValueSink`] +
+    ///    [`crate::codec::row_value::decode_row_value`].
+    ///
+    /// The two writes target disjoint fields (the sink's
+    /// `is_in_pk` mask skips PK keyparts), so order between
+    /// the two phases is irrelevant.
     ///
     /// Returns: `OK` on a successful row decode; `END_OF_FILE`
-    /// when the scan is exhausted; `ENGINE_IO_FAILED` for
-    /// explicit-PK tables / I/O / codec failures;
+    /// when the scan is exhausted; `ENGINE_IO_FAILED` on I/O or
+    /// codec failure (including a keypart whose
+    /// `FieldPacking::unpack_func` slot is unwired — e.g.
+    /// VARCHAR / non-binary-collation CHAR);
     /// `BAD_TABLE_PATH` if the handler isn't open or rnd_init
     /// wasn't called.
     #[cfg(feature = "field_callbacks")]
@@ -639,13 +645,6 @@ impl HaSlateDb {
         let Some(pk_kd) = find_pk_keydef(&tdef) else {
             return status::ENGINE_IO_FAILED;
         };
-        // Stage 0: explicit-PK rnd_next would need unpack_record
-        // (PK column reconstruction from key bytes), not yet
-        // implemented. Fail explicitly rather than silently
-        // leave PK columns uninitialised.
-        if pk_kd.index_type == IndexType::Primary {
-            return status::ENGINE_IO_FAILED;
-        }
 
         let runtime = match crate::runtime::get() {
             Some(rt) => rt,
@@ -657,8 +656,18 @@ impl HaSlateDb {
             Err(_) => return status::ENGINE_IO_FAILED,
         };
 
-        // Decode value blob into record[0] via the cxx
-        // Field/TABLE callbacks.
+        // ----- PK columns (explicit-PK only) -----
+        //
+        // Hidden-PK tables have no real PK column to reconstruct;
+        // the rowid stays in the key and isn't surfaced to the
+        // SQL layer.
+        if pk_kd.index_type == IndexType::Primary
+            && unpack_record_via_table(&pk_kd, table, false, &kv.key).is_err()
+        {
+            return status::ENGINE_IO_FAILED;
+        }
+
+        // ----- Non-PK columns: value-blob decode -----
         let field_count = ffi::table_field_count(table);
         let pk_field_mask =
             TableRefRowValueSource::pk_field_mask_for(&pk_kd, field_count);
