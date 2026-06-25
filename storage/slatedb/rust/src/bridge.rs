@@ -161,11 +161,6 @@ pub mod ffi {
         ) -> i32;
 
         // ----- table-scan read path (rnd_init / rnd_next / rnd_end) -----
-        //
-        // Gated by `field_callbacks` because `ha_rnd_next` takes
-        // `&TableRef` to decode the value blob into MariaDB row
-        // storage. `ha_rnd_init` and `ha_rnd_end` are gated for
-        // symmetry — the three live and die together.
 
         /// Open a full-table scan on the PK keyspace, scoped to
         /// the per-THD transaction's snapshot. Stashes the
@@ -176,7 +171,6 @@ pub mod ffi {
         /// `BAD_TABLE_PATH` if the handler isn't open or has no
         /// PK; `ENGINE_IO_FAILED` if the txn isn't registered or
         /// the underlying scan_prefix fails.
-        #[cfg(feature = "field_callbacks")]
         fn ha_rnd_init(self: &mut HaSlateDb, thd_id: u64) -> i32;
 
         /// Advance the active scan iterator and decode the
@@ -188,13 +182,11 @@ pub mod ffi {
         /// `ENGINE_IO_FAILED` for I/O / codec failures or for
         /// explicit-PK tables (Stage 0 limit — see method docs);
         /// `BAD_TABLE_PATH` if `rnd_init` wasn't called first.
-        #[cfg(feature = "field_callbacks")]
         fn ha_rnd_next(self: &mut HaSlateDb, table: &TableRef) -> i32;
 
         /// Tear down the active scan. Idempotent — calling on a
         /// handler that hasn't run `rnd_init` is OK. Always
         /// returns `OK`.
-        #[cfg(feature = "field_callbacks")]
         fn ha_rnd_end(self: &mut HaSlateDb) -> i32;
 
         // ----- handlerton txn callbacks -----
@@ -250,10 +242,6 @@ pub mod ffi {
         fn slatedb_handlerton_checkpoint_request();
 
         // ----- Field/TABLE row-I/O entry points -----
-        //
-        // Gated by the `field_callbacks` Cargo feature so
-        // `cargo test --lib` doesn't try to link against the
-        // C++-side `slatedb_field_callbacks.h` forwarders.
 
         /// CREATE TABLE entry — called by the C++ shim's
         /// `ha_slatedb::create` once it has wrapped `TABLE *form`
@@ -263,7 +251,6 @@ pub mod ffi {
         /// `TblDef` to the system-CF catalogue via
         /// `DdlManager::put_and_write`. `name` is MariaDB's
         /// on-disk path form (`./db/tbl[#P#part]`); Rust normalises.
-        #[cfg(feature = "field_callbacks")]
         fn slatedb_create_table(name: String, table: &TableRef) -> i32;
 
         /// INSERT row entry — called by `ha_slatedb::write_row`
@@ -276,7 +263,6 @@ pub mod ffi {
         /// Stage 0: writes only the PK row, no secondary keys, no
         /// unique-check pre-read, no auto-incr field bump from the
         /// row, no TTL prefix, no debug checksum suffix.
-        #[cfg(feature = "field_callbacks")]
         fn slatedb_write_row(thd_id: u64, name: String, table: &TableRef) -> i32;
 
         /// DELETE row entry — called by `ha_slatedb::delete_row`
@@ -288,7 +274,6 @@ pub mod ffi {
         /// (MyRocks's `m_last_rowkey`), which isn't plumbed —
         /// returns `ENGINE_IO_FAILED` at the guard for hidden-PK
         /// tables.
-        #[cfg(feature = "field_callbacks")]
         fn slatedb_delete_row(thd_id: u64, name: String, table: &TableRef) -> i32;
 
         /// UPDATE row entry — called by `ha_slatedb::update_row`.
@@ -313,7 +298,6 @@ pub mod ffi {
         ///   without packing both old and new PKs first, which is
         ///   the work that's deferred. SQL-layer users should
         ///   prefer `DELETE … INSERT …` for PK changes in Stage 0.
-        #[cfg(feature = "field_callbacks")]
         fn slatedb_update_row(thd_id: u64, name: String, table: &TableRef) -> i32;
     }
 
@@ -337,7 +321,6 @@ pub mod ffi {
     // methods on `Pin<&mut FieldRef>` — the underlying `Field` is
     // pinned by the blocked thread regardless of how we borrow.
 
-    #[cfg(feature = "field_callbacks")]
     unsafe extern "C++" {
         include!("slatedb_field_callbacks.h");
 
@@ -594,7 +577,6 @@ impl HaSlateDb {
     /// via the global [`TxnRegistry`] and stashes the iterator on
     /// this handler. Delegates to the Rust-native
     /// [`HaSlateDb::rnd_init`].
-    #[cfg(feature = "field_callbacks")]
     fn ha_rnd_init(&mut self, thd_id: u64) -> i32 {
         let Some(registry) = current_txn_registry() else {
             return crate::handler::status::NO_ENGINE;
@@ -631,7 +613,6 @@ impl HaSlateDb {
     /// VARCHAR / non-binary-collation CHAR);
     /// `BAD_TABLE_PATH` if the handler isn't open or rnd_init
     /// wasn't called.
-    #[cfg(feature = "field_callbacks")]
     fn ha_rnd_next(&mut self, table: &ffi::TableRef) -> i32 {
         use crate::codec::key::IndexType;
         use crate::codec::row_value::{
@@ -689,7 +670,6 @@ impl HaSlateDb {
 
     /// Cxx wrapper — drops the active scan iterator. Delegates
     /// to [`HaSlateDb::rnd_end`], which is infallible.
-    #[cfg(feature = "field_callbacks")]
     fn ha_rnd_end(&mut self) -> i32 {
         crate::handler::open_result_to_status(self.rnd_end())
     }
@@ -981,10 +961,6 @@ pub(crate) fn slatedb_handlerton_checkpoint_request() {
 // ---------------------------------------------------------------------------
 // Field/TABLE row-I/O entry-point bodies + codec wrappers
 // ---------------------------------------------------------------------------
-//
-// Cxx-side declarations live in the `mod ffi` block above (gated by
-// `field_callbacks`). Bodies and Rust-only helpers follow here, all
-// likewise gated.
 
 /// Pack one keypart's value into `dst` in memcmp (sort) form via
 /// the C++ `field->sort_string` callback. Counterpart of MyRocks'
@@ -1009,7 +985,6 @@ pub(crate) fn slatedb_handlerton_checkpoint_request() {
 /// `field` is borrowed from MariaDB and valid only for the
 /// duration of this call. See the cxx surface doc for the
 /// retention rule.
-#[cfg(feature = "field_callbacks")]
 pub fn pack_with_sort_string(
     fpi: &crate::codec::field_pack::FieldPacking,
     field: &ffi::FieldRef,
@@ -1051,7 +1026,6 @@ pub fn pack_with_sort_string(
 /// orchestrator: `None` for explicit PK or SK on a table with a
 /// declared PRIMARY KEY; `Some(rowid)` for SK on a hidden-PK
 /// table — the rowid lands at the SK's tail keypart.
-#[cfg(feature = "field_callbacks")]
 pub fn pack_record_via_table(
     key_def: &crate::codec::key::KeyDef,
     table: &ffi::TableRef,
@@ -1096,7 +1070,6 @@ pub fn pack_record_via_table(
 /// returns `Invalid` rather than silently leaving the field
 /// uninitialised. `ha_rnd_next` propagates that to
 /// `ENGINE_IO_FAILED`.
-#[cfg(feature = "field_callbacks")]
 pub fn unpack_record_via_table(
     key_def: &crate::codec::key::KeyDef,
     table: &ffi::TableRef,
@@ -1178,7 +1151,6 @@ pub fn unpack_record_via_table(
 /// `KeyDef`'s `pack_info[].field_index` values. `is_null` /
 /// `pack_length` / `write_field_bytes` all dispatch through the
 /// cxx callbacks.
-#[cfg(feature = "field_callbacks")]
 pub struct TableRefRowValueSource<'a> {
     table: &'a ffi::TableRef,
     /// Per-field mask: `pk_field_mask[i] = true` iff field `i` is
@@ -1186,7 +1158,6 @@ pub struct TableRefRowValueSource<'a> {
     pk_field_mask: Vec<bool>,
 }
 
-#[cfg(feature = "field_callbacks")]
 impl<'a> TableRefRowValueSource<'a> {
     /// Build a source from a TableRef + a precomputed PK
     /// exclusion mask. The mask is a `Vec<bool>` of length
@@ -1218,7 +1189,6 @@ impl<'a> TableRefRowValueSource<'a> {
     }
 }
 
-#[cfg(feature = "field_callbacks")]
 impl<'a> crate::codec::row_value::RowValueSource for TableRefRowValueSource<'a> {
     fn is_in_pk(&self, i: u32) -> bool {
         self.pk_field_mask
@@ -1252,13 +1222,11 @@ impl<'a> crate::codec::row_value::RowValueSource for TableRefRowValueSource<'a> 
 /// Symmetric counterpart of [`TableRefRowValueSource`] — the
 /// read-path decoder writes column bytes back into MariaDB
 /// `Field`s through this sink.
-#[cfg(feature = "field_callbacks")]
 pub struct TableRefRowValueSink<'a> {
     table: &'a ffi::TableRef,
     pk_field_mask: Vec<bool>,
 }
 
-#[cfg(feature = "field_callbacks")]
 impl<'a> TableRefRowValueSink<'a> {
     /// Build a sink from a TableRef + a precomputed PK exclusion
     /// mask (see [`TableRefRowValueSource::pk_field_mask_for`] —
@@ -1271,7 +1239,6 @@ impl<'a> TableRefRowValueSink<'a> {
     }
 }
 
-#[cfg(feature = "field_callbacks")]
 impl<'a> crate::codec::row_value::RowValueSink for TableRefRowValueSink<'a> {
     fn is_in_pk(&self, i: u32) -> bool {
         self.pk_field_mask
@@ -1304,7 +1271,6 @@ impl<'a> crate::codec::row_value::RowValueSink for TableRefRowValueSink<'a> {
 
 /// Find the primary-key `KeyDef` in a `TblDef`. Returns the
 /// `KeyDef` whose `index_type` is `Primary` or `HiddenPrimary`.
-#[cfg(feature = "field_callbacks")]
 fn find_pk_keydef(
     tdef: &crate::codec::tbl_def::TblDef,
 ) -> Option<std::sync::Arc<crate::codec::key::KeyDef>> {
@@ -1343,7 +1309,6 @@ fn find_pk_keydef(
 /// Stage 0 limitations: no SK writes, no unique-check pre-read,
 /// no auto-incr field bump from the row value, no TTL prefix,
 /// no debug checksum.
-#[cfg(feature = "field_callbacks")]
 fn slatedb_write_row(thd_id: u64, name: String, table: &ffi::TableRef) -> i32 {
     use crate::codec::key::{IndexType, INDEX_NUMBER_SIZE};
     use crate::codec::row_value::{
@@ -1434,7 +1399,6 @@ fn slatedb_write_row(thd_id: u64, name: String, table: &ffi::TableRef) -> i32 {
 /// Stage 0 limitation: hidden-PK delete returns
 /// `ENGINE_IO_FAILED` (needs `m_last_rowkey` captured from prior
 /// scan/read, not plumbed yet).
-#[cfg(feature = "field_callbacks")]
 fn slatedb_delete_row(thd_id: u64, name: String, table: &ffi::TableRef) -> i32 {
     use crate::codec::key::IndexType;
 
@@ -1497,7 +1461,6 @@ fn slatedb_delete_row(thd_id: u64, name: String, table: &ffi::TableRef) -> i32 {
 /// PK-changing UPDATE would leave an orphaned row at the old
 /// PK; SQL-layer users should prefer `DELETE … INSERT …` for
 /// those cases in Stage 0.
-#[cfg(feature = "field_callbacks")]
 fn slatedb_update_row(thd_id: u64, name: String, table: &ffi::TableRef) -> i32 {
     use crate::codec::key::IndexType;
 
@@ -1540,9 +1503,7 @@ fn slatedb_update_row(thd_id: u64, name: String, table: &ffi::TableRef) -> i32 {
 /// (MyRocks' `COMMENT='cf=...'` syntax is deferred).
 ///
 /// This helper is the testable core of [`slatedb_create_table`] —
-/// pure Rust, no cxx dependency, so it compiles and tests both
-/// with and without the `field_callbacks` feature.
-#[cfg_attr(not(feature = "field_callbacks"), allow(dead_code))]
+/// pure Rust, no cxx dependency.
 pub(crate) fn build_tbl_def_from_schema(
     full_name: &str,
     key_names: &[String],
@@ -1624,7 +1585,6 @@ pub(crate) fn build_tbl_def_from_schema(
 /// left at defaults because setup doesn't consult them for any of
 /// the currently-wired types (integer / float / date / decimal /
 /// binary string).
-#[cfg(feature = "field_callbacks")]
 fn build_field_view_from_cxx(
     table: &ffi::TableRef,
     i: u32,
@@ -1665,7 +1625,6 @@ fn build_field_view_from_cxx(
 /// `hidden_pk_field.is_some()` — the actual index value is a
 /// sentinel (`field_count`, one past the real columns) because
 /// MariaDB has no real `Field` for the hidden rowid.
-#[cfg(feature = "field_callbacks")]
 fn build_table_share_view_from_cxx(
     table: &ffi::TableRef,
     synth_hidden_pk: bool,
@@ -1741,7 +1700,6 @@ fn build_table_share_view_from_cxx(
 ///
 /// On setup failure (corrupt schema, unrecognised column type,
 /// etc.) returns `ENGINE_IO_FAILED`.
-#[cfg(feature = "field_callbacks")]
 fn slatedb_create_table(name: String, table: &ffi::TableRef) -> i32 {
     use std::sync::Arc;
 
@@ -1816,7 +1774,6 @@ fn slatedb_create_table(name: String, table: &ffi::TableRef) -> i32 {
 ///
 /// Factored out so the cfg-gated `slatedb_create_table` body
 /// stays focused on the cxx/marshalling concerns.
-#[cfg(feature = "field_callbacks")]
 fn run_keydef_setup(
     tdef: &mut crate::codec::tbl_def::TblDef,
     tbl_view: &crate::codec::value::TableShareView,

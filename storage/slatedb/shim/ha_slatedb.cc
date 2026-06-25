@@ -25,7 +25,7 @@
 #include <my_global.h>
 #include <mysql/plugin.h>
 #include "ha_slatedb.h"
-#include "sql_class.h"
+#include "sql_priv.h"
 #include "log.h"
 #include "slatedb_bridge/bridge.h"
 /* For the slatedb::TableRef struct definition — the cxx-generated
@@ -275,7 +275,7 @@ int ha_slatedb::external_lock(THD *thd, int lock_type)
      (autocommit is on AND no BEGIN active). The C++ method does
      this check because the Rust side can't introspect THD. */
   const bool autocommit_boundary=
-      (lock_type == F_UNLCK) && !thd->in_multi_stmt_transaction_mode();
+      (lock_type == F_UNLCK) && !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
 
   int32_t rc= m_rust->ha_external_lock(thd_get_thread_id(thd),
                                        lock_type,
