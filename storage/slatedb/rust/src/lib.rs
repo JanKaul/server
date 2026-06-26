@@ -9,6 +9,8 @@ pub mod engine;
 pub mod error;
 pub mod globals;
 pub mod handler;
+#[cfg(test)]
+mod mtr_coverage;
 pub mod runtime;
 pub mod table_handler;
 pub mod task;

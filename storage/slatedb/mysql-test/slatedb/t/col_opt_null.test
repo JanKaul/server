@@ -1,0 +1,29 @@
+--source include/have_slatedb.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+CREATE TABLE t1 (
+  pk  INT NOT NULL PRIMARY KEY,
+  i   INT NULL,
+  b   BIGINT NULL,
+  c   CHAR(8) NULL,
+  vc  VARBINARY(16) NULL
+) ENGINE=slatedb;
+
+SHOW COLUMNS IN t1;
+
+# All NULLs
+INSERT INTO t1 (pk) VALUES (1);
+# Mixed NULL / non-NULL
+INSERT INTO t1 VALUES (2, 42, 9999, 'hello', 'world');
+INSERT INTO t1 VALUES (3, NULL, 0, NULL, NULL);
+
+--sorted_result
+SELECT * FROM t1;
+
+SELECT pk FROM t1 WHERE i IS NULL;
+SELECT pk FROM t1 WHERE i IS NOT NULL;
+
+DROP TABLE t1;

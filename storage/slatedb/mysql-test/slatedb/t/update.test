@@ -1,0 +1,36 @@
+--source include/have_slatedb.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+CREATE TABLE t1 (pk INT NOT NULL PRIMARY KEY, a INT, b CHAR(8)) ENGINE=slatedb;
+INSERT INTO t1 VALUES (1, 10, 'aaa'), (2, 20, 'bbb'), (3, 30, 'ccc');
+
+# UPDATE non-PK column by PK (PK unchanged — Stage 0 supported path)
+UPDATE t1 SET a = 99 WHERE pk = 1;
+--sorted_result
+SELECT * FROM t1;
+
+UPDATE t1 SET b = 'zzz' WHERE pk = 2;
+--sorted_result
+SELECT * FROM t1;
+
+UPDATE t1 SET a = 0, b = 'xxx' WHERE pk = 3;
+--sorted_result
+SELECT * FROM t1;
+
+# Transactional UPDATE
+BEGIN;
+UPDATE t1 SET a = 1 WHERE pk = 1;
+COMMIT;
+--sorted_result
+SELECT * FROM t1;
+
+BEGIN;
+UPDATE t1 SET a = 999 WHERE pk = 1;
+ROLLBACK;
+--sorted_result
+SELECT * FROM t1;
+
+DROP TABLE t1;

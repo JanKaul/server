@@ -1712,22 +1712,15 @@ mod tests {
     }
 
     #[test]
-    fn external_lock_type_from_i32_matches_my_global_h() {
-        assert_eq!(ExternalLockType::from_i32(1), Some(ExternalLockType::Read));
-        assert_eq!(
-            ExternalLockType::from_i32(2),
-            Some(ExternalLockType::Write),
-        );
-        // F_UNLCK = 3 per MariaDB's `include/my_global.h:145`.
-        assert_eq!(
-            ExternalLockType::from_i32(3),
-            Some(ExternalLockType::Unlock),
-        );
-        // Unknown ints return None.
-        assert_eq!(ExternalLockType::from_i32(0), None);
-        // 8 is the BSD/POSIX libc value for F_UNLCK — explicitly
-        // NOT accepted because MariaDB itself uses my_global.h's 3.
-        assert_eq!(ExternalLockType::from_i32(8), None);
+    fn external_lock_type_from_i32_matches_normalized_encoding() {
+        // The C++ shim normalises platform-specific F_*LCK values
+        // (glibc: 0/1/2; my_global.h: 1/2/3 on Windows) to the stable
+        // encoding below before crossing the cxx boundary.
+        assert_eq!(ExternalLockType::from_i32(0), Some(ExternalLockType::Read));
+        assert_eq!(ExternalLockType::from_i32(1), Some(ExternalLockType::Write));
+        assert_eq!(ExternalLockType::from_i32(2), Some(ExternalLockType::Unlock));
+        // Values outside the 0/1/2 range are rejected.
+        assert_eq!(ExternalLockType::from_i32(3), None);
         assert_eq!(ExternalLockType::from_i32(99), None);
         assert_eq!(ExternalLockType::from_i32(-1), None);
     }

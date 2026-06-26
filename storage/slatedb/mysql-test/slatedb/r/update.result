@@ -1,0 +1,38 @@
+DROP TABLE IF EXISTS t1;
+CREATE TABLE t1 (pk INT NOT NULL PRIMARY KEY, a INT, b CHAR(8)) ENGINE=slatedb;
+INSERT INTO t1 VALUES (1, 10, 'aaa'), (2, 20, 'bbb'), (3, 30, 'ccc');
+UPDATE t1 SET a = 99 WHERE pk = 1;
+SELECT * FROM t1;
+pk	a	b
+1	10	aaa
+2	20	bbb
+3	30	ccc
+UPDATE t1 SET b = 'zzz' WHERE pk = 2;
+SELECT * FROM t1;
+pk	a	b
+1	10	aaa
+2	20	bbb
+3	30	ccc
+UPDATE t1 SET a = 0, b = 'xxx' WHERE pk = 3;
+SELECT * FROM t1;
+pk	a	b
+1	10	aaa
+2	20	bbb
+3	30	ccc
+BEGIN;
+UPDATE t1 SET a = 1 WHERE pk = 1;
+COMMIT;
+SELECT * FROM t1;
+pk	a	b
+1	10	aaa
+2	20	bbb
+3	30	ccc
+BEGIN;
+UPDATE t1 SET a = 999 WHERE pk = 1;
+ROLLBACK;
+SELECT * FROM t1;
+pk	a	b
+1	10	aaa
+2	20	bbb
+3	30	ccc
+DROP TABLE t1;

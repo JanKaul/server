@@ -1,0 +1,8 @@
+# Tests disabled for SlateDB Stage 0.
+# Each entry: <test_name>  :  <reason>
+#
+# Format: "test_name : reason" (tab separated by convention)
+#
+# Note: PK uniqueness enforcement (ER_DUP_ENTRY on duplicate INSERT) requires
+# index_read_map to check for an existing key before writing — deferred to the
+# same slice as secondary-index reads.

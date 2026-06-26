@@ -1,0 +1,38 @@
+--source include/have_slatedb.inc
+
+--disable_warnings
+DROP TABLE IF EXISTS t1;
+--enable_warnings
+
+CREATE TABLE t1 (pk INT NOT NULL PRIMARY KEY, a INT, b CHAR(8)) ENGINE=slatedb;
+INSERT INTO t1 VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd');
+
+# DELETE by explicit PK (Stage 0 supported path)
+DELETE FROM t1 WHERE pk = 1;
+--sorted_result
+SELECT * FROM t1;
+
+DELETE FROM t1 WHERE pk = 3;
+--sorted_result
+SELECT * FROM t1;
+
+# DELETE all rows
+DELETE FROM t1;
+SELECT COUNT(*) FROM t1;
+
+# Transactional DELETE
+INSERT INTO t1 VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c');
+
+BEGIN;
+DELETE FROM t1 WHERE pk = 1;
+COMMIT;
+--sorted_result
+SELECT * FROM t1;
+
+BEGIN;
+DELETE FROM t1 WHERE pk = 2;
+ROLLBACK;
+--sorted_result
+SELECT * FROM t1;
+
+DROP TABLE t1;

@@ -1,0 +1,31 @@
+DROP TABLE IF EXISTS t1;
+CREATE TABLE t1 (
+pk  INT NOT NULL PRIMARY KEY,
+i   INT NULL,
+b   BIGINT NULL,
+c   CHAR(8) NULL,
+vc  VARBINARY(16) NULL
+) ENGINE=slatedb;
+SHOW COLUMNS IN t1;
+Field	Type	Null	Key	Default	Extra
+pk	int(11)	NO	PRI	NULL	
+i	int(11)	YES		NULL	
+b	bigint(20)	YES		NULL	
+c	char(8)	YES		NULL	
+vc	varbinary(16)	YES		NULL	
+INSERT INTO t1 (pk) VALUES (1);
+INSERT INTO t1 VALUES (2, 42, 9999, 'hello', 'world');
+INSERT INTO t1 VALUES (3, NULL, 0, NULL, NULL);
+SELECT * FROM t1;
+pk	i	b	c	vc
+1	NULL	NULL	NULL	NULL
+2	42	9999	hello	world
+3	NULL	0	NULL	NULL
+SELECT pk FROM t1 WHERE i IS NULL;
+pk
+1
+3
+SELECT pk FROM t1 WHERE i IS NOT NULL;
+pk
+2
+DROP TABLE t1;

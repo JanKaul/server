@@ -1,0 +1,1 @@
+--plugin-load=$HA_SLATEDB_SO --default-storage-engine=slatedb --plugin-maturity=experimental

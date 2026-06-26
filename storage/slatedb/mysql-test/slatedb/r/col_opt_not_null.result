@@ -1,0 +1,31 @@
+DROP TABLE IF EXISTS t1;
+CREATE TABLE t1 (
+pk  INT NOT NULL PRIMARY KEY,
+i   INT NOT NULL,
+b   BIGINT NOT NULL,
+c   CHAR(8) NOT NULL,
+vc  VARBINARY(16) NOT NULL
+) ENGINE=slatedb;
+SHOW COLUMNS IN t1;
+Field	Type	Null	Key	Default	Extra
+pk	int(11)	NO	PRI	NULL	
+i	int(11)	NO		NULL	
+b	bigint(20)	NO		NULL	
+c	char(8)	NO		NULL	
+vc	varbinary(16)	NO		NULL	
+INSERT INTO t1 VALUES (1, 42, 9999, 'hello', 'world');
+INSERT INTO t1 VALUES (2, 0, 0, '', '');
+INSERT INTO t1 VALUES (3, -1, -9223372036854775808, 'x', 'y');
+SELECT * FROM t1;
+pk	i	b	c	vc
+1	42	9999	hello	world
+2	0	0		
+3	-1	-9223372036854775808	x	y
+INSERT INTO t1 VALUES (4, NULL, 0, 'z', 'z');
+ERROR 23000: Column 'i' cannot be null
+SELECT * FROM t1;
+pk	i	b	c	vc
+1	42	9999	hello	world
+2	0	0		
+3	-1	-9223372036854775808	x	y
+DROP TABLE t1;

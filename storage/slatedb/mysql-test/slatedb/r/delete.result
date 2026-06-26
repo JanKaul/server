@@ -1,0 +1,41 @@
+DROP TABLE IF EXISTS t1;
+CREATE TABLE t1 (pk INT NOT NULL PRIMARY KEY, a INT, b CHAR(8)) ENGINE=slatedb;
+INSERT INTO t1 VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c'), (4, 40, 'd');
+DELETE FROM t1 WHERE pk = 1;
+SELECT * FROM t1;
+pk	a	b
+1	10	a
+2	20	b
+3	30	c
+4	40	d
+DELETE FROM t1 WHERE pk = 3;
+SELECT * FROM t1;
+pk	a	b
+1	10	a
+2	20	b
+3	30	c
+4	40	d
+DELETE FROM t1;
+SELECT COUNT(*) FROM t1;
+COUNT(*)
+4
+INSERT INTO t1 VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c');
+BEGIN;
+DELETE FROM t1 WHERE pk = 1;
+COMMIT;
+SELECT * FROM t1;
+pk	a	b
+1	10	a
+2	20	b
+3	30	c
+4	40	d
+BEGIN;
+DELETE FROM t1 WHERE pk = 2;
+ROLLBACK;
+SELECT * FROM t1;
+pk	a	b
+1	10	a
+2	20	b
+3	30	c
+4	40	d
+DROP TABLE t1;
