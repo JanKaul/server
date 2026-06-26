@@ -188,33 +188,30 @@ impl HaExtraFunction {
     }
 }
 
-/// MariaDB's `int lock_type` parameter to `external_lock`. Values
-/// from `include/my_global.h` (`F_RDLCK = 1`, `F_WRLCK = 2`,
-/// `F_UNLCK = 3`). These are MariaDB's *own* `F_*LCK` constants —
-/// not the POSIX `<sys/file.h>` ones (which differ across libc:
-/// glibc has F_UNLCK=2, BSD has F_UNLCK=8). The MariaDB SQL layer
-/// always uses the my_global.h values, so the cxx bridge passes
-/// those.
+/// Normalized lock type for `external_lock`. The C++ shim translates
+/// the platform-specific `F_*LCK` constants (glibc: 0/1/2; Win32:
+/// 1/2/3 per my_global.h) into the stable encoding below before
+/// crossing the cxx boundary, so this enum is platform-independent.
 #[repr(i32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExternalLockType {
-    /// `F_RDLCK = 1` — table is being read.
-    Read = 1,
-    /// `F_WRLCK = 2` — table is being written.
-    Write = 2,
-    /// `F_UNLCK = 3` — table is being released. Maybe-commit point.
-    Unlock = 3,
+    /// Shim encodes as 0 (F_RDLCK) — table is being read.
+    Read = 0,
+    /// Shim encodes as 1 (F_WRLCK) — table is being written.
+    Write = 1,
+    /// Shim encodes as 2 (F_UNLCK) — table is being released.
+    Unlock = 2,
 }
 
 impl ExternalLockType {
-    /// Map from the raw `lock_type` int. Unknown values return
-    /// `None`; the caller treats that as an internal error (the
-    /// SQL layer shouldn't be passing values outside the F_* set).
+    /// Map from the normalized encoding the shim sends. Unknown
+    /// values (shim passes -1 for unrecognised F_*LCK) return
+    /// `None`; the caller treats that as an internal error.
     pub fn from_i32(v: i32) -> Option<Self> {
         match v {
-            1 => Some(Self::Read),
-            2 => Some(Self::Write),
-            3 => Some(Self::Unlock),
+            0 => Some(Self::Read),
+            1 => Some(Self::Write),
+            2 => Some(Self::Unlock),
             _ => None,
         }
     }

@@ -30,8 +30,6 @@
 
 class ha_slatedb: public handler
 {
-  THR_LOCK_DATA lock;
-
   /* Per-handler Rust state — opaque on this side. Constructed via
      `slatedb::new_ha_slatedb()` in the ctor; dropped via the Box's
      dtor when this instance is destroyed. */
@@ -45,9 +43,11 @@ public:
   ulong index_flags(uint, uint, bool) const override { return 0; }
 
   uint max_supported_record_length() const override { return HA_MAX_REC_LENGTH; }
-  uint max_supported_keys()           const override { return 0; }
-  uint max_supported_key_parts()      const override { return 0; }
-  uint max_supported_key_length()     const override { return 0; }
+  uint max_supported_keys()           const override { return MAX_KEY; }
+  uint max_supported_key_parts()      const override { return MAX_REF_PARTS; }
+  uint max_supported_key_length()     const override { return 3500; }
+  /* SSI handles all isolation internally; no THR_LOCK entries needed. */
+  uint lock_count() const override { return 0; }
 
   IO_AND_CPU_COST scan_time() override
   {

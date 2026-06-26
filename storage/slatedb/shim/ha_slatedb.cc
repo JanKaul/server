@@ -192,7 +192,6 @@ ha_slatedb::ha_slatedb(handlerton *hton, TABLE_SHARE *table_arg)
 int ha_slatedb::open(const char *name, int, uint)
 {
   DBUG_ENTER("ha_slatedb::open");
-  thr_lock_data_init(nullptr, &lock, nullptr);
   int32_t rc= m_rust->ha_open(rust::String(name));
   DBUG_RETURN(slatedb_status_to_ha_err(rc));
 }
@@ -277,8 +276,15 @@ int ha_slatedb::external_lock(THD *thd, int lock_type)
   const bool autocommit_boundary=
       (lock_type == F_UNLCK) && !thd_test_options(thd, OPTION_NOT_AUTOCOMMIT | OPTION_BEGIN);
 
+  /* Translate the platform-specific F_*LCK values (glibc: 0/1/2,
+     my_global.h redefines to 1/2/3 only on Windows) to the stable
+     encoding the Rust side expects: 0=READ, 1=WRITE, 2=UNLOCK. */
+  const int32_t rust_lock_type=
+      (lock_type == F_RDLCK) ? 0 :
+      (lock_type == F_WRLCK) ? 1 :
+      (lock_type == F_UNLCK) ? 2 : -1;
   int32_t rc= m_rust->ha_external_lock(thd_get_thread_id(thd),
-                                       lock_type,
+                                       rust_lock_type,
                                        autocommit_boundary);
   DBUG_RETURN(slatedb_status_to_ha_err(rc));
 }
@@ -374,17 +380,11 @@ int ha_slatedb::delete_row(const uchar *)
 THR_LOCK_DATA **ha_slatedb::store_lock(THD *thd, THR_LOCK_DATA **to,
                                        enum thr_lock_type lock_type)
 {
-  /* The Rust side decides whether to downgrade the lock type
-     (e.g. WRITE_ALLOW_WRITE → WRITE_CONCURRENT_INSERT outside
-     LOCK TABLES). It also updates the handler's internal
-     `lock_rows` + `db_lock_type`. */
-  const bool in_lt= thd_in_lock_tables(thd);
-  const bool tspace_op= thd_tablespace_op(thd);
-  int32_t chosen= m_rust->ha_store_lock(in_lt, tspace_op,
-                                         static_cast<int32_t>(lock_type));
-  if (chosen != TL_IGNORE && lock.type == TL_UNLOCK)
-    lock.type= static_cast<enum thr_lock_type>(chosen);
-  *to++= &lock;
+  /* SSI handles all isolation; no THR_LOCK entry is registered.
+     Still inform the Rust side of the requested lock type so it can
+     set its internal lock_rows / db_lock_type bookkeeping. */
+  m_rust->ha_store_lock(thd_in_lock_tables(thd), thd_tablespace_op(thd),
+                        static_cast<int32_t>(lock_type));
   return to;
 }
 
